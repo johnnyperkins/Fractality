@@ -1,0 +1,18 @@
+# Rust build output
+/target
+
+# Backtrace / debug
+*.pdb
+
+# Downloaded package artifacts
+*.deb
+
+# Package stubs
+/.pkgstub
+
+# Editor / OS
+*.swp
+*.swo
+.DS_Store
+.idea/
+.vscode/
