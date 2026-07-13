@@ -10,11 +10,15 @@ use bevy::render::camera::ClearColorConfig;
 use bevy::render::view::Msaa;
 use bevy::window::PresentMode;
 
-use particles::{generate_particles, ParticlePlugin, ParticleSeed, SimParams};
+use bevy::math::DVec2;
 
-const MAX_ITER: u32 = 90;
-const DEFAULT_CENTER: Vec2 = Vec2::new(-0.55, 0.0);
-const DEFAULT_HEIGHT: f32 = 2.7;
+use particles::{
+    generate_particles, reference_orbit, ParticlePlugin, ParticleSeed, RefOrbit, SimParams,
+};
+
+const BASE_ITER: u32 = 90;
+const DEFAULT_CENTER: DVec2 = DVec2::new(-0.55, 0.0);
+const DEFAULT_HEIGHT: f64 = 2.7;
 
 #[derive(Resource)]
 struct ParticleCount(u32);
@@ -22,10 +26,16 @@ struct ParticleCount(u32);
 #[derive(Resource)]
 struct Paused(bool);
 
+/// View transform. center/height are f64 so the reference point keeps ~15
+/// digits of precision, enough for zoom down to ~1e-15 (near-infinite feel).
 #[derive(Resource)]
 struct ViewState {
-    center: Vec2,
-    height: f32,
+    center: DVec2,
+    height: f64,
+    /// Center from the previous frame, for per-frame particle rebasing.
+    prev_center: DVec2,
+    /// Height from the previous frame, to size the zoom-out reseed burst.
+    prev_height: f64,
 }
 
 impl Default for ViewState {
@@ -33,8 +43,18 @@ impl Default for ViewState {
         Self {
             center: DEFAULT_CENTER,
             height: DEFAULT_HEIGHT,
+            prev_center: DEFAULT_CENTER,
+            prev_height: DEFAULT_HEIGHT,
         }
     }
+}
+
+/// Iteration count grows with zoom depth so deep boundary detail resolves.
+/// Capped well below REF_ORBIT_CAP: cost is max_iter x 3 x particle_count every
+/// frame, so an uncapped ramp tanks the framerate (and makes input feel dead).
+fn depth_iter(height: f64) -> u32 {
+    let zoom = (DEFAULT_HEIGHT / height).max(1.0);
+    (90.0 + 45.0 * zoom.log2()).clamp(90.0, 320.0) as u32
 }
 
 fn main() {
@@ -70,8 +90,12 @@ fn main() {
         .insert_resource(ViewState::default())
         .insert_resource(Paused(false))
         .insert_resource(SimParams::default())
+        .insert_resource(RefOrbit::default())
         .add_systems(Startup, setup)
-        .add_systems(Update, (handle_input, update_params, update_title))
+        .add_systems(
+            Update,
+            ((handle_input, update_params).chain(), update_title),
+        )
         .run();
 }
 
@@ -91,7 +115,8 @@ fn setup(mut commands: Commands, count: Res<ParticleCount>) {
     ));
 
     let start = std::time::Instant::now();
-    let particles = generate_particles(count.0 as usize, MAX_ITER);
+    // Positions are stored relative to the view center; seed at the default one.
+    let particles = generate_particles(count.0 as usize, BASE_ITER, DEFAULT_CENTER);
     info!(
         "generated {} particles in {:.2?}",
         particles.len(),
@@ -108,9 +133,9 @@ fn handle_input(
     mut view: ResMut<ViewState>,
     mut paused: ResMut<Paused>,
 ) {
-    let dt = time.delta_secs();
+    let dt = time.delta_secs() as f64;
 
-    let mut pan = Vec2::ZERO;
+    let mut pan = DVec2::ZERO;
     if keys.pressed(KeyCode::KeyW) {
         pan.y += 1.0;
     }
@@ -123,7 +148,7 @@ fn handle_input(
     if keys.pressed(KeyCode::KeyD) {
         pan.x += 1.0;
     }
-    if pan != Vec2::ZERO {
+    if pan != DVec2::ZERO {
         let speed = view.height * 0.6 * dt;
         view.center += pan * speed;
     }
@@ -136,11 +161,11 @@ fn handle_input(
         paused.0 = !paused.0;
     }
 
-    let mut scroll = 0.0f32;
+    let mut scroll = 0.0f64;
     for ev in wheel.read() {
         scroll += match ev.unit {
-            MouseScrollUnit::Line => ev.y,
-            MouseScrollUnit::Pixel => ev.y / 60.0,
+            MouseScrollUnit::Line => ev.y as f64,
+            MouseScrollUnit::Pixel => ev.y as f64 / 60.0,
         };
     }
     if scroll != 0.0 {
@@ -148,17 +173,15 @@ fn handle_input(
             return;
         };
         let old_h = view.height;
-        let new_h = (old_h * 0.9f32.powf(scroll)).clamp(1e-6, 40.0);
+        // Lower clamp near f64 precision floor for the center; feels infinite.
+        let new_h = (old_h * 0.9f64.powf(scroll)).clamp(1e-15, 40.0);
         if let Some(cursor) = window.cursor_position() {
-            let w = window.width().max(1.0);
-            let h = window.height().max(1.0);
+            let w = window.width().max(1.0) as f64;
+            let h = window.height().max(1.0) as f64;
             let aspect = w / h;
-            let ndc = Vec2::new(
-                cursor.x / w * 2.0 - 1.0,
-                1.0 - cursor.y / h * 2.0,
-            );
+            let ndc = DVec2::new(cursor.x as f64 / w * 2.0 - 1.0, 1.0 - cursor.y as f64 / h * 2.0);
             let cursor_fractal =
-                view.center + Vec2::new(ndc.x * old_h * aspect * 0.5, ndc.y * old_h * 0.5);
+                view.center + DVec2::new(ndc.x * old_h * aspect * 0.5, ndc.y * old_h * 0.5);
             let delta = (cursor_fractal - view.center) * (1.0 - new_h / old_h);
             view.center += delta;
         }
@@ -169,26 +192,44 @@ fn handle_input(
 fn update_params(
     time: Res<Time>,
     windows: Query<&Window>,
-    view: Res<ViewState>,
+    mut view: ResMut<ViewState>,
     paused: Res<Paused>,
     mouse: Res<ButtonInput<MouseButton>>,
     count: Res<ParticleCount>,
     mut params: ResMut<SimParams>,
+    mut ref_orbit: ResMut<RefOrbit>,
+    mut frame: Local<u32>,
 ) {
     let Ok(window) = windows.single() else {
         return;
     };
     let w = window.width().max(1.0);
     let h = window.height().max(1.0);
-    let aspect = w / h;
+    let aspect = (w / h) as f64;
 
-    // clip.x = (p.x - cx) * 2/(height*aspect), clip.y = (p.y - cy) * 2/height
-    let scale = Vec2::new(2.0 / (view.height * aspect), 2.0 / view.height);
-    let offset = -view.center * scale;
+    // Positions are center-relative, so clip = pos * scale (offset is zero).
+    let scale = Vec2::new(
+        (2.0 / (view.height * aspect)) as f32,
+        (2.0 / view.height) as f32,
+    );
 
-    let mouse_fractal = window.cursor_position().map(|c| {
+    // Rebase amount for this frame, computed in f64 so it stays tiny and exact.
+    let center_delta = (view.prev_center - view.center).as_vec2();
+    view.prev_center = view.center;
+
+    // Zoom-out reseed budget: fraction of the view area newly revealed this
+    // frame (1 - (prev_h/cur_h)^2 when zooming out), so fill exactly tracks the
+    // growing view with no lagging density front. Floor at a small trickle for
+    // steady-state coverage, cap to bound the per-frame churn.
+    let area_ratio = (view.prev_height / view.height).powi(2);
+    let revealed = (1.0 - area_ratio).clamp(0.0, 1.0);
+    let reseed_rate = (revealed.max(0.006) as f32).min(0.2);
+    view.prev_height = view.height;
+
+    // Cursor in center-relative coords (same space as particles).
+    let mouse_rel = window.cursor_position().map(|c| {
         let ndc = Vec2::new(c.x / w * 2.0 - 1.0, 1.0 - c.y / h * 2.0);
-        (ndc - offset) / scale
+        ndc / scale
     });
     let button = if mouse.pressed(MouseButton::Left) {
         1.0
@@ -197,7 +238,7 @@ fn update_params(
     } else {
         0.0
     };
-    let radius = view.height * 0.09;
+    let radius = (view.height * 0.09) as f32;
 
     let dt = if paused.0 {
         0.0
@@ -205,22 +246,35 @@ fn update_params(
         time.delta_secs().min(1.0 / 30.0)
     };
 
+    let max_iter = depth_iter(view.height);
+    // High-precision reference orbit at the view center for perturbation.
+    ref_orbit.0 = reference_orbit(view.center.x, view.center.y, max_iter);
+
+    *frame = frame.wrapping_add(1);
+
     let px = 1.3f32;
     let u = &mut params.0;
-    u.world_to_clip = Vec4::new(scale.x, scale.y, offset.x, offset.y);
-    u.mouse = match mouse_fractal {
+    u.world_to_clip = Vec4::new(scale.x, scale.y, 0.0, 0.0);
+    u.mouse = match mouse_rel {
         Some(p) => Vec4::new(p.x, p.y, button, radius),
         None => Vec4::new(1e9, 1e9, 0.0, radius),
     };
     u.particle_size = Vec2::new(2.0 * px / w, 2.0 * px / h);
+    u.center_delta = center_delta;
     u.time = time.elapsed_secs();
     u.dt = dt;
     u.count = count.0;
-    u.max_iter = MAX_ITER;
-    u.flow_speed = 0.22;
+    u.max_iter = max_iter;
+    // Flow speed as a fraction of view height per second (shader scales by
+    // view_height), tuned so the default-zoom feel matches the original 0.22.
+    u.flow_speed = 0.081;
     u.band_k = 0.7;
     u.damping = 3.0;
     u.brightness = 1.1 * (500_000.0 / count.0 as f32).sqrt();
+    u.ref_len = ref_orbit.0.len() as u32;
+    u.frame = *frame;
+    u.reseed_rate = reseed_rate;
+    u._pad = 0.0;
 }
 
 fn update_title(

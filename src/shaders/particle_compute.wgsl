@@ -13,6 +13,7 @@ struct Params {
     world_to_clip: vec4<f32>,
     mouse: vec4<f32>,
     particle_size: vec2<f32>,
+    center_delta: vec2<f32>,
     time: f32,
     dt: f32,
     count: u32,
@@ -21,23 +22,63 @@ struct Params {
     band_k: f32,
     damping: f32,
     brightness: f32,
+    ref_len: u32,
+    frame: u32,
+    reseed_rate: f32,
+    _pad: f32,
 };
 
 @group(0) @binding(0) var<storage, read_write> particles: array<Particle>;
 @group(0) @binding(1) var<uniform> params: Params;
+// Reference orbit Z_0..Z_n at the view center, computed in f64 on the CPU.
+@group(0) @binding(2) var<storage, read> ref_orbit: array<vec2<f32>>;
 
-// Smooth escape-time field. Formula and escape radius (256.0) are identical
-// to smooth_iter() on the CPU so band values match.
-fn field(c: vec2<f32>) -> f32 {
-    var z = vec2<f32>(0.0, 0.0);
-    for (var i: u32 = 0u; i < params.max_iter; i = i + 1u) {
-        z = vec2<f32>(z.x * z.x - z.y * z.y, 2.0 * z.x * z.y) + c;
+fn cmul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
+    return vec2<f32>(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
+}
+
+// Smooth escape-time field via perturbation. dc is the point's offset from the
+// view center (small, so f32 keeps full relative precision no matter how deep
+// the zoom). Iterates the delta dz around the reference orbit and rebases
+// (Zhuoran's method) when the delta outgrows the reference, which also handles
+// a short/diverged reference orbit.
+fn field(dc: vec2<f32>) -> f32 {
+    var dz = vec2<f32>(0.0, 0.0);
+    var ri: u32 = 0u;
+    let last = params.ref_len - 1u;
+    for (var n: u32 = 0u; n < params.max_iter; n = n + 1u) {
+        let z_ref = ref_orbit[ri];
+        // dz_{n+1} = 2*Z_n*dz + dz^2 + dc
+        dz = 2.0 * cmul(z_ref, dz) + cmul(dz, dz) + dc;
+        ri = ri + 1u;
+        let z = ref_orbit[ri] + dz; // full z_{n+1}
         let m = dot(z, z);
         if (m > 256.0) {
-            return f32(i) + 1.0 - log2(0.5 * log2(m));
+            return f32(n) + 1.0 - log2(0.5 * log2(m));
+        }
+        // Rebase: fold the full value into the delta and restart the reference
+        // when the delta dominates or the reference orbit is exhausted.
+        if (m < dot(dz, dz) || ri >= last) {
+            dz = z;
+            ri = 0u;
         }
     }
     return f32(params.max_iter);
+}
+
+fn hash_u32(x0: u32) -> u32 {
+    var h = x0;
+    h = h ^ (h >> 16u);
+    h = h * 0x7feb352du;
+    h = h ^ (h >> 15u);
+    h = h * 0x846ca68bu;
+    h = h ^ (h >> 16u);
+    return h;
+}
+
+fn rand01(state: ptr<function, u32>) -> f32 {
+    *state = hash_u32(*state);
+    return f32(*state) * (1.0 / 4294967296.0);
 }
 
 @compute @workgroup_size(256)
@@ -49,11 +90,57 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
     var p = particles[idx];
     let dt = params.dt;
 
-    // Gradient of the field by forward differences. Scale the sample step with
-    // the current view height (2.0 / world_to_clip.y) so the gradient stays
-    // accurate when zoomed deep into the boundary.
+    // Rebase into the current view center's frame (center moved since last frame).
+    p.pos += params.center_delta;
+    p.home += params.center_delta;
+
+    // Half extents of the visible region in center-relative units.
     let view_height = 2.0 / params.world_to_clip.y;
-    let eps = clamp(view_height * 0.0008, 1e-5, 0.004);
+    let aspect = params.world_to_clip.y / params.world_to_clip.x;
+    let ext = vec2<f32>(view_height * aspect * 0.5, view_height * 0.5);
+
+    // Recycle particles to keep the current view populated as it moves. Two
+    // triggers: (1) drifted well outside the view - fills fresh territory when
+    // zooming IN; (2) a small random per-frame trickle - continuously resamples
+    // the whole cloud into the current view, which is what fills the growing
+    // margins when zooming OUT (drifted-out never triggers on zoom-out). Over a
+    // few seconds the trickle refreshes the entire set at the current scale.
+    var seed = hash_u32(idx ^ (params.frame * 2654435761u));
+    let out_of_view = abs(p.pos.x) > ext.x * 2.5 || abs(p.pos.y) > ext.y * 2.5;
+    let trickle = rand01(&seed) < params.reseed_rate;
+    if (out_of_view || trickle) {
+        for (var k: u32 = 0u; k < 4u; k = k + 1u) {
+            // Feathered sampling extent: mostly ~screen size (flat, uniform
+            // density across the whole visible rect incl. corners), with a soft
+            // tail past the screen edge. r*r concentrates the margin near 1.05
+            // so the taper (and its front) sits off-screen - no visible box.
+            let r = rand01(&seed);
+            let mgn = 1.05 + 0.55 * r * r;
+            let cand = vec2<f32>(
+                (rand01(&seed) * 2.0 - 1.0) * ext.x * mgn,
+                (rand01(&seed) * 2.0 - 1.0) * ext.y * mgn,
+            );
+            let f = field(cand);
+            if (f > 3.0 && f < f32(params.max_iter) - 1.0) {
+                p.home = cand;
+                p.pos = cand;
+                p.band = f;
+                p.hue = fract(f * 0.045 + 0.62);
+                p.vel = vec2<f32>(0.0, 0.0);
+                // Skip flow/mouse this frame: on a spike (fast zoom-out) this
+                // avoids the 3 gradient field() calls on every respawned
+                // particle, keeping the frame's total field() work bounded.
+                particles[idx] = p;
+                return;
+            }
+        }
+    }
+
+    // Gradient of the field by forward differences. Scale the sample step with
+    // the current view height so the gradient stays accurate when zoomed deep.
+    // Step scales with the view so the finite-difference delta stays ~constant
+    // in field units at any zoom (no fixed floor, which would over-sample deep).
+    let eps = clamp(view_height * 0.0008, 1e-30, 0.004);
     let f0 = field(p.pos);
     let fx = field(p.pos + vec2<f32>(eps, 0.0));
     let fy = field(p.pos + vec2<f32>(0.0, eps));
@@ -66,7 +153,7 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
         let gn = grad / gl;
         let tangent = vec2<f32>(-gn.y, gn.x);
         let err = clamp((p.band - f0) * params.band_k, -2.0, 2.0);
-        desired = (tangent + gn * err) * params.flow_speed;
+        desired = (tangent + gn * err) * params.flow_speed * view_height;
     } else {
         desired = (p.home - p.pos) * 0.6;
     }
@@ -74,7 +161,7 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Mouse interaction: hover ripple, left blast, right vortex.
     var impulse = vec2<f32>(0.0, 0.0);
     let d = p.pos - params.mouse.xy;
-    let dist = max(length(d), 1e-5);
+    let dist = max(length(d), 1e-7);
     let radius = params.mouse.w;
     if (dist < radius) {
         let fall = 1.0 - dist / radius;
@@ -93,10 +180,12 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
     p.vel += impulse * dt;
     p.pos += p.vel * dt;
 
-    // Safety: respawn escaped or NaN particles at home. The negated <= form is
-    // false for NaN (every ordered compare with NaN is false), so NaN positions
-    // trigger the reset without a self-compare the optimizer may fold away.
-    if (!(abs(p.pos.x) <= 4.0 && abs(p.pos.y) <= 4.0)) {
+    // Safety: respawn NaN particles at home. The negated <= form is false for
+    // NaN (every ordered compare with NaN is false), so NaN positions reset
+    // without a self-compare the optimizer may fold away. Bound is view-relative
+    // now that positions are center-relative.
+    let bound = max(ext.x, ext.y) * 8.0;
+    if (!(abs(p.pos.x) <= bound && abs(p.pos.y) <= bound)) {
         p.pos = p.home;
         p.vel = vec2<f32>(0.0, 0.0);
     }

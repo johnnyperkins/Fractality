@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use bevy::asset::DirectAssetAccessExt;
+use bevy::math::DVec2;
 use bevy::core_pipeline::core_2d::graph::{Core2d, Node2d};
 use bevy::prelude::*;
 use bevy::render::{
@@ -34,12 +35,16 @@ pub struct Particle {
 /// Uniform parameters. Field order must match the WGSL Params struct exactly.
 #[derive(Clone, Copy, ShaderType, Default)]
 pub struct ParamsUniform {
-    /// xy scale, zw offset: clip = pos * scale + offset
+    /// xy scale, zw offset: clip = pos * scale + offset. Positions are stored
+    /// relative to the view center, so offset (zw) is always zero.
     pub world_to_clip: Vec4,
-    /// xy fractal pos, z button (1 left / -1 right / 0 none), w radius in fractal units
+    /// xy pos (center-relative), z button (1 left / -1 right / 0 none), w radius
     pub mouse: Vec4,
     /// clip-space half extents of the particle quad
     pub particle_size: Vec2,
+    /// (prev_center - cur_center) in world units. Added to every particle each
+    /// frame to keep positions relative to the moving view center.
+    pub center_delta: Vec2,
     pub time: f32,
     pub dt: f32,
     pub count: u32,
@@ -48,6 +53,42 @@ pub struct ParamsUniform {
     pub band_k: f32,
     pub damping: f32,
     pub brightness: f32,
+    /// Number of valid entries in the reference orbit buffer.
+    pub ref_len: u32,
+    /// Frame counter, seeds particle-recycle RNG.
+    pub frame: u32,
+    /// Per-frame probability a particle is recycled. Rises with zoom-out speed
+    /// so fill keeps pace with the newly revealed area; floors at a small trickle.
+    pub reseed_rate: f32,
+    pub _pad: f32,
+}
+
+/// Max reference-orbit length (also caps max_iter). One vec2<f32> per entry.
+pub const REF_ORBIT_CAP: usize = 2048;
+
+/// CPU-computed f64 reference orbit at the view center, stored as f32 pairs.
+/// Perturbation keeps full f32 precision because particle deltas stay small.
+#[derive(Resource, Clone, Default, ExtractResource)]
+pub struct RefOrbit(pub Vec<[f32; 2]>);
+
+/// Iterate z -> z^2 + c at the reference point c in f64, storing Z_0..Z_n as
+/// f32 pairs. Stops at max_iter, REF_ORBIT_CAP, or when the orbit diverges hard.
+pub fn reference_orbit(cx: f64, cy: f64, max_iter: u32) -> Vec<[f32; 2]> {
+    let mut v = Vec::with_capacity((max_iter as usize + 1).min(REF_ORBIT_CAP));
+    v.push([0.0, 0.0]); // Z_0 = 0
+    let mut zx = 0.0f64;
+    let mut zy = 0.0f64;
+    for _ in 0..max_iter {
+        let nx = zx * zx - zy * zy + cx;
+        let ny = 2.0 * zx * zy + cy;
+        zx = nx;
+        zy = ny;
+        v.push([zx as f32, zy as f32]);
+        if zx * zx + zy * zy > 1e10 || v.len() >= REF_ORBIT_CAP {
+            break;
+        }
+    }
+    v
 }
 
 /// Per-frame simulation parameters, extracted into the render world.
@@ -77,7 +118,7 @@ fn smooth_iter(x: f64, y: f64, max_iter: u32) -> f32 {
     max_iter as f32
 }
 
-pub fn generate_particles(count: usize, max_iter: u32) -> Vec<Particle> {
+pub fn generate_particles(count: usize, max_iter: u32, center: DVec2) -> Vec<Particle> {
     (0..count)
         .into_par_iter()
         .map(|i| {
@@ -95,7 +136,8 @@ pub fn generate_particles(count: usize, max_iter: u32) -> Vec<Particle> {
                 let t = rng.f32();
                 let threshold = 3.0 + (max_iter as f32 - 12.0) * t * t * t;
                 if f > 3.0 && f >= threshold {
-                    let pos = [x as f32, y as f32];
+                    // Store relative to the view center.
+                    let pos = [(x - center.x) as f32, (y - center.y) as f32];
                     return Particle {
                         pos,
                         vel: [0.0, 0.0],
@@ -124,6 +166,23 @@ struct ParticleBuffers {
 #[derive(Resource, Default)]
 struct ParticleUniform(UniformBuffer<ParamsUniform>);
 
+/// Fixed-capacity GPU buffer holding the current reference orbit.
+#[derive(Resource)]
+struct RefOrbitBuffer(Buffer);
+
+impl FromWorld for RefOrbitBuffer {
+    fn from_world(world: &mut World) -> Self {
+        let device = world.resource::<RenderDevice>();
+        let buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("ref_orbit_buffer"),
+            size: (REF_ORBIT_CAP * std::mem::size_of::<[f32; 2]>()) as u64,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        Self(buffer)
+    }
+}
+
 #[derive(Resource)]
 struct ParticleBindGroups {
     compute: BindGroup,
@@ -148,6 +207,7 @@ impl FromWorld for ParticlePipelines {
                 (
                     storage_buffer_sized(false, None),
                     uniform_buffer::<ParamsUniform>(false),
+                    storage_buffer_read_only_sized(false, None),
                 ),
             ),
         );
@@ -250,6 +310,8 @@ fn prepare_particle_bind_groups(
     pipelines: Res<ParticlePipelines>,
     buffers: Option<Res<ParticleBuffers>>,
     params: Option<Res<SimParams>>,
+    ref_orbit: Option<Res<RefOrbit>>,
+    ref_buffer: Res<RefOrbitBuffer>,
     mut uniform: ResMut<ParticleUniform>,
 ) {
     let Some(buffers) = buffers else {
@@ -258,6 +320,12 @@ fn prepare_particle_bind_groups(
     let Some(params) = params else {
         return;
     };
+    if let Some(ref_orbit) = ref_orbit {
+        let bytes = bytemuck::cast_slice(ref_orbit.0.as_slice());
+        if !bytes.is_empty() {
+            queue.write_buffer(&ref_buffer.0, 0, bytes);
+        }
+    }
     uniform.0.set(params.0);
     uniform.0.write_buffer(&device, &queue);
     let Some(binding) = uniform.0.binding() else {
@@ -266,7 +334,11 @@ fn prepare_particle_bind_groups(
     let compute = device.create_bind_group(
         "particle_compute_bind_group",
         &pipelines.compute_layout,
-        &BindGroupEntries::sequential((buffers.buffer.as_entire_binding(), binding.clone())),
+        &BindGroupEntries::sequential((
+            buffers.buffer.as_entire_binding(),
+            binding.clone(),
+            ref_buffer.0.as_entire_binding(),
+        )),
     );
     let render = device.create_bind_group(
         "particle_render_bind_group",
@@ -352,6 +424,7 @@ impl Plugin for ParticlePlugin {
         bevy::asset::embedded_asset!(app, "shaders/particle_render.wgsl");
 
         app.add_plugins(ExtractResourcePlugin::<SimParams>::default());
+        app.add_plugins(ExtractResourcePlugin::<RefOrbit>::default());
 
         let render_app = app.sub_app_mut(RenderApp);
         render_app
@@ -375,5 +448,6 @@ impl Plugin for ParticlePlugin {
         let render_app = app.sub_app_mut(RenderApp);
         render_app.init_resource::<ParticlePipelines>();
         render_app.init_resource::<ParticleUniform>();
+        render_app.init_resource::<RefOrbitBuffer>();
     }
 }

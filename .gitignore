@@ -3,6 +3,7 @@
 
 # Backtrace / debug
 *.pdb
+*.log
 
 # Downloaded package artifacts
 *.deb
