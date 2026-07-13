@@ -1,3 +1,4 @@
+mod menu;
 mod particles;
 
 use std::sync::Arc;
@@ -12,16 +13,15 @@ use bevy::window::PresentMode;
 
 use bevy::math::DVec2;
 
+use menu::{MenuPlugin, Settings};
 use particles::{
     generate_particles, reference_orbit, ParticlePlugin, ParticleSeed, RefOrbit, SimParams,
+    MAX_PARTICLES, REF_ORBIT_CAP,
 };
 
-const BASE_ITER: u32 = 90;
+const BASE_ITER: u32 = 240;
 const DEFAULT_CENTER: DVec2 = DVec2::new(-0.55, 0.0);
 const DEFAULT_HEIGHT: f64 = 2.7;
-
-#[derive(Resource)]
-struct ParticleCount(u32);
 
 #[derive(Resource)]
 struct Paused(bool);
@@ -52,9 +52,11 @@ impl Default for ViewState {
 /// Iteration count grows with zoom depth so deep boundary detail resolves.
 /// Capped well below REF_ORBIT_CAP: cost is max_iter x 3 x particle_count every
 /// frame, so an uncapped ramp tanks the framerate (and makes input feel dead).
-fn depth_iter(height: f64) -> u32 {
+fn depth_iter(height: f64, detail: f32) -> u32 {
     let zoom = (DEFAULT_HEIGHT / height).max(1.0);
-    (90.0 + 45.0 * zoom.log2()).clamp(90.0, 320.0) as u32
+    let raw = (240.0 + 90.0 * zoom.log2()) * detail as f64;
+    // Cap below REF_ORBIT_CAP: the perturbation reference orbit is that long.
+    raw.clamp(60.0, (REF_ORBIT_CAP - 1) as f64) as u32
 }
 
 fn main() {
@@ -62,7 +64,8 @@ fn main() {
         .nth(1)
         .map(|s| s.replace('_', ""))
         .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(1_000_000);
+        .unwrap_or(2_000_000)
+        .min(MAX_PARTICLES);
 
     println!("Fractality controls:");
     println!("  hover      ripple particles");
@@ -72,6 +75,7 @@ fn main() {
     println!("  WASD       pan");
     println!("  Space      pause");
     println!("  R          reset view");
+    println!("  M / Esc    settings menu");
 
     App::new()
         .add_plugins(
@@ -86,7 +90,11 @@ fn main() {
         )
         .add_plugins(FrameTimeDiagnosticsPlugin::default())
         .add_plugins(ParticlePlugin)
-        .insert_resource(ParticleCount(count))
+        .add_plugins(MenuPlugin)
+        .insert_resource(Settings {
+            particle_count: count,
+            ..default()
+        })
         .insert_resource(ViewState::default())
         .insert_resource(Paused(false))
         .insert_resource(SimParams::default())
@@ -99,7 +107,7 @@ fn main() {
         .run();
 }
 
-fn setup(mut commands: Commands, count: Res<ParticleCount>) {
+fn setup(mut commands: Commands, settings: Res<Settings>) {
     commands.spawn((
         Camera2d,
         Camera {
@@ -108,7 +116,7 @@ fn setup(mut commands: Commands, count: Res<ParticleCount>) {
             ..default()
         },
         Bloom {
-            intensity: 0.3,
+            intensity: settings.bloom,
             ..Bloom::NATURAL
         },
         Msaa::Off,
@@ -116,7 +124,10 @@ fn setup(mut commands: Commands, count: Res<ParticleCount>) {
 
     let start = std::time::Instant::now();
     // Positions are stored relative to the view center; seed at the default one.
-    let particles = generate_particles(count.0 as usize, BASE_ITER, DEFAULT_CENTER);
+    // Seed only the initial active count (fast startup). The GPU buffer is sized
+    // to MAX_PARTICLES; raising the count later fills the tail via recycle.
+    let particles =
+        generate_particles(settings.particle_count as usize, BASE_ITER, DEFAULT_CENTER);
     info!(
         "generated {} particles in {:.2?}",
         particles.len(),
@@ -195,7 +206,7 @@ fn update_params(
     mut view: ResMut<ViewState>,
     paused: Res<Paused>,
     mouse: Res<ButtonInput<MouseButton>>,
-    count: Res<ParticleCount>,
+    settings: Res<Settings>,
     mut params: ResMut<SimParams>,
     mut ref_orbit: ResMut<RefOrbit>,
     mut frame: Local<u32>,
@@ -246,13 +257,14 @@ fn update_params(
         time.delta_secs().min(1.0 / 30.0)
     };
 
-    let max_iter = depth_iter(view.height);
+    let count = settings.particle_count.clamp(1, MAX_PARTICLES);
+    let max_iter = depth_iter(view.height, settings.detail);
     // High-precision reference orbit at the view center for perturbation.
     ref_orbit.0 = reference_orbit(view.center.x, view.center.y, max_iter);
 
     *frame = frame.wrapping_add(1);
 
-    let px = 1.3f32;
+    let px = settings.dot_px;
     let u = &mut params.0;
     u.world_to_clip = Vec4::new(scale.x, scale.y, 0.0, 0.0);
     u.mouse = match mouse_rel {
@@ -263,24 +275,26 @@ fn update_params(
     u.center_delta = center_delta;
     u.time = time.elapsed_secs();
     u.dt = dt;
-    u.count = count.0;
+    u.count = count;
     u.max_iter = max_iter;
     // Flow speed as a fraction of view height per second (shader scales by
-    // view_height), tuned so the default-zoom feel matches the original 0.22.
-    u.flow_speed = 0.081;
+    // view_height). Default 0.081 matches the original 0.22 feel at base zoom.
+    u.flow_speed = settings.flow_speed;
     u.band_k = 0.7;
     u.damping = 3.0;
-    u.brightness = 1.1 * (500_000.0 / count.0 as f32).sqrt();
+    // Normalize brightness by density so a given user setting looks the same at
+    // any particle count, then scale by the user's brightness knob.
+    u.brightness = settings.brightness * (500_000.0f32 / count as f32).sqrt();
     u.ref_len = ref_orbit.0.len() as u32;
     u.frame = *frame;
     u.reseed_rate = reseed_rate;
-    u._pad = 0.0;
+    u.detail = settings.detail;
 }
 
 fn update_title(
     time: Res<Time>,
     diagnostics: Res<DiagnosticsStore>,
-    count: Res<ParticleCount>,
+    settings: Res<Settings>,
     mut windows: Query<&mut Window>,
     mut timer: Local<f32>,
 ) {
@@ -295,8 +309,8 @@ fn update_title(
         .unwrap_or(0.0);
     if let Ok(mut window) = windows.single_mut() {
         window.title = format!(
-            "Fractality | {} particles | {:.0} FPS | wheel zoom, WASD pan, Space pause, R reset",
-            count.0, fps
+            "Fractality | {} particles | {:.0} FPS | wheel zoom, WASD pan, M menu",
+            settings.particle_count, fps
         );
     }
 }

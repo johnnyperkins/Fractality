@@ -13,6 +13,7 @@ struct Params {
     world_to_clip: vec4<f32>,
     mouse: vec4<f32>,
     particle_size: vec2<f32>,
+    center_delta: vec2<f32>,
     time: f32,
     dt: f32,
     count: u32,

@@ -25,7 +25,7 @@ struct Params {
     ref_len: u32,
     frame: u32,
     reseed_rate: f32,
-    _pad: f32,
+    detail: f32,
 };
 
 @group(0) @binding(0) var<storage, read_write> particles: array<Particle>;
@@ -109,7 +109,7 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
     let out_of_view = abs(p.pos.x) > ext.x * 2.5 || abs(p.pos.y) > ext.y * 2.5;
     let trickle = rand01(&seed) < params.reseed_rate;
     if (out_of_view || trickle) {
-        for (var k: u32 = 0u; k < 4u; k = k + 1u) {
+        for (var k: u32 = 0u; k < 8u; k = k + 1u) {
             // Feathered sampling extent: mostly ~screen size (flat, uniform
             // density across the whole visible rect incl. corners), with a soft
             // tail past the screen edge. r*r concentrates the margin near 1.05
@@ -121,7 +121,17 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
                 (rand01(&seed) * 2.0 - 1.0) * ext.y * mgn,
             );
             let f = field(cand);
-            if (f > 3.0 && f < f32(params.max_iter) - 1.0) {
+            // Boundary bias: like the CPU seed, prefer candidates near the set
+            // (high f). Without this, recycle accepts the whole exterior evenly
+            // and the boundary detail washes out to a uniform haze over a few
+            // seconds. t*t*t pushes the accept threshold up toward max_iter.
+            // Boundary tightness scales with the detail knob: exponent 4 at
+            // detail=1, higher pushes the accept threshold up toward max_iter so
+            // particles cluster into a thinner, finer boundary shell.
+            let t = rand01(&seed);
+            let bias = pow(t, 4.0 * max(params.detail, 0.1));
+            let threshold = 3.0 + (f32(params.max_iter) - 12.0) * bias;
+            if (f > 3.0 && f >= threshold && f < f32(params.max_iter) - 1.0) {
                 p.home = cand;
                 p.pos = cand;
                 p.band = f;

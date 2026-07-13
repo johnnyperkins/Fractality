@@ -60,11 +60,18 @@ pub struct ParamsUniform {
     /// Per-frame probability a particle is recycled. Rises with zoom-out speed
     /// so fill keeps pace with the newly revealed area; floors at a small trickle.
     pub reseed_rate: f32,
-    pub _pad: f32,
+    /// Boundary-tightness exponent driver. Higher = particles pack closer to the
+    /// set edge on recycle (finer, sharper boundary). Also the detail knob.
+    pub detail: f32,
 }
 
 /// Max reference-orbit length (also caps max_iter). One vec2<f32> per entry.
 pub const REF_ORBIT_CAP: usize = 2048;
+
+/// GPU particle buffer capacity. The full buffer is always allocated; the live
+/// `count` uniform caps how many are actually simulated/drawn, so the settings
+/// menu can change particle count instantly with no buffer reallocation.
+pub const MAX_PARTICLES: u32 = 12_000_000;
 
 /// CPU-computed f64 reference orbit at the view center, stored as f32 pairs.
 /// Perturbation keeps full f32 precision because particle deltas stay small.
@@ -134,7 +141,7 @@ pub fn generate_particles(count: usize, max_iter: u32, center: DVec2) -> Vec<Par
                 }
                 // Bias samples toward the boundary.
                 let t = rng.f32();
-                let threshold = 3.0 + (max_iter as f32 - 12.0) * t * t * t;
+                let threshold = 3.0 + (max_iter as f32 - 12.0) * t * t * t * t;
                 if f > 3.0 && f >= threshold {
                     // Store relative to the view center.
                     let pos = [(x - center.x) as f32, (y - center.y) as f32];
@@ -292,14 +299,21 @@ fn extract_particle_buffers(
     let Some(seed) = seed.as_ref() else {
         return;
     };
+    // Allocate at full capacity; front-load the seeded particles, zero the rest.
+    // The live `count` uniform gates how many are simulated/drawn, so the count
+    // can be raised at runtime with no reallocation. Zeroed tail particles sit at
+    // the origin and get pulled into view by the recycle trickle as count rises.
+    let mut data = vec![bytemuck::Zeroable::zeroed(); MAX_PARTICLES as usize];
+    let n = seed.0.len().min(data.len());
+    data[..n].copy_from_slice(&seed.0[..n]);
     let buffer = device.create_buffer_with_data(&BufferInitDescriptor {
         label: Some("particle_buffer"),
         usage: BufferUsages::STORAGE,
-        contents: bytemuck::cast_slice(seed.0.as_slice()),
+        contents: bytemuck::cast_slice(&data),
     });
     commands.insert_resource(ParticleBuffers {
         buffer,
-        count: seed.0.len() as u32,
+        count: MAX_PARTICLES,
     });
 }
 
@@ -368,12 +382,20 @@ impl render_graph::Node for ParticleComputeNode {
         let Some(pipeline) = cache.get_compute_pipeline(pipelines.compute_pipeline) else {
             return Ok(());
         };
+        // Simulate only the active count (buffer holds up to MAX_PARTICLES).
+        let count = world
+            .get_resource::<SimParams>()
+            .map_or(0, |p| p.0.count)
+            .min(buffers.count);
+        if count == 0 {
+            return Ok(());
+        }
         let mut pass = render_context
             .command_encoder()
             .begin_compute_pass(&ComputePassDescriptor::default());
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bind_groups.compute, &[]);
-        pass.dispatch_workgroups((buffers.count + 255) / 256, 1, 1);
+        pass.dispatch_workgroups((count + 255) / 256, 1, 1);
         Ok(())
     }
 }
@@ -409,9 +431,14 @@ impl ViewNode for ParticleDrawNode {
             timestamp_writes: None,
             occlusion_query_set: None,
         });
+        // Draw only the active count (buffer holds up to MAX_PARTICLES).
+        let count = world
+            .get_resource::<SimParams>()
+            .map_or(0, |p| p.0.count)
+            .min(buffers.count);
         pass.set_render_pipeline(pipeline);
         pass.set_bind_group(0, &bind_groups.render, &[]);
-        pass.draw(0..6, 0..buffers.count);
+        pass.draw(0..6, 0..count);
         Ok(())
     }
 }
