@@ -210,6 +210,7 @@ fn update_params(
     mut params: ResMut<SimParams>,
     mut ref_orbit: ResMut<RefOrbit>,
     mut frame: Local<u32>,
+    mut last_orbit_key: Local<Option<(DVec2, u32)>>,
 ) {
     let Ok(window) = windows.single() else {
         return;
@@ -264,7 +265,13 @@ fn update_params(
     let count = settings.particle_count.clamp(1, MAX_PARTICLES);
     let max_iter = depth_iter(view.height, settings.detail);
     // High-precision reference orbit at the view center for perturbation.
-    ref_orbit.0 = reference_orbit(view.center.x, view.center.y, max_iter);
+    // Only recompute (and re-upload, via the generation bump) when the view
+    // center or iteration count actually changed; a static view pays nothing.
+    if *last_orbit_key != Some((view.center, max_iter)) {
+        ref_orbit.points = reference_orbit(view.center.x, view.center.y, max_iter);
+        ref_orbit.generation = ref_orbit.generation.wrapping_add(1);
+        *last_orbit_key = Some((view.center, max_iter));
+    }
 
     *frame = frame.wrapping_add(1);
 
@@ -289,7 +296,7 @@ fn update_params(
     // Normalize brightness by density so a given user setting looks the same at
     // any particle count, then scale by the user's brightness knob.
     u.brightness = settings.brightness * (500_000.0f32 / count as f32).sqrt();
-    u.ref_len = ref_orbit.0.len() as u32;
+    u.ref_len = ref_orbit.points.len() as u32;
     u.frame = *frame;
     u.reseed_rate = reseed_rate;
     u.detail = settings.detail;

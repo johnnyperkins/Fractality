@@ -75,8 +75,13 @@ pub const MAX_PARTICLES: u32 = 12_000_000;
 
 /// CPU-computed f64 reference orbit at the view center, stored as f32 pairs.
 /// Perturbation keeps full f32 precision because particle deltas stay small.
+/// `generation` bumps on every recompute so the render world uploads the
+/// buffer only when the orbit actually changed.
 #[derive(Resource, Clone, Default, ExtractResource)]
-pub struct RefOrbit(pub Vec<[f32; 2]>);
+pub struct RefOrbit {
+    pub points: Vec<[f32; 2]>,
+    pub generation: u32,
+}
 
 /// Iterate z -> z^2 + c at the reference point c in f64, storing Z_0..Z_n as
 /// f32 pairs. Stops at max_iter, REF_ORBIT_CAP, or when the orbit diverges hard.
@@ -349,6 +354,7 @@ fn prepare_particle_bind_groups(
     ref_orbit: Option<Res<RefOrbit>>,
     ref_buffer: Res<RefOrbitBuffer>,
     mut uniform: ResMut<ParticleUniform>,
+    mut last_generation: Local<Option<u32>>,
 ) {
     let Some(buffers) = buffers else {
         return;
@@ -357,9 +363,12 @@ fn prepare_particle_bind_groups(
         return;
     };
     if let Some(ref_orbit) = ref_orbit {
-        let bytes = bytemuck::cast_slice(ref_orbit.0.as_slice());
-        if !bytes.is_empty() {
-            queue.write_buffer(&ref_buffer.0, 0, bytes);
+        if *last_generation != Some(ref_orbit.generation) {
+            let bytes = bytemuck::cast_slice(ref_orbit.points.as_slice());
+            if !bytes.is_empty() {
+                queue.write_buffer(&ref_buffer.0, 0, bytes);
+                *last_generation = Some(ref_orbit.generation);
+            }
         }
     }
     uniform.0.set(params.0);
