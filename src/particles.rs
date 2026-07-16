@@ -66,6 +66,9 @@ pub struct ParamsUniform {
     /// 1.0 = dissolve mode (Space): flow field inert, particles melt off their
     /// contours via diffusion; mouse impulses still apply. 0.0 = normal flow.
     pub dissolve: f32,
+    /// Palette selector for the render shader (C cycles): 0 classic, 1 bands,
+    /// 2 velocity, 3 heat.
+    pub color_mode: u32,
 }
 
 /// Max reference-orbit length (also caps max_iter). One vec2<f32> per entry.

@@ -27,6 +27,7 @@ struct Params {
     reseed_rate: f32,
     detail: f32,
     dissolve: f32,
+    color_mode: u32,
 };
 
 @group(0) @binding(0) var<storage, read_write> particles: array<Particle>;

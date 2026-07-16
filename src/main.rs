@@ -8,6 +8,7 @@ use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
 use bevy::render::camera::ClearColorConfig;
+use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 use bevy::render::view::Msaa;
 use bevy::window::PresentMode;
 
@@ -25,6 +26,32 @@ const DEFAULT_HEIGHT: f64 = 2.7;
 
 #[derive(Resource)]
 struct Dissolve(bool);
+
+/// Palette selector, cycled with C (or by clicking the menu row). Names
+/// indexed by the mode id.
+#[derive(Resource, Default)]
+pub struct ColorMode(pub u32);
+
+pub const COLOR_MODES: [&str; 4] = ["classic", "rings", "electric", "inferno"];
+
+/// Continuous zoom dive toward the cursor, toggled with Z. Any manual
+/// navigation (wheel, pan, R) cancels it.
+#[derive(Resource, Default)]
+struct AutoZoom(bool);
+
+#[derive(Clone, Copy)]
+struct Bookmark {
+    center: DVec2,
+    height: f64,
+}
+
+/// View bookmarks: Shift+1..9 saves the current view, 1..9 flies back to it.
+#[derive(Resource, Default)]
+struct Bookmarks([Option<Bookmark>; 9]);
+
+/// In-flight animated transition to a bookmarked view.
+#[derive(Resource, Default)]
+struct FlyTo(Option<Bookmark>);
 
 /// View transform. center/height are f64 so the reference point keeps ~15
 /// digits of precision, enough for zoom down to ~1e-15 (near-infinite feel).
@@ -74,6 +101,10 @@ fn main() {
     println!("  wheel      zoom toward cursor");
     println!("  WASD       pan");
     println!("  Space      dissolve");
+    println!("  Z          auto-zoom dive at cursor");
+    println!("  C          cycle color mode");
+    println!("  P          screenshot (PNG in working dir)");
+    println!("  Shift+1..9 save view, 1..9 fly back to it");
     println!("  R          reset view");
     println!("  M / Esc    settings menu");
 
@@ -97,6 +128,10 @@ fn main() {
         })
         .insert_resource(ViewState::default())
         .insert_resource(Dissolve(false))
+        .insert_resource(ColorMode::default())
+        .insert_resource(AutoZoom::default())
+        .insert_resource(Bookmarks::default())
+        .insert_resource(FlyTo::default())
         .insert_resource(SimParams::default())
         .insert_resource(RefOrbit::default())
         .add_systems(Startup, setup)
@@ -136,6 +171,22 @@ fn setup(mut commands: Commands, settings: Res<Settings>) {
     commands.insert_resource(ParticleSeed(Arc::new(particles)));
 }
 
+/// Change the view height to `new_h`, keeping the fractal point under the
+/// cursor fixed on screen (falls back to a centered zoom with no cursor).
+fn zoom_anchored(view: &mut ViewState, window: &Window, new_h: f64) {
+    let old_h = view.height;
+    if let Some(cursor) = window.cursor_position() {
+        let w = window.width().max(1.0) as f64;
+        let h = window.height().max(1.0) as f64;
+        let aspect = w / h;
+        let ndc = DVec2::new(cursor.x as f64 / w * 2.0 - 1.0, 1.0 - cursor.y as f64 / h * 2.0);
+        let cursor_fractal =
+            view.center + DVec2::new(ndc.x * old_h * aspect * 0.5, ndc.y * old_h * 0.5);
+        view.center += (cursor_fractal - view.center) * (1.0 - new_h / old_h);
+    }
+    view.height = new_h;
+}
+
 fn handle_input(
     time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
@@ -143,6 +194,11 @@ fn handle_input(
     windows: Query<&Window>,
     mut view: ResMut<ViewState>,
     mut dissolve: ResMut<Dissolve>,
+    mut color_mode: ResMut<ColorMode>,
+    mut auto_zoom: ResMut<AutoZoom>,
+    mut bookmarks: ResMut<Bookmarks>,
+    mut fly: ResMut<FlyTo>,
+    mut commands: Commands,
 ) {
     let dt = time.delta_secs() as f64;
 
@@ -162,14 +218,66 @@ fn handle_input(
     if pan != DVec2::ZERO {
         let speed = view.height * 0.6 * dt;
         view.center += pan * speed;
+        // Manual navigation takes the wheel back from any autopilot.
+        auto_zoom.0 = false;
+        fly.0 = None;
     }
 
     if keys.just_pressed(KeyCode::KeyR) {
         view.center = DEFAULT_CENTER;
         view.height = DEFAULT_HEIGHT;
+        auto_zoom.0 = false;
+        fly.0 = None;
     }
     if keys.just_pressed(KeyCode::Space) {
         dissolve.0 = !dissolve.0;
+    }
+    if keys.just_pressed(KeyCode::KeyZ) {
+        auto_zoom.0 = !auto_zoom.0;
+        fly.0 = None;
+    }
+    if keys.just_pressed(KeyCode::KeyC) {
+        color_mode.0 = (color_mode.0 + 1) % COLOR_MODES.len() as u32;
+        info!("color mode: {}", COLOR_MODES[color_mode.0 as usize]);
+    }
+    if keys.just_pressed(KeyCode::KeyP) {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let path = format!("fractality_{stamp}.png");
+        info!("saving screenshot to {path}");
+        commands
+            .spawn(Screenshot::primary_window())
+            .observe(save_to_disk(path));
+    }
+
+    // Bookmarks: Shift+digit saves the current view, plain digit flies to it.
+    let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+    const DIGITS: [KeyCode; 9] = [
+        KeyCode::Digit1,
+        KeyCode::Digit2,
+        KeyCode::Digit3,
+        KeyCode::Digit4,
+        KeyCode::Digit5,
+        KeyCode::Digit6,
+        KeyCode::Digit7,
+        KeyCode::Digit8,
+        KeyCode::Digit9,
+    ];
+    for (i, key) in DIGITS.iter().enumerate() {
+        if keys.just_pressed(*key) {
+            if shift {
+                bookmarks.0[i] = Some(Bookmark {
+                    center: view.center,
+                    height: view.height,
+                });
+                info!("saved view to bookmark {}", i + 1);
+            } else if let Some(b) = bookmarks.0[i] {
+                fly.0 = Some(b);
+                auto_zoom.0 = false;
+            }
+        }
     }
 
     let mut scroll = 0.0f64;
@@ -179,24 +287,48 @@ fn handle_input(
             MouseScrollUnit::Pixel => ev.y as f64 / 60.0,
         };
     }
+    let Ok(window) = windows.single() else {
+        return;
+    };
     if scroll != 0.0 {
-        let Ok(window) = windows.single() else {
-            return;
-        };
-        let old_h = view.height;
         // Lower clamp near f64 precision floor for the center; feels infinite.
-        let new_h = (old_h * 0.9f64.powf(scroll)).clamp(1e-15, 40.0);
-        if let Some(cursor) = window.cursor_position() {
-            let w = window.width().max(1.0) as f64;
-            let h = window.height().max(1.0) as f64;
-            let aspect = w / h;
-            let ndc = DVec2::new(cursor.x as f64 / w * 2.0 - 1.0, 1.0 - cursor.y as f64 / h * 2.0);
-            let cursor_fractal =
-                view.center + DVec2::new(ndc.x * old_h * aspect * 0.5, ndc.y * old_h * 0.5);
-            let delta = (cursor_fractal - view.center) * (1.0 - new_h / old_h);
-            view.center += delta;
+        let new_h = (view.height * 0.9f64.powf(scroll)).clamp(1e-15, 40.0);
+        zoom_anchored(&mut view, window, new_h);
+        auto_zoom.0 = false;
+        fly.0 = None;
+    }
+
+    // Auto-zoom dive: constant exponential rate toward the cursor, so the
+    // apparent speed is the same at every depth. Stops at the precision floor.
+    if auto_zoom.0 {
+        let new_h = (view.height * (-0.9 * dt).exp()).max(1e-15);
+        zoom_anchored(&mut view, window, new_h);
+        if new_h <= 1e-15 {
+            auto_zoom.0 = false;
         }
+    }
+
+    // Animated fly-to. Height moves in log space with a fixed time constant,
+    // so the trip takes a couple of seconds regardless of depth. The center
+    // gets two pulls: an anchor term matching the height shrink (keeps the
+    // target's screen position stable while diving, same math as cursor zoom)
+    // plus the same exponential decay as the height, which closes the
+    // remaining error in sync instead of leaving the target off-screen.
+    if let Some(target) = fly.0 {
+        let k = 1.0 - (-2.5 * dt).exp();
+        let old_h = view.height;
+        let new_h = (old_h.ln() + (target.height.ln() - old_h.ln()) * k).exp();
+        let shrink = (1.0 - new_h / old_h).max(0.0);
+        let pull = (shrink + k).min(1.0);
+        let step = (target.center - view.center) * pull;
+        view.center += step;
         view.height = new_h;
+        let err = (target.center - view.center).length();
+        if (new_h / target.height).ln().abs() < 0.005 && err < target.height * 0.002 {
+            view.center = target.center;
+            view.height = target.height;
+            fly.0 = None;
+        }
     }
 }
 
@@ -205,6 +337,7 @@ fn update_params(
     windows: Query<&Window>,
     mut view: ResMut<ViewState>,
     dissolve: Res<Dissolve>,
+    color_mode: Res<ColorMode>,
     mouse: Res<ButtonInput<MouseButton>>,
     over_menu: Res<PointerOverMenu>,
     settings: Res<Settings>,
@@ -302,6 +435,7 @@ fn update_params(
     u.frame = *frame;
     u.reseed_rate = reseed_rate;
     u.detail = settings.detail;
+    u.color_mode = color_mode.0;
 }
 
 fn update_title(

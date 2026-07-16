@@ -7,6 +7,7 @@ use bevy::prelude::*;
 use bevy::ui::RelativeCursorPosition;
 
 use crate::particles::MAX_PARTICLES;
+use crate::{ColorMode, COLOR_MODES};
 
 /// Live-tunable knobs. Source of truth for the whole app.
 #[derive(Resource)]
@@ -160,6 +161,14 @@ struct SettingValue(Setting);
 #[derive(Component)]
 struct SliderTrack(Setting);
 
+/// Clickable "Color mode" row; clicking cycles the palette (same as C).
+#[derive(Component)]
+struct ColorModeRow;
+
+/// The text showing the active palette name.
+#[derive(Component)]
+struct ColorModeValue;
+
 #[derive(Component)]
 struct SliderFill(Setting);
 
@@ -177,6 +186,8 @@ impl Plugin for MenuPlugin {
                     track_pointer_over_menu,
                     drag_sliders,
                     update_sliders,
+                    click_color_mode,
+                    update_color_mode_text,
                     apply_bloom,
                 ),
             );
@@ -283,11 +294,14 @@ fn control_bundle(text: &str) -> impl Bundle {
     )
 }
 
-const CONTROLS: [&str; 6] = [
+const CONTROLS: [&str; 9] = [
     "W / A / S / D  pan",
     "Scroll  zoom at cursor",
     "Left hold  blast   Right hold  vortex",
     "Space  dissolve",
+    "Z  auto-zoom dive   C  color mode",
+    "P  screenshot",
+    "Shift+1..9  save view   1..9  fly to it",
     "R  reset view",
     "Esc / M  toggle menu",
 ];
@@ -317,29 +331,58 @@ fn build_menu(mut commands: Commands) {
                 parent.spawn(row_bundle(setting));
             }
             parent.spawn((
+                Button,
                 Node {
+                    flex_direction: FlexDirection::Row,
+                    align_items: AlignItems::Center,
+                    column_gap: Val::Px(10.0),
+                    ..default()
+                },
+                ColorModeRow,
+                children![
+                    (
+                        Text::new("Color mode"),
+                        TextFont {
+                            font_size: 16.0,
+                            ..default()
+                        },
+                        TextColor(Color::srgb(0.80, 0.85, 0.95)),
+                        Node {
+                            width: Val::Px(110.0),
+                            ..default()
+                        },
+                    ),
+                    (
+                        Text::new(COLOR_MODES[0]),
+                        TextFont {
+                            font_size: 16.0,
+                            ..default()
+                        },
+                        TextColor(Color::srgb(1.0, 0.88, 0.5)),
+                        ColorModeValue,
+                    ),
+                ],
+            ));
+            parent
+                .spawn(Node {
                     flex_direction: FlexDirection::Column,
                     row_gap: Val::Px(2.0),
                     margin: UiRect::top(Val::Px(10.0)),
                     ..default()
-                },
-                children![
-                    (
+                })
+                .with_children(|col| {
+                    col.spawn((
                         Text::new("CONTROLS"),
                         TextFont {
                             font_size: 14.0,
                             ..default()
                         },
                         TextColor(Color::srgb(0.7, 0.75, 0.85)),
-                    ),
-                    control_bundle(CONTROLS[0]),
-                    control_bundle(CONTROLS[1]),
-                    control_bundle(CONTROLS[2]),
-                    control_bundle(CONTROLS[3]),
-                    control_bundle(CONTROLS[4]),
-                    control_bundle(CONTROLS[5]),
-                ],
-            ));
+                    ));
+                    for line in CONTROLS {
+                        col.spawn(control_bundle(line));
+                    }
+                });
         });
 }
 
@@ -364,7 +407,7 @@ fn toggle_menu(
 /// in progress (a track stays Pressed even after the cursor leaves it).
 fn track_pointer_over_menu(
     mut over: ResMut<PointerOverMenu>,
-    widgets: Query<&Interaction, Or<(With<MenuRoot>, With<SliderTrack>)>>,
+    widgets: Query<&Interaction, Or<(With<MenuRoot>, With<SliderTrack>, With<ColorModeRow>)>>,
 ) {
     over.0 = widgets.iter().any(|i| *i != Interaction::None);
 }
@@ -410,6 +453,31 @@ fn update_sliders(
     }
     for (mut node, fill) in &mut fills {
         node.width = Val::Percent(fill.0.fraction(&settings) * 100.0);
+    }
+}
+
+/// Clicking the row cycles the palette, same as the C key.
+fn click_color_mode(
+    mut mode: ResMut<ColorMode>,
+    rows: Query<&Interaction, (Changed<Interaction>, With<ColorModeRow>)>,
+) {
+    for interaction in &rows {
+        if *interaction == Interaction::Pressed {
+            mode.0 = (mode.0 + 1) % COLOR_MODES.len() as u32;
+        }
+    }
+}
+
+/// Keep the palette name in sync however the mode changes (click or C key).
+fn update_color_mode_text(
+    mode: Res<ColorMode>,
+    mut texts: Query<&mut Text, With<ColorModeValue>>,
+) {
+    if !mode.is_changed() {
+        return;
+    }
+    for mut text in &mut texts {
+        *text = Text::new(COLOR_MODES[mode.0 as usize]);
     }
 }
 
