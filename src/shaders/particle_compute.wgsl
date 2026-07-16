@@ -168,8 +168,15 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gl > 1e-4 && f0 < f32(params.max_iter) - 0.5) {
         gn = grad / gl;
         let tangent = vec2<f32>(-gn.y, gn.x);
-        let err = clamp((p.band - f0) * 0.7, -2.0, 2.0);
-        desired = (tangent + gn * err) * params.flow_speed * view_height;
+        let band_err = p.band - f0;
+        let err = clamp(band_err * 0.7, -2.0, 2.0);
+        // Settle factor: a large band error means the local field varies
+        // violently (deep boundary filaments), where the tangent direction is
+        // noise. Streaming there just thrashes; scale the tangential flow down
+        // so those particles slow, lock onto their contour, and trace the fine
+        // shape instead of smearing it. Well-seated particles keep full flow.
+        let settle = 1.0 / (1.0 + band_err * band_err);
+        desired = (tangent * settle + gn * err) * params.flow_speed * view_height;
         // Spatial distance from the particle to its home contour along the
         // normal: (band - f0) is the field-unit error, /gl converts to distance.
         to_band = clamp((p.band - f0) / gl, -view_height, view_height);
@@ -214,9 +221,22 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (on_contour) {
         if (dt > 0.0) {
             let alpha = clamp(params.band_k * dt, 0.0, 1.0);
-            let amp = view_height * 0.003 * min(alpha * 2.0, 1.0);
+            // Cap the per-frame pull step to a small fraction of the view. The
+            // gradient is a noisy single-sample estimate near the boundary, so
+            // an uncapped snap teleports along a wrong direction and the
+            // particle ping-pongs harder the higher the align force. A capped
+            // step converges over a few frames instead, which reads as a
+            // stable sharpening of the shape.
+            let max_step = view_height * 0.02;
+            let step = clamp(to_band * alpha, -max_step, max_step);
+            let amp = view_height * 0.0015 * min(alpha * 2.0, 1.0);
             let jitter = (rand01(&seed) * 2.0 - 1.0) * amp;
-            p.pos += gn * (to_band * alpha + jitter);
+            p.pos += gn * (step + jitter);
+            // Bleed off the velocity component along the normal: the pull
+            // corrects position but the old velocity keeps pushing off the
+            // contour, and the two fighting shows up as vibration. Removing
+            // normal velocity keeps the tangential stream intact.
+            p.vel -= gn * dot(p.vel, gn) * alpha;
         } else {
             // Paused: pull is inert; run the diffusion alone for the slow
             // dissolve effect on Space.
