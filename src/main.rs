@@ -13,7 +13,7 @@ use bevy::window::PresentMode;
 
 use bevy::math::DVec2;
 
-use menu::{MenuPlugin, Settings};
+use menu::{MenuPlugin, PointerOverMenu, Settings};
 use particles::{
     generate_particles, reference_orbit, ParticlePlugin, ParticleSeed, RefOrbit, SimParams,
     MAX_PARTICLES, REF_ORBIT_CAP,
@@ -206,6 +206,7 @@ fn update_params(
     mut view: ResMut<ViewState>,
     paused: Res<Paused>,
     mouse: Res<ButtonInput<MouseButton>>,
+    over_menu: Res<PointerOverMenu>,
     settings: Res<Settings>,
     mut params: ResMut<SimParams>,
     mut ref_orbit: ResMut<RefOrbit>,
@@ -247,7 +248,11 @@ fn update_params(
         let ndc = Vec2::new(c.x / w * 2.0 - 1.0, 1.0 - c.y / h * 2.0);
         ndc / scale
     });
-    let button = if mouse.pressed(MouseButton::Left) {
+    // Cursor over the panel (or mid slider-drag): clicks are for the UI,
+    // not the blast/vortex force.
+    let button = if over_menu.0 {
+        0.0
+    } else if mouse.pressed(MouseButton::Left) {
         1.0
     } else if mouse.pressed(MouseButton::Right) {
         -1.0
