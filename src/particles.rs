@@ -63,6 +63,9 @@ pub struct ParamsUniform {
     /// Boundary-tightness exponent driver. Higher = particles pack closer to the
     /// set edge on recycle (finer, sharper boundary). Also the detail knob.
     pub detail: f32,
+    /// 1.0 = dissolve mode (Space): flow field inert, particles melt off their
+    /// contours via diffusion; mouse impulses still apply. 0.0 = normal flow.
+    pub dissolve: f32,
 }
 
 /// Max reference-orbit length (also caps max_iter). One vec2<f32> per entry.

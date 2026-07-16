@@ -26,6 +26,7 @@ struct Params {
     frame: u32,
     reseed_rate: f32,
     detail: f32,
+    dissolve: f32,
 };
 
 @group(0) @binding(0) var<storage, read_write> particles: array<Particle>;
@@ -267,6 +268,13 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
         desired = (p.home - p.pos) * 0.6;
     }
 
+    // Dissolve mode (Space): the flow field goes inert - no tangential
+    // stream, no home pull - so damping bleeds particles to rest and only
+    // mouse impulses and the diffusion below move them.
+    if (params.dissolve > 0.5) {
+        desired = vec2<f32>(0.0, 0.0);
+    }
+
     // Mouse interaction: hover ripple, left blast, right vortex.
     var impulse = vec2<f32>(0.0, 0.0);
     if (dist < radius) {
@@ -300,37 +308,35 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
     // is the perfectly crisp static boundary, and turning it up buys stronger
     // streams while the matching pull keeps the fuzz bounded to ~jitter size.
     // The branch's mistake was a large fixed jitter (0.008) with no such link.
-    if (on_contour) {
-        if (dt > 0.0) {
-            let alpha = clamp(params.band_k * dt, 0.0, 1.0);
-            // Cap the per-frame pull step to a small fraction of the view. The
-            // field varies violently near the boundary, so even the exact
-            // local gradient changes direction step to step; an uncapped snap
-            // teleports along a soon-stale direction and the particle
-            // ping-pongs harder the higher the align force. A capped step
-            // converges over a few frames instead, which reads as a stable
-            // sharpening of the shape.
-            // Shell particles get a much tighter cap: the field is wildest
-            // there, so at high align force a 2% hop per frame reads as
-            // boiling. Small steps converge just as surely, only smoother.
-            let max_step = view_height * mix(0.003, 0.02, calm);
-            let step = clamp(to_band * alpha, -max_step, max_step);
-            // Jitter scales with calm too: shell particles get almost none,
-            // so the diffusion ratchet only churns the outer flow.
-            let amp = view_height * 0.0015 * min(alpha * 2.0, 1.0) * calm;
-            let jitter = (rand01(&seed) * 2.0 - 1.0) * amp;
-            p.pos += gn * (step + jitter);
-            // Bleed off the velocity component along the normal: the pull
-            // corrects position but the old velocity keeps pushing off the
-            // contour, and the two fighting shows up as vibration. Removing
-            // normal velocity keeps the tangential stream intact.
-            p.vel -= gn * dot(p.vel, gn) * alpha;
-        } else {
-            // Paused: pull is inert; run the diffusion alone for the slow
-            // dissolve effect on Space.
-            let jitter = (rand01(&seed) * 2.0 - 1.0) * view_height * 0.008;
-            p.pos += gn * jitter;
-        }
+    if (on_contour && params.dissolve > 0.5) {
+        // Dissolve: the pull is inert; diffusion alone along the gradient
+        // normal gives the slow melt off the contours.
+        let jitter = (rand01(&seed) * 2.0 - 1.0) * view_height * 0.008;
+        p.pos += gn * jitter;
+    } else if (on_contour && dt > 0.0) {
+        let alpha = clamp(params.band_k * dt, 0.0, 1.0);
+        // Cap the per-frame pull step to a small fraction of the view. The
+        // field varies violently near the boundary, so even the exact
+        // local gradient changes direction step to step; an uncapped snap
+        // teleports along a soon-stale direction and the particle
+        // ping-pongs harder the higher the align force. A capped step
+        // converges over a few frames instead, which reads as a stable
+        // sharpening of the shape.
+        // Shell particles get a much tighter cap: the field is wildest
+        // there, so at high align force a 2% hop per frame reads as
+        // boiling. Small steps converge just as surely, only smoother.
+        let max_step = view_height * mix(0.003, 0.02, calm);
+        let step = clamp(to_band * alpha, -max_step, max_step);
+        // Jitter scales with calm too: shell particles get almost none,
+        // so the diffusion ratchet only churns the outer flow.
+        let amp = view_height * 0.0015 * min(alpha * 2.0, 1.0) * calm;
+        let jitter = (rand01(&seed) * 2.0 - 1.0) * amp;
+        p.pos += gn * (step + jitter);
+        // Bleed off the velocity component along the normal: the pull
+        // corrects position but the old velocity keeps pushing off the
+        // contour, and the two fighting shows up as vibration. Removing
+        // normal velocity keeps the tangential stream intact.
+        p.vel -= gn * dot(p.vel, gn) * alpha;
     }
 
     // Safety: respawn NaN particles at home. The negated <= form is false for

@@ -24,7 +24,7 @@ const DEFAULT_CENTER: DVec2 = DVec2::new(-0.55, 0.0);
 const DEFAULT_HEIGHT: f64 = 2.7;
 
 #[derive(Resource)]
-struct Paused(bool);
+struct Dissolve(bool);
 
 /// View transform. center/height are f64 so the reference point keeps ~15
 /// digits of precision, enough for zoom down to ~1e-15 (near-infinite feel).
@@ -73,7 +73,7 @@ fn main() {
     println!("  right-click vortex");
     println!("  wheel      zoom toward cursor");
     println!("  WASD       pan");
-    println!("  Space      pause");
+    println!("  Space      dissolve");
     println!("  R          reset view");
     println!("  M / Esc    settings menu");
 
@@ -96,7 +96,7 @@ fn main() {
             ..default()
         })
         .insert_resource(ViewState::default())
-        .insert_resource(Paused(false))
+        .insert_resource(Dissolve(false))
         .insert_resource(SimParams::default())
         .insert_resource(RefOrbit::default())
         .add_systems(Startup, setup)
@@ -142,7 +142,7 @@ fn handle_input(
     mut wheel: EventReader<MouseWheel>,
     windows: Query<&Window>,
     mut view: ResMut<ViewState>,
-    mut paused: ResMut<Paused>,
+    mut dissolve: ResMut<Dissolve>,
 ) {
     let dt = time.delta_secs() as f64;
 
@@ -169,7 +169,7 @@ fn handle_input(
         view.height = DEFAULT_HEIGHT;
     }
     if keys.just_pressed(KeyCode::Space) {
-        paused.0 = !paused.0;
+        dissolve.0 = !dissolve.0;
     }
 
     let mut scroll = 0.0f64;
@@ -204,7 +204,7 @@ fn update_params(
     time: Res<Time>,
     windows: Query<&Window>,
     mut view: ResMut<ViewState>,
-    paused: Res<Paused>,
+    dissolve: Res<Dissolve>,
     mouse: Res<ButtonInput<MouseButton>>,
     over_menu: Res<PointerOverMenu>,
     settings: Res<Settings>,
@@ -261,11 +261,7 @@ fn update_params(
     };
     let radius = (view.height * 0.09) as f32;
 
-    let dt = if paused.0 {
-        0.0
-    } else {
-        time.delta_secs().min(1.0 / 30.0)
-    };
+    let dt = time.delta_secs().min(1.0 / 30.0);
 
     let count = settings.particle_count.clamp(1, MAX_PARTICLES);
     let max_iter = depth_iter(view.height, settings.detail);
@@ -296,6 +292,7 @@ fn update_params(
     // Flow speed as a fraction of view height per second (shader scales by
     // view_height). Default 0.081 matches the original 0.22 feel at base zoom.
     u.flow_speed = settings.flow_speed;
+    u.dissolve = if dissolve.0 { 1.0 } else { 0.0 };
     u.band_k = settings.align_force;
     u.damping = 3.0;
     // Normalize brightness by density so a given user setting looks the same at

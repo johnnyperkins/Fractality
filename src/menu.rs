@@ -287,7 +287,7 @@ const CONTROLS: [&str; 6] = [
     "W / A / S / D  pan",
     "Scroll  zoom at cursor",
     "Left hold  blast   Right hold  vortex",
-    "Space  pause",
+    "Space  dissolve",
     "R  reset view",
     "Esc / M  toggle menu",
 ];
