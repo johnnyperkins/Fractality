@@ -199,9 +199,12 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     // Mouse geometry, needed both by the stagger gate and the impulse below.
+    // The distance floor (division guard for dir) must scale with the view:
+    // radius shrinks with zoom, and any absolute floor eventually exceeds it,
+    // silently killing the blast/vortex at deep zoom.
     let d = p.pos - params.mouse.xy;
-    let dist = max(length(d), 1e-7);
     let radius = params.mouse.w;
+    let dist = max(length(d), radius * 1e-4);
 
     // Stagger: shell particles (calm ~ 0) are deliberately near-frozen, yet
     // still pay the full field cost every frame. For settled particles band
@@ -270,10 +273,10 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
         let fall = 1.0 - dist / radius;
         let dir = d / dist;
         if (params.mouse.z > 0.5) {
-            impulse = dir * fall * fall * radius * 60.0;
+            impulse = dir * fall * fall * radius * 240.0;
         } else if (params.mouse.z < -0.5) {
             let perp = vec2<f32>(-dir.y, dir.x);
-            impulse = (perp * 2.5 - dir * 2.0) * fall * radius * 14.0;
+            impulse = (perp * 2.5 - dir * 2.0) * fall * radius * 56.0;
         } else {
             impulse = dir * fall * fall * radius * 5.0;
         }
