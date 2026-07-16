@@ -38,16 +38,17 @@ fn vs(
     @builtin(vertex_index) vertex_index: u32,
     @builtin(instance_index) instance_index: u32,
 ) -> VsOut {
-    var corners = array<vec2<f32>, 6>(
-        vec2<f32>(-1.0, -1.0),
-        vec2<f32>(1.0, -1.0),
-        vec2<f32>(1.0, 1.0),
-        vec2<f32>(-1.0, -1.0),
-        vec2<f32>(1.0, 1.0),
-        vec2<f32>(-1.0, 1.0),
+    // Quad corner from the vertex index without a runtime-indexed array
+    // (which naga lowers to per-vertex private memory). Vertices 0..5 map to
+    // corner ids 0,1,2 / 2,3,0 - two triangles covering the quad - and corner
+    // id c walks (-1,-1),(1,-1),(1,1),(-1,1) counterclockwise. Culling is off,
+    // so winding is irrelevant.
+    let c = (vertex_index % 3u + (vertex_index / 3u) * 2u) % 4u;
+    let corner = vec2<f32>(
+        select(-1.0, 1.0, c == 1u || c == 2u),
+        select(-1.0, 1.0, c >= 2u),
     );
     let p = particles[instance_index];
-    let corner = corners[vertex_index];
 
     let clip_xy = p.pos * params.world_to_clip.xy + params.world_to_clip.zw
         + corner * params.particle_size;
