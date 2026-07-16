@@ -355,6 +355,7 @@ fn prepare_particle_bind_groups(
     ref_buffer: Res<RefOrbitBuffer>,
     mut uniform: ResMut<ParticleUniform>,
     mut last_generation: Local<Option<u32>>,
+    existing_bind_groups: Option<Res<ParticleBindGroups>>,
 ) {
     let Some(buffers) = buffers else {
         return;
@@ -373,6 +374,13 @@ fn prepare_particle_bind_groups(
     }
     uniform.0.set(params.0);
     uniform.0.write_buffer(&device, &queue);
+    // Bind groups are immortal: the particle and ref-orbit buffers are created
+    // once at fixed capacity, and the uniform buffer is allocated on its first
+    // write and never resized (constant size), so nothing they reference ever
+    // moves. Create them on the first frame and reuse forever.
+    if existing_bind_groups.is_some() {
+        return;
+    }
     let Some(binding) = uniform.0.binding() else {
         return;
     };
