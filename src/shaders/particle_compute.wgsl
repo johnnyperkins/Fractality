@@ -198,6 +198,25 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
+    // Mouse geometry, needed both by the stagger gate and the impulse below.
+    let d = p.pos - params.mouse.xy;
+    let dist = max(length(d), 1e-7);
+    let radius = params.mouse.w;
+
+    // Stagger: shell particles (calm ~ 0) are deliberately near-frozen, yet
+    // still pay the full field cost every frame. For settled particles band
+    // tracks the local field value, so it predicts calm without computing the
+    // field; skip 3 of 4 frames for those. Recycle checks above still run
+    // every frame, and mouse-adjacent particles always update so interactions
+    // stay responsive. NaN pos/band fails these compares and falls through to
+    // the full path, where the NaN guard at the end catches it.
+    let depth_est = p.band / f32(params.max_iter);
+    let calm_est = 1.0 - 0.95 * smoothstep(0.25, 0.75, depth_est);
+    if (calm_est < 0.2 && dist > radius * 2.0 && (idx + params.frame) % 4u != 0u) {
+        particles[idx] = p;
+        return;
+    }
+
     // Field value and exact gradient from one fused perturbation loop.
     let fg = field_grad(p.pos);
     let f0 = fg.f;
@@ -247,9 +266,6 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // Mouse interaction: hover ripple, left blast, right vortex.
     var impulse = vec2<f32>(0.0, 0.0);
-    let d = p.pos - params.mouse.xy;
-    let dist = max(length(d), 1e-7);
-    let radius = params.mouse.w;
     if (dist < radius) {
         let fall = 1.0 - dist / radius;
         let dir = d / dist;
