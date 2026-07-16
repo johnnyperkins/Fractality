@@ -50,7 +50,7 @@ impl Default for ViewState {
 }
 
 /// Iteration count grows with zoom depth so deep boundary detail resolves.
-/// Capped well below REF_ORBIT_CAP: cost is max_iter x 3 x particle_count every
+/// Capped well below REF_ORBIT_CAP: cost is ~max_iter x particle_count every
 /// frame, so an uncapped ramp tanks the framerate (and makes input feel dead).
 fn depth_iter(height: f64, detail: f32) -> u32 {
     let zoom = (DEFAULT_HEIGHT / height).max(1.0);

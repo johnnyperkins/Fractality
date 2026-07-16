@@ -73,6 +73,51 @@ fn field(dc: vec2<f32>) -> f32 {
     return f32(params.max_iter);
 }
 
+struct FieldGrad {
+    f: f32,
+    grad: vec2<f32>,
+};
+
+// ln(2)^2, chain-rule constant for the smooth-field gradient.
+const LN2_SQ: f32 = 0.4804530139182014;
+
+// field() plus its exact spatial gradient in one perturbation loop. The
+// derivative of the full orbit w.r.t. c is iterated alongside the delta
+// (der_{n+1} = 2*z_n*der_n + 1, using the full z, so rebasing does not affect
+// it). At escape the gradient of f = n + 1 - log2(0.5*log2(|z|^2)) follows by
+// chain rule: grad f = -z*conj(der) / (|z|^2 * 0.5*log2(|z|^2) * ln(2)^2).
+// One analytic loop replaces three finite-difference field() calls and has no
+// step-size (eps) tuning, staying exact at any zoom depth.
+fn field_grad(dc: vec2<f32>) -> FieldGrad {
+    var dz = vec2<f32>(0.0, 0.0);
+    var der = vec2<f32>(0.0, 0.0);
+    var ri: u32 = 0u;
+    var z_ref = vec2<f32>(0.0, 0.0);
+    let last = params.ref_len - 1u;
+    for (var n: u32 = 0u; n < params.max_iter; n = n + 1u) {
+        let z_full = z_ref + dz; // full z_n
+        der = 2.0 * cmul(z_full, der) + vec2<f32>(1.0, 0.0);
+        dz = 2.0 * cmul(z_ref, dz) + cmul(dz, dz) + dc;
+        ri = ri + 1u;
+        let z_ref_next = ref_orbit[ri];
+        let z = z_ref_next + dz;
+        let m = dot(z, z);
+        if (m > 256.0) {
+            let u = 0.5 * log2(m);
+            let g = -cmul(z, vec2<f32>(der.x, -der.y)) / (m * u * LN2_SQ);
+            return FieldGrad(f32(n) + 1.0 - log2(u), g);
+        }
+        if (m < dot(dz, dz) || ri >= last) {
+            dz = z;
+            ri = 0u;
+            z_ref = vec2<f32>(0.0, 0.0);
+        } else {
+            z_ref = z_ref_next;
+        }
+    }
+    return FieldGrad(f32(params.max_iter), vec2<f32>(0.0, 0.0));
+}
+
 fn hash_u32(x0: u32) -> u32 {
     var h = x0;
     h = h ^ (h >> 16u);
@@ -145,23 +190,18 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
                 p.hue = fract(f * 0.045 + 0.62);
                 p.vel = vec2<f32>(0.0, 0.0);
                 // Skip flow/mouse this frame: on a spike (fast zoom-out) this
-                // avoids the 3 gradient field() calls on every respawned
-                // particle, keeping the frame's total field() work bounded.
+                // avoids the field_grad() call on every respawned particle,
+                // keeping the frame's total field work bounded.
                 particles[idx] = p;
                 return;
             }
         }
     }
 
-    // Gradient of the field by forward differences. Scale the sample step with
-    // the current view height so the gradient stays accurate when zoomed deep.
-    // Step scales with the view so the finite-difference delta stays ~constant
-    // in field units at any zoom (no fixed floor, which would over-sample deep).
-    let eps = clamp(view_height * 0.0008, 1e-30, 0.004);
-    let f0 = field(p.pos);
-    let fx = field(p.pos + vec2<f32>(eps, 0.0));
-    let fy = field(p.pos + vec2<f32>(0.0, eps));
-    let grad = vec2<f32>(fx - f0, fy - f0) / eps;
+    // Field value and exact gradient from one fused perturbation loop.
+    let fg = field_grad(p.pos);
+    let f0 = fg.f;
+    let grad = fg.grad;
     let gl = length(grad);
 
     // Advect along iso-contours, correcting back toward the home band. The
@@ -173,7 +213,9 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
     var to_band = 0.0;
     var on_contour = false;
     var calm = 1.0;
-    if (gl > 1e-4 && f0 < f32(params.max_iter) - 0.5) {
+    // Upper bound rejects the rare overflowed derivative (inf gl) so gn stays
+    // finite; NaN gl fails the compare and also falls through to the home pull.
+    if (gl > 1e-4 && gl < 1e30 && f0 < f32(params.max_iter) - 0.5) {
         gn = grad / gl;
         let tangent = vec2<f32>(-gn.y, gn.x);
         let band_err = p.band - f0;
@@ -243,14 +285,15 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (dt > 0.0) {
             let alpha = clamp(params.band_k * dt, 0.0, 1.0);
             // Cap the per-frame pull step to a small fraction of the view. The
-            // gradient is a noisy single-sample estimate near the boundary, so
-            // an uncapped snap teleports along a wrong direction and the
-            // particle ping-pongs harder the higher the align force. A capped
-            // step converges over a few frames instead, which reads as a
-            // stable sharpening of the shape.
-            // Shell particles get a much tighter cap: their gradient estimate
-            // is the noisiest, so at high align force a 2% hop per frame reads
-            // as boiling. Small steps converge just as surely, only smoother.
+            // field varies violently near the boundary, so even the exact
+            // local gradient changes direction step to step; an uncapped snap
+            // teleports along a soon-stale direction and the particle
+            // ping-pongs harder the higher the align force. A capped step
+            // converges over a few frames instead, which reads as a stable
+            // sharpening of the shape.
+            // Shell particles get a much tighter cap: the field is wildest
+            // there, so at high align force a 2% hop per frame reads as
+            // boiling. Small steps converge just as surely, only smoother.
             let max_step = view_height * mix(0.003, 0.02, calm);
             let step = clamp(to_band * alpha, -max_step, max_step);
             // Jitter scales with calm too: shell particles get almost none,
