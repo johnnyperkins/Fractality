@@ -183,7 +183,11 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
         // mid-field, leaving the outer haze streaming normally.
         let depth = f0 / f32(params.max_iter);
         calm = 1.0 - 0.95 * smoothstep(0.25, 0.75, depth);
-        desired = (tangent * settle * calm + gn * err) * params.flow_speed * view_height;
+        // The normal velocity correction also rides the noisy gradient, so on
+        // the shell it mostly injects thrash; the capped positional pull below
+        // holds those particles instead. Keep it strong only for outer flow.
+        desired = (tangent * settle * calm + gn * err * mix(0.25, 1.0, calm))
+            * params.flow_speed * view_height;
         // Spatial distance from the particle to its home contour along the
         // normal: (band - f0) is the field-unit error, /gl converts to distance.
         to_band = clamp((p.band - f0) / gl, -view_height, view_height);
@@ -237,7 +241,10 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
             // particle ping-pongs harder the higher the align force. A capped
             // step converges over a few frames instead, which reads as a
             // stable sharpening of the shape.
-            let max_step = view_height * 0.02;
+            // Shell particles get a much tighter cap: their gradient estimate
+            // is the noisiest, so at high align force a 2% hop per frame reads
+            // as boiling. Small steps converge just as surely, only smoother.
+            let max_step = view_height * (0.003 + 0.017 * calm);
             let step = clamp(to_band * alpha, -max_step, max_step);
             // Jitter scales with calm too: shell particles get almost none,
             // so the diffusion ratchet only churns the outer flow.
