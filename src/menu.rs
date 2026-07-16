@@ -7,7 +7,7 @@ use bevy::prelude::*;
 use bevy::ui::RelativeCursorPosition;
 
 use crate::particles::MAX_PARTICLES;
-use crate::{ColorMode, COLOR_MODES};
+use crate::{ColorMode, FractalType, COLOR_MODES, FRACTAL_MODES};
 
 /// Live-tunable knobs. Source of truth for the whole app.
 #[derive(Resource)]
@@ -169,6 +169,14 @@ struct ColorModeRow;
 #[derive(Component)]
 struct ColorModeValue;
 
+/// Clickable "Fractal" row; clicking cycles the fractal type (same as F).
+#[derive(Component)]
+struct FractalRow;
+
+/// The text showing the active fractal name.
+#[derive(Component)]
+struct FractalValue;
+
 #[derive(Component)]
 struct SliderFill(Setting);
 
@@ -188,6 +196,8 @@ impl Plugin for MenuPlugin {
                     update_sliders,
                     click_color_mode,
                     update_color_mode_text,
+                    click_fractal,
+                    update_fractal_text,
                     apply_bloom,
                 ),
             );
@@ -294,12 +304,13 @@ fn control_bundle(text: &str) -> impl Bundle {
     )
 }
 
-const CONTROLS: [&str; 9] = [
+const CONTROLS: [&str; 10] = [
     "W / A / S / D  pan",
     "Scroll  zoom at cursor",
     "Left hold  blast   Right hold  vortex",
     "Space  dissolve",
     "Z  auto-zoom dive   C  color mode",
+    "F  fractal type",
     "P  screenshot",
     "Shift+1..9  save view   1..9  fly to it",
     "R  reset view",
@@ -330,6 +341,39 @@ fn build_menu(mut commands: Commands) {
             for setting in SETTINGS {
                 parent.spawn(row_bundle(setting));
             }
+            parent.spawn((
+                Button,
+                Node {
+                    flex_direction: FlexDirection::Row,
+                    align_items: AlignItems::Center,
+                    column_gap: Val::Px(10.0),
+                    ..default()
+                },
+                FractalRow,
+                children![
+                    (
+                        Text::new("Fractal"),
+                        TextFont {
+                            font_size: 16.0,
+                            ..default()
+                        },
+                        TextColor(Color::srgb(0.80, 0.85, 0.95)),
+                        Node {
+                            width: Val::Px(110.0),
+                            ..default()
+                        },
+                    ),
+                    (
+                        Text::new(FRACTAL_MODES[0]),
+                        TextFont {
+                            font_size: 16.0,
+                            ..default()
+                        },
+                        TextColor(Color::srgb(1.0, 0.88, 0.5)),
+                        FractalValue,
+                    ),
+                ],
+            ));
             parent.spawn((
                 Button,
                 Node {
@@ -407,7 +451,15 @@ fn toggle_menu(
 /// in progress (a track stays Pressed even after the cursor leaves it).
 fn track_pointer_over_menu(
     mut over: ResMut<PointerOverMenu>,
-    widgets: Query<&Interaction, Or<(With<MenuRoot>, With<SliderTrack>, With<ColorModeRow>)>>,
+    widgets: Query<
+        &Interaction,
+        Or<(
+            With<MenuRoot>,
+            With<SliderTrack>,
+            With<ColorModeRow>,
+            With<FractalRow>,
+        )>,
+    >,
 ) {
     over.0 = widgets.iter().any(|i| *i != Interaction::None);
 }
@@ -478,6 +530,31 @@ fn update_color_mode_text(
     }
     for mut text in &mut texts {
         *text = Text::new(COLOR_MODES[mode.0 as usize]);
+    }
+}
+
+/// Clicking the row cycles the fractal type, same as the F key.
+fn click_fractal(
+    mut fractal: ResMut<FractalType>,
+    rows: Query<&Interaction, (Changed<Interaction>, With<FractalRow>)>,
+) {
+    for interaction in &rows {
+        if *interaction == Interaction::Pressed {
+            fractal.0 = (fractal.0 + 1) % FRACTAL_MODES.len() as u32;
+        }
+    }
+}
+
+/// Keep the fractal name in sync however the type changes (click or F key).
+fn update_fractal_text(
+    fractal: Res<FractalType>,
+    mut texts: Query<&mut Text, With<FractalValue>>,
+) {
+    if !fractal.is_changed() {
+        return;
+    }
+    for mut text in &mut texts {
+        *text = Text::new(FRACTAL_MODES[fractal.0 as usize]);
     }
 }
 

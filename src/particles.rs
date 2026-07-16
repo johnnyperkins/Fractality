@@ -69,6 +69,9 @@ pub struct ParamsUniform {
     /// Palette selector for the render shader (C cycles): 0 classic, 1 bands,
     /// 2 velocity, 3 heat.
     pub color_mode: u32,
+    /// Fractal formula (F cycles): 0 Mandelbrot, 1 Burning Ship, 2 Tricorn,
+    /// 3 Multibrot-3, 4 Julia. Must match the switch in the compute shader.
+    pub fractal_type: u32,
 }
 
 /// Max reference-orbit length (also caps max_iter). One vec2<f32> per entry.
@@ -89,16 +92,58 @@ pub struct RefOrbit {
     pub generation: u32,
 }
 
-/// Iterate z -> z^2 + c at the reference point c in f64, storing Z_0..Z_n as
+/// Fixed Julia parameter for fractal type 4. Only the CPU needs it: the GPU
+/// delta iteration for Julia has no c term (dc seeds dz_0 instead).
+pub const JULIA_C: (f64, f64) = (-0.7269, 0.1889);
+
+/// One iteration of the selected fractal map in f64. Types must match the
+/// switch in the compute shader: 0 Mandelbrot (also Julia's map), 1 Burning
+/// Ship, 2 Tricorn, 3 Multibrot-3.
+fn fractal_step(zx: f64, zy: f64, cx: f64, cy: f64, ftype: u32) -> (f64, f64) {
+    match ftype {
+        1 => {
+            let ax = zx.abs();
+            let ay = zy.abs();
+            (ax * ax - ay * ay + cx, 2.0 * ax * ay + cy)
+        }
+        2 => (zx * zx - zy * zy + cx, -2.0 * zx * zy + cy),
+        3 => (
+            zx * (zx * zx - 3.0 * zy * zy) + cx,
+            zy * (3.0 * zx * zx - zy * zy) + cy,
+        ),
+        _ => (zx * zx - zy * zy + cx, 2.0 * zx * zy + cy),
+    }
+}
+
+/// Initial z and effective c for a point of the given fractal. Julia iterates
+/// the point itself under a fixed c; everything else iterates from 0 with the
+/// point as c.
+fn orbit_start(x: f64, y: f64, ftype: u32) -> (f64, f64, f64, f64) {
+    if ftype == 4 {
+        (x, y, JULIA_C.0, JULIA_C.1)
+    } else {
+        (0.0, 0.0, x, y)
+    }
+}
+
+/// 1/log2(power): smooth-iteration scale so fractional bands stay continuous
+/// for maps of power != 2 (only Multibrot-3 here).
+fn inv_log2_power(ftype: u32) -> f64 {
+    if ftype == 3 {
+        1.0 / 3.0f64.log2()
+    } else {
+        1.0
+    }
+}
+
+/// Iterate the selected map at the reference point in f64, storing Z_0..Z_n as
 /// f32 pairs. Stops at max_iter, REF_ORBIT_CAP, or when the orbit diverges hard.
-pub fn reference_orbit(cx: f64, cy: f64, max_iter: u32) -> Vec<[f32; 2]> {
+pub fn reference_orbit(cx: f64, cy: f64, max_iter: u32, ftype: u32) -> Vec<[f32; 2]> {
+    let (mut zx, mut zy, ccx, ccy) = orbit_start(cx, cy, ftype);
     let mut v = Vec::with_capacity((max_iter as usize + 1).min(REF_ORBIT_CAP));
-    v.push([0.0, 0.0]); // Z_0 = 0
-    let mut zx = 0.0f64;
-    let mut zy = 0.0f64;
+    v.push([zx as f32, zy as f32]); // Z_0 (0 except Julia, where it's the center)
     for _ in 0..max_iter {
-        let nx = zx * zx - zy * zy + cx;
-        let ny = 2.0 * zx * zy + cy;
+        let (nx, ny) = fractal_step(zx, zy, ccx, ccy, ftype);
         zx = nx;
         zy = ny;
         v.push([zx as f32, zy as f32]);
@@ -120,32 +165,45 @@ pub struct ParticleSeed(pub Arc<Vec<Particle>>);
 /// Smooth escape-time field on the CPU (f64). The formula and the escape
 /// radius (256.0) must be identical to field() in the WGSL shaders so that
 /// CPU band values match GPU field values.
-fn smooth_iter(x: f64, y: f64, max_iter: u32) -> f32 {
-    let mut zx = 0.0f64;
-    let mut zy = 0.0f64;
+fn smooth_iter(x: f64, y: f64, max_iter: u32, ftype: u32) -> f32 {
+    let (mut zx, mut zy, cx, cy) = orbit_start(x, y, ftype);
+    let ilp = inv_log2_power(ftype);
     for i in 0..max_iter {
-        let nx = zx * zx - zy * zy + x;
-        let ny = 2.0 * zx * zy + y;
+        let (nx, ny) = fractal_step(zx, zy, cx, cy, ftype);
         zx = nx;
         zy = ny;
         let m = zx * zx + zy * zy;
         if m > 256.0 {
-            return i as f32 + 1.0 - ((0.5 * m.log2()).log2()) as f32;
+            return i as f32 + 1.0 - ((0.5 * m.log2()).log2() * ilp) as f32;
         }
     }
     max_iter as f32
 }
 
-pub fn generate_particles(count: usize, max_iter: u32, center: DVec2) -> Vec<Particle> {
+/// Seed-sampling rectangle (x0, x1, y0, y1) covering the fractal's exterior
+/// boundary region. Coarse is fine: rejection keeps only boundary points and
+/// the GPU recycle resamples the live view within seconds anyway.
+fn spawn_rect(ftype: u32) -> (f64, f64, f64, f64) {
+    match ftype {
+        1 => (-2.5, 1.6, -2.0, 1.0),
+        2 => (-2.4, 1.6, -2.0, 2.0),
+        3 => (-1.6, 1.6, -1.6, 1.6),
+        4 => (-1.8, 1.8, -1.3, 1.3),
+        _ => (-2.3, 0.85, -1.3, 1.3),
+    }
+}
+
+pub fn generate_particles(count: usize, max_iter: u32, center: DVec2, ftype: u32) -> Vec<Particle> {
+    let (x0, x1, y0, y1) = spawn_rect(ftype);
     (0..count)
         .into_par_iter()
         .map(|i| {
             let mut rng =
                 fastrand::Rng::with_seed(0x9E3779B97F4A7C15u64.wrapping_mul(i as u64 + 1));
             loop {
-                let x = -2.3 + rng.f64() * (0.85 - (-2.3));
-                let y = -1.3 + rng.f64() * (1.3 - (-1.3));
-                let f = smooth_iter(x, y, max_iter);
+                let x = x0 + rng.f64() * (x1 - x0);
+                let y = y0 + rng.f64() * (y1 - y0);
+                let f = smooth_iter(x, y, max_iter, ftype);
                 // Inside the set: reject.
                 if f >= max_iter as f32 - 1.0 {
                     continue;

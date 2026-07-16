@@ -34,6 +34,26 @@ pub struct ColorMode(pub u32);
 
 pub const COLOR_MODES: [&str; 4] = ["classic", "rings", "electric", "inferno"];
 
+/// Fractal formula selector, cycled with F (or by clicking the menu row).
+/// Ids must match the switch in the compute shader and fractal_step() on the
+/// CPU side.
+#[derive(Resource, Default)]
+pub struct FractalType(pub u32);
+
+pub const FRACTAL_MODES: [&str; 5] =
+    ["mandelbrot", "burning ship", "tricorn", "multibrot-3", "julia"];
+
+/// Home view (center, height) per fractal, used on R reset and when switching.
+fn fractal_default_view(ftype: u32) -> (DVec2, f64) {
+    match ftype {
+        1 => (DVec2::new(-0.4, -0.5), 3.0),
+        2 => (DVec2::new(-0.3, 0.0), 3.4),
+        3 => (DVec2::ZERO, 3.0),
+        4 => (DVec2::ZERO, 3.0),
+        _ => (DEFAULT_CENTER, DEFAULT_HEIGHT),
+    }
+}
+
 /// Continuous zoom dive toward the cursor, toggled with Z. Any manual
 /// navigation (wheel, pan, R) cancels it.
 #[derive(Resource, Default)]
@@ -103,6 +123,7 @@ fn main() {
     println!("  Space      dissolve");
     println!("  Z          auto-zoom dive at cursor");
     println!("  C          cycle color mode");
+    println!("  F          cycle fractal type");
     println!("  P          screenshot (PNG in working dir)");
     println!("  Shift+1..9 save view, 1..9 fly back to it");
     println!("  R          reset view");
@@ -129,6 +150,7 @@ fn main() {
         .insert_resource(ViewState::default())
         .insert_resource(Dissolve(false))
         .insert_resource(ColorMode::default())
+        .insert_resource(FractalType::default())
         .insert_resource(AutoZoom::default())
         .insert_resource(Bookmarks::default())
         .insert_resource(FlyTo::default())
@@ -137,7 +159,10 @@ fn main() {
         .add_systems(Startup, setup)
         .add_systems(
             Update,
-            ((handle_input, update_params).chain(), update_title),
+            (
+                (handle_input, apply_fractal_switch, update_params).chain(),
+                update_title,
+            ),
         )
         .run();
 }
@@ -162,7 +187,7 @@ fn setup(mut commands: Commands, settings: Res<Settings>) {
     // Seed only the initial active count (fast startup). The GPU buffer is sized
     // to MAX_PARTICLES; raising the count later fills the tail via recycle.
     let particles =
-        generate_particles(settings.particle_count as usize, BASE_ITER, DEFAULT_CENTER);
+        generate_particles(settings.particle_count as usize, BASE_ITER, DEFAULT_CENTER, 0);
     info!(
         "generated {} particles in {:.2?}",
         particles.len(),
@@ -195,6 +220,7 @@ fn handle_input(
     mut view: ResMut<ViewState>,
     mut dissolve: ResMut<Dissolve>,
     mut color_mode: ResMut<ColorMode>,
+    mut fractal: ResMut<FractalType>,
     mut auto_zoom: ResMut<AutoZoom>,
     mut bookmarks: ResMut<Bookmarks>,
     mut fly: ResMut<FlyTo>,
@@ -224,8 +250,9 @@ fn handle_input(
     }
 
     if keys.just_pressed(KeyCode::KeyR) {
-        view.center = DEFAULT_CENTER;
-        view.height = DEFAULT_HEIGHT;
+        let (center, height) = fractal_default_view(fractal.0);
+        view.center = center;
+        view.height = height;
         auto_zoom.0 = false;
         fly.0 = None;
     }
@@ -239,6 +266,10 @@ fn handle_input(
     if keys.just_pressed(KeyCode::KeyC) {
         color_mode.0 = (color_mode.0 + 1) % COLOR_MODES.len() as u32;
         info!("color mode: {}", COLOR_MODES[color_mode.0 as usize]);
+    }
+    if keys.just_pressed(KeyCode::KeyF) {
+        fractal.0 = (fractal.0 + 1) % FRACTAL_MODES.len() as u32;
+        info!("fractal: {}", FRACTAL_MODES[fractal.0 as usize]);
     }
     if keys.just_pressed(KeyCode::KeyP) {
         let stamp = std::time::SystemTime::now()
@@ -332,19 +363,39 @@ fn handle_input(
     }
 }
 
+/// Whenever the fractal type changes (F key or menu click), jump to that
+/// fractal's home view and cancel any autopilot. The recycle trickle then
+/// resamples the particle cloud onto the new set within a couple of seconds.
+fn apply_fractal_switch(
+    fractal: Res<FractalType>,
+    mut view: ResMut<ViewState>,
+    mut auto_zoom: ResMut<AutoZoom>,
+    mut fly: ResMut<FlyTo>,
+) {
+    if !fractal.is_changed() || fractal.is_added() {
+        return;
+    }
+    let (center, height) = fractal_default_view(fractal.0);
+    view.center = center;
+    view.height = height;
+    auto_zoom.0 = false;
+    fly.0 = None;
+}
+
 fn update_params(
     time: Res<Time>,
     windows: Query<&Window>,
     mut view: ResMut<ViewState>,
     dissolve: Res<Dissolve>,
     color_mode: Res<ColorMode>,
+    fractal: Res<FractalType>,
     mouse: Res<ButtonInput<MouseButton>>,
     over_menu: Res<PointerOverMenu>,
     settings: Res<Settings>,
     mut params: ResMut<SimParams>,
     mut ref_orbit: ResMut<RefOrbit>,
     mut frame: Local<u32>,
-    mut last_orbit_key: Local<Option<(DVec2, u32)>>,
+    mut last_orbit_key: Local<Option<(DVec2, u32, u32)>>,
 ) {
     let Ok(window) = windows.single() else {
         return;
@@ -401,10 +452,10 @@ fn update_params(
     // High-precision reference orbit at the view center for perturbation.
     // Only recompute (and re-upload, via the generation bump) when the view
     // center or iteration count actually changed; a static view pays nothing.
-    if *last_orbit_key != Some((view.center, max_iter)) {
-        ref_orbit.points = reference_orbit(view.center.x, view.center.y, max_iter);
+    if *last_orbit_key != Some((view.center, max_iter, fractal.0)) {
+        ref_orbit.points = reference_orbit(view.center.x, view.center.y, max_iter, fractal.0);
         ref_orbit.generation = ref_orbit.generation.wrapping_add(1);
-        *last_orbit_key = Some((view.center, max_iter));
+        *last_orbit_key = Some((view.center, max_iter, fractal.0));
     }
 
     *frame = frame.wrapping_add(1);
@@ -436,6 +487,7 @@ fn update_params(
     u.reseed_rate = reseed_rate;
     u.detail = settings.detail;
     u.color_mode = color_mode.0;
+    u.fractal_type = fractal.0;
 }
 
 fn update_title(

@@ -28,6 +28,7 @@ struct Params {
     detail: f32,
     dissolve: f32,
     color_mode: u32,
+    fractal_type: u32,
 };
 
 @group(0) @binding(0) var<storage, read> particles: array<Particle>;

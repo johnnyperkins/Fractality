@@ -28,6 +28,7 @@ struct Params {
     detail: f32,
     dissolve: f32,
     color_mode: u32,
+    fractal_type: u32,
 };
 
 @group(0) @binding(0) var<storage, read_write> particles: array<Particle>;
@@ -39,35 +40,127 @@ fn cmul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
     return vec2<f32>(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
 }
 
+fn conj(a: vec2<f32>) -> vec2<f32> {
+    return vec2<f32>(a.x, -a.y);
+}
+
+// |x + d| - |x| without catastrophic cancellation (d may be ~1e-14 of x).
+fn diffabs(x: f32, d: f32) -> f32 {
+    if (x >= 0.0) {
+        if (x + d >= 0.0) {
+            return d;
+        }
+        return -(2.0 * x + d);
+    }
+    if (x + d <= 0.0) {
+        return -d;
+    }
+    return 2.0 * x + d;
+}
+
+// One perturbation step of the selected fractal: dz_{n+1} from the reference
+// value Z_n, the delta dz_n, and the point's offset dc from the view center.
+// Types match FRACTAL_MODES on the Rust side.
+fn step_dz(z_ref: vec2<f32>, dz: vec2<f32>, dc: vec2<f32>) -> vec2<f32> {
+    switch params.fractal_type {
+        case 1u: {
+            // Burning Ship: z' = (|x| + i|y|)^2 + c. With w = |Z+dz| and
+            // wr = |Z| (componentwise), dz' = w^2 - wr^2 = (w-wr)(w+wr);
+            // diffabs gives w-wr exactly, avoiding the cancellation that
+            // would erase a tiny delta at deep zoom.
+            let wr = abs(z_ref);
+            let d = vec2<f32>(diffabs(z_ref.x, dz.x), diffabs(z_ref.y, dz.y));
+            return cmul(d, 2.0 * wr + d) + dc;
+        }
+        case 2u: {
+            // Tricorn: z' = conj(z)^2 + c, and conj(z)^2 - conj(Z)^2
+            // = conj(z^2 - Z^2), so conjugate the Mandelbrot delta.
+            return conj(cmul(2.0 * z_ref + dz, dz)) + dc;
+        }
+        case 3u: {
+            // Multibrot-3: (Z+dz)^3 - Z^3 = dz*(3Z^2 + 3Z*dz + dz^2).
+            return cmul(dz, 3.0 * cmul(z_ref, z_ref) + 3.0 * cmul(z_ref, dz) + cmul(dz, dz)) + dc;
+        }
+        case 4u: {
+            // Julia: same map as Mandelbrot but c is a global constant, so
+            // there is no dc term; dc instead seeds dz_0 (offset of z_0).
+            return cmul(2.0 * z_ref + dz, dz);
+        }
+        default: {
+            // Mandelbrot: 2*Z*dz + dz^2 + dc.
+            return cmul(2.0 * z_ref + dz, dz) + dc;
+        }
+    }
+}
+
+// d(z_{n+1})/dc iteration for the selected fractal, using the full z_n.
+// Exact for the holomorphic maps (0, 3, 4); Burning Ship and Tricorn are not
+// holomorphic, so their rules are the standard distance-estimate
+// approximations - plenty for steering the flow field.
+fn step_der(z_full: vec2<f32>, der: vec2<f32>) -> vec2<f32> {
+    switch params.fractal_type {
+        case 1u: {
+            return 2.0 * cmul(abs(z_full), der) + vec2<f32>(1.0, 0.0);
+        }
+        case 2u: {
+            return 2.0 * cmul(conj(z_full), conj(der)) + vec2<f32>(1.0, 0.0);
+        }
+        case 3u: {
+            return 3.0 * cmul(cmul(z_full, z_full), der) + vec2<f32>(1.0, 0.0);
+        }
+        case 4u: {
+            // dz_0/dc = 1 (dc perturbs z_0), no additive term after that.
+            return 2.0 * cmul(z_full, der);
+        }
+        default: {
+            return 2.0 * cmul(z_full, der) + vec2<f32>(1.0, 0.0);
+        }
+    }
+}
+
+// 1/log2(power) for the smooth-iteration formula; only Multibrot-3 (power 3)
+// differs from 1. Must match inv_log2_power() on the CPU.
+fn inv_log2_power() -> f32 {
+    return select(1.0, 0.6309297535714574, params.fractal_type == 3u);
+}
+
+// Initial delta: zero except Julia, where dc perturbs the starting point.
+fn initial_dz(dc: vec2<f32>) -> vec2<f32> {
+    if (params.fractal_type == 4u) {
+        return dc;
+    }
+    return vec2<f32>(0.0, 0.0);
+}
+
 // Smooth escape-time field via perturbation. dc is the point's offset from the
 // view center (small, so f32 keeps full relative precision no matter how deep
 // the zoom). Iterates the delta dz around the reference orbit and rebases
 // (Zhuoran's method) when the delta outgrows the reference, which also handles
 // a short/diverged reference orbit.
 fn field(dc: vec2<f32>) -> f32 {
-    var dz = vec2<f32>(0.0, 0.0);
+    // Z_0 is known up front (0 for c-plane fractals, the view center for
+    // Julia), so each iteration needs only one ref_orbit load (the next
+    // entry); the previous load is carried in a register across iterations.
+    let ref0 = ref_orbit[0];
+    var dz = initial_dz(dc);
     var ri: u32 = 0u;
-    // Z_0 = 0 always, so the current reference value starts known and each
-    // iteration needs only one ref_orbit load (the next entry); the previous
-    // load is carried in a register across iterations.
-    var z_ref = vec2<f32>(0.0, 0.0);
+    var z_ref = ref0;
     let last = params.ref_len - 1u;
     for (var n: u32 = 0u; n < params.max_iter; n = n + 1u) {
-        // dz_{n+1} = 2*Z_n*dz + dz^2 + dc
-        dz = 2.0 * cmul(z_ref, dz) + cmul(dz, dz) + dc;
+        dz = step_dz(z_ref, dz, dc);
         ri = ri + 1u;
         let z_ref_next = ref_orbit[ri];
         let z = z_ref_next + dz; // full z_{n+1}
         let m = dot(z, z);
         if (m > 256.0) {
-            return f32(n) + 1.0 - log2(0.5 * log2(m));
+            return f32(n) + 1.0 - log2(0.5 * log2(m)) * inv_log2_power();
         }
         // Rebase: fold the full value into the delta and restart the reference
         // when the delta dominates or the reference orbit is exhausted.
         if (m < dot(dz, dz) || ri >= last) {
-            dz = z;
+            dz = z - ref0;
             ri = 0u;
-            z_ref = vec2<f32>(0.0, 0.0);
+            z_ref = ref0;
         } else {
             z_ref = z_ref_next;
         }
@@ -91,28 +184,31 @@ const LN2_SQ: f32 = 0.4804530139182014;
 // One analytic loop replaces three finite-difference field() calls and has no
 // step-size (eps) tuning, staying exact at any zoom depth.
 fn field_grad(dc: vec2<f32>) -> FieldGrad {
-    var dz = vec2<f32>(0.0, 0.0);
-    var der = vec2<f32>(0.0, 0.0);
+    let ref0 = ref_orbit[0];
+    var dz = initial_dz(dc);
+    // Julia: dc perturbs z_0, so d(z_0)/dc = 1; c-plane fractals start at 0.
+    var der = vec2<f32>(select(0.0, 1.0, params.fractal_type == 4u), 0.0);
     var ri: u32 = 0u;
-    var z_ref = vec2<f32>(0.0, 0.0);
+    var z_ref = ref0;
     let last = params.ref_len - 1u;
+    let ilp = inv_log2_power();
     for (var n: u32 = 0u; n < params.max_iter; n = n + 1u) {
         let z_full = z_ref + dz; // full z_n
-        der = 2.0 * cmul(z_full, der) + vec2<f32>(1.0, 0.0);
-        dz = 2.0 * cmul(z_ref, dz) + cmul(dz, dz) + dc;
+        der = step_der(z_full, der);
+        dz = step_dz(z_ref, dz, dc);
         ri = ri + 1u;
         let z_ref_next = ref_orbit[ri];
         let z = z_ref_next + dz;
         let m = dot(z, z);
         if (m > 256.0) {
             let u = 0.5 * log2(m);
-            let g = -cmul(z, vec2<f32>(der.x, -der.y)) / (m * u * LN2_SQ);
-            return FieldGrad(f32(n) + 1.0 - log2(u), g);
+            let g = -cmul(z, conj(der)) / (m * u * LN2_SQ) * ilp;
+            return FieldGrad(f32(n) + 1.0 - log2(u) * ilp, g);
         }
         if (m < dot(dz, dz) || ri >= last) {
-            dz = z;
+            dz = z - ref0;
             ri = 0u;
-            z_ref = vec2<f32>(0.0, 0.0);
+            z_ref = ref0;
         } else {
             z_ref = z_ref_next;
         }
