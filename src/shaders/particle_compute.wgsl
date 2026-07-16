@@ -157,13 +157,23 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
     let grad = vec2<f32>(fx - f0, fy - f0) / eps;
     let gl = length(grad);
 
-    // Advect along iso-contours, correcting back toward the home band.
+    // Advect along iso-contours, correcting back toward the home band. The
+    // gentle velocity-space correction (fixed gain, clamped) is what keeps the
+    // cloud crisply on the boundary; the align knob adds a separate positional
+    // pull below for the stream-convergence look.
     var desired: vec2<f32>;
+    var gn = vec2<f32>(0.0, 0.0);
+    var to_band = 0.0;
+    var on_contour = false;
     if (gl > 1e-4 && f0 < f32(params.max_iter) - 0.5) {
-        let gn = grad / gl;
+        gn = grad / gl;
         let tangent = vec2<f32>(-gn.y, gn.x);
-        let err = clamp((p.band - f0) * params.band_k, -2.0, 2.0);
+        let err = clamp((p.band - f0) * 0.7, -2.0, 2.0);
         desired = (tangent + gn * err) * params.flow_speed * view_height;
+        // Spatial distance from the particle to its home contour along the
+        // normal: (band - f0) is the field-unit error, /gl converts to distance.
+        to_band = clamp((p.band - f0) / gl, -view_height, view_height);
+        on_contour = true;
     } else {
         desired = (p.home - p.pos) * 0.6;
     }
@@ -189,6 +199,31 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
     p.vel += (desired - p.vel) * clamp(params.damping * dt, 0.0, 1.0);
     p.vel += impulse * dt;
     p.pos += p.vel * dt;
+
+    // Band alignment: pull the particle toward its home contour as a positional
+    // move. band_k is the closing rate per second; clamp to [0,1] so it snaps at
+    // most exactly onto the contour (no overshoot).
+    //
+    // The stream effect is a diffusion/pull ratchet: normal jitter kicks the
+    // particle off its contour, the pull snaps it back, and the asymmetry of the
+    // field walks particles along the boundary into convergence points. The
+    // jitter amplitude scales with the pull strength (via alpha), so align = 0
+    // is the perfectly crisp static boundary, and turning it up buys stronger
+    // streams while the matching pull keeps the fuzz bounded to ~jitter size.
+    // The branch's mistake was a large fixed jitter (0.008) with no such link.
+    if (on_contour) {
+        if (dt > 0.0) {
+            let alpha = clamp(params.band_k * dt, 0.0, 1.0);
+            let amp = view_height * 0.003 * min(alpha * 2.0, 1.0);
+            let jitter = (rand01(&seed) * 2.0 - 1.0) * amp;
+            p.pos += gn * (to_band * alpha + jitter);
+        } else {
+            // Paused: pull is inert; run the diffusion alone for the slow
+            // dissolve effect on Space.
+            let jitter = (rand01(&seed) * 2.0 - 1.0) * view_height * 0.008;
+            p.pos += gn * jitter;
+        }
+    }
 
     // Safety: respawn NaN particles at home. The negated <= form is false for
     // NaN (every ordered compare with NaN is false), so NaN positions reset

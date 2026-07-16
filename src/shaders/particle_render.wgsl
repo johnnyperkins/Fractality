@@ -52,15 +52,27 @@ fn vs(
     let clip_xy = p.pos * params.world_to_clip.xy + params.world_to_clip.zw
         + corner * params.particle_size;
 
-    let speed = length(p.vel);
-    let h = p.hue + speed * 0.35 + params.time * 0.015;
-    // Sinebow palette.
-    let sinebow = 0.5 + 0.5 * cos(6.2831853 * h - vec3<f32>(0.0, 2.0944, 4.1888));
+    // Screen-relative speed: world velocity scales with view_height (flow is a
+    // fraction of view height), so normalize by it to keep color/brightness the
+    // same at any zoom - otherwise zoomed-out looks bright/colorful and zoomed-in
+    // looks dim and flat. (view_height = 2 / world_to_clip.y.)
+    let view_h = 2.0 / params.world_to_clip.y;
+    let speed = length(p.vel) / view_h;
+    let h = p.hue + speed * 0.95 + params.time * 0.015;
+    // Sinebow palette, then saturate: subtract the valley floor and rescale so
+    // the off-hue channels go to true 0. Without this the palette's ~0.25 valleys
+    // accumulate under additive blending in dense regions (the fractal edge) and
+    // clip to white. Saturating keeps the dense edge a coherent color.
+    let raw = 0.5 + 0.5 * cos(6.2831853 * h - vec3<f32>(0.0, 2.0944, 4.1888));
+    let sinebow = max(raw - vec3<f32>(0.32), vec3<f32>(0.0)) / 0.68;
 
     var out: VsOut;
     out.clip = vec4<f32>(clip_xy, 0.0, 1.0);
     out.uv = corner;
-    out.color = sinebow * (0.25 + speed * 2.2) * params.brightness;
+    // Keep the flat floor at 0.25 so the slow particles sitting on the boundary
+    // (the fractal shape itself) stay visible; speed lifts the flowing streams
+    // on top of that. Saturated palette above prevents dense-edge white-out.
+    out.color = sinebow * (0.25 + speed * 5.5) * params.brightness;
     return out;
 }
 

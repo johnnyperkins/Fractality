@@ -228,13 +228,17 @@ fn update_params(
     let center_delta = (view.prev_center - view.center).as_vec2();
     view.prev_center = view.center;
 
-    // Zoom-out reseed budget: fraction of the view area newly revealed this
-    // frame (1 - (prev_h/cur_h)^2 when zooming out), so fill exactly tracks the
-    // growing view with no lagging density front. Floor at a small trickle for
-    // steady-state coverage, cap to bound the per-frame churn.
+    // Reseed budget. Two contributions, take the max:
+    //  - zoom-OUT: fraction of view area newly revealed (1 - (prev_h/cur_h)^2),
+    //    so fill tracks the growing view with no lagging density front.
+    //  - any zoom MOTION: |log2(prev_h/cur_h)| per frame. Zooming IN reveals no
+    //    new area but exposes finer filaments; without this term zoom-in keeps
+    //    the stale coarse sampling and looks worse than zoom-out. Resampling
+    //    concentrates particles onto the now-visible fine boundary.
     let area_ratio = (view.prev_height / view.height).powi(2);
     let revealed = (1.0 - area_ratio).clamp(0.0, 1.0);
-    let reseed_rate = (revealed.max(0.006) as f32).min(0.2);
+    let zoom_motion = (view.prev_height / view.height).log2().abs() * 6.0;
+    let reseed_rate = (revealed.max(zoom_motion).max(0.006) as f32).min(0.4);
     view.prev_height = view.height;
 
     // Cursor in center-relative coords (same space as particles).
@@ -280,7 +284,7 @@ fn update_params(
     // Flow speed as a fraction of view height per second (shader scales by
     // view_height). Default 0.081 matches the original 0.22 feel at base zoom.
     u.flow_speed = settings.flow_speed;
-    u.band_k = 0.7;
+    u.band_k = settings.align_force;
     u.damping = 3.0;
     // Normalize brightness by density so a given user setting looks the same at
     // any particle count, then scale by the user's brightness knob.

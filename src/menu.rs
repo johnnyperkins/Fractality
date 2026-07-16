@@ -18,6 +18,10 @@ pub struct Settings {
     pub detail: f32,
     /// Iso-contour advection speed (fraction of view height / sec).
     pub flow_speed: f32,
+    /// Alignment force: closing rate (per second) pulling each particle onto
+    /// its home fractal iso-band (band_k in the compute shader). Higher =
+    /// tighter to the shape; monotonic, cannot overshoot.
+    pub align_force: f32,
     /// Brightness multiplier.
     pub brightness: f32,
     /// Particle dot size in pixels.
@@ -32,6 +36,7 @@ impl Default for Settings {
             particle_count: 2_000_000,
             detail: 1.0,
             flow_speed: 0.081,
+            align_force: 15.0,
             brightness: 1.1,
             dot_px: 1.0,
             bloom: 0.3,
@@ -44,16 +49,18 @@ pub enum Setting {
     ParticleCount,
     Detail,
     FlowSpeed,
+    AlignForce,
     Brightness,
     DotSize,
     Bloom,
 }
 
 /// Rows, in display order.
-const SETTINGS: [Setting; 6] = [
+const SETTINGS: [Setting; 7] = [
     Setting::ParticleCount,
     Setting::Detail,
     Setting::FlowSpeed,
+    Setting::AlignForce,
     Setting::Brightness,
     Setting::DotSize,
     Setting::Bloom,
@@ -65,6 +72,7 @@ impl Setting {
             Setting::ParticleCount => "Particles",
             Setting::Detail => "Detail",
             Setting::FlowSpeed => "Flow speed",
+            Setting::AlignForce => "Align force",
             Setting::Brightness => "Brightness",
             Setting::DotSize => "Dot size",
             Setting::Bloom => "Bloom",
@@ -77,6 +85,7 @@ impl Setting {
             Setting::ParticleCount => (500_000.0, 100_000.0, MAX_PARTICLES as f32),
             Setting::Detail => (0.5, 0.5, 8.0),
             Setting::FlowSpeed => (0.02, 0.0, 0.4),
+            Setting::AlignForce => (5.0, 0.0, 200.0),
             Setting::Brightness => (0.15, 0.1, 4.0),
             Setting::DotSize => (0.1, 0.1, 4.0),
             Setting::Bloom => (0.05, 0.0, 1.0),
@@ -88,6 +97,7 @@ impl Setting {
             Setting::ParticleCount => s.particle_count as f32,
             Setting::Detail => s.detail,
             Setting::FlowSpeed => s.flow_speed,
+            Setting::AlignForce => s.align_force,
             Setting::Brightness => s.brightness,
             Setting::DotSize => s.dot_px,
             Setting::Bloom => s.bloom,
@@ -99,6 +109,7 @@ impl Setting {
             Setting::ParticleCount => s.particle_count = v.round() as u32,
             Setting::Detail => s.detail = v,
             Setting::FlowSpeed => s.flow_speed = v,
+            Setting::AlignForce => s.align_force = v,
             Setting::Brightness => s.brightness = v,
             Setting::DotSize => s.dot_px = v,
             Setting::Bloom => s.bloom = v,
@@ -257,6 +268,7 @@ fn build_menu(mut commands: Commands) {
             row_bundle(Setting::ParticleCount),
             row_bundle(Setting::Detail),
             row_bundle(Setting::FlowSpeed),
+            row_bundle(Setting::AlignForce),
             row_bundle(Setting::Brightness),
             row_bundle(Setting::DotSize),
             row_bundle(Setting::Bloom),
