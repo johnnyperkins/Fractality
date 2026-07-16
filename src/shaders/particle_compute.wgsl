@@ -165,6 +165,7 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
     var gn = vec2<f32>(0.0, 0.0);
     var to_band = 0.0;
     var on_contour = false;
+    var calm = 1.0;
     if (gl > 1e-4 && f0 < f32(params.max_iter) - 0.5) {
         gn = grad / gl;
         let tangent = vec2<f32>(-gn.y, gn.x);
@@ -175,8 +176,14 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
         // noise. Streaming there just thrashes; scale the tangential flow down
         // so those particles slow, lock onto their contour, and trace the fine
         // shape instead of smearing it. Well-seated particles keep full flow.
-        let settle = 1.0 / (1.0 + band_err * band_err);
-        desired = (tangent * settle + gn * err) * params.flow_speed * view_height;
+        let settle = 1.0 / (1.0 + 6.0 * band_err * band_err);
+        // Depth calm: f0 near max_iter means the particle sits on the fractal
+        // shell itself, where the shape lives. Freeze those almost completely
+        // so the boundary renders as a stable filigree; the calm ramps in from
+        // mid-field, leaving the outer haze streaming normally.
+        let depth = f0 / f32(params.max_iter);
+        calm = 1.0 - 0.95 * smoothstep(0.25, 0.75, depth);
+        desired = (tangent * settle * calm + gn * err) * params.flow_speed * view_height;
         // Spatial distance from the particle to its home contour along the
         // normal: (band - f0) is the field-unit error, /gl converts to distance.
         to_band = clamp((p.band - f0) / gl, -view_height, view_height);
@@ -203,7 +210,10 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
-    p.vel += (desired - p.vel) * clamp(params.damping * dt, 0.0, 1.0);
+    // Calm particles converge onto their (slow) desired velocity much faster,
+    // shedding leftover chaotic velocity instead of coasting on it.
+    let damp = params.damping * (1.0 + 3.0 * (1.0 - calm));
+    p.vel += (desired - p.vel) * clamp(damp * dt, 0.0, 1.0);
     p.vel += impulse * dt;
     p.pos += p.vel * dt;
 
@@ -229,7 +239,9 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
             // stable sharpening of the shape.
             let max_step = view_height * 0.02;
             let step = clamp(to_band * alpha, -max_step, max_step);
-            let amp = view_height * 0.0015 * min(alpha * 2.0, 1.0);
+            // Jitter scales with calm too: shell particles get almost none,
+            // so the diffusion ratchet only churns the outer flow.
+            let amp = view_height * 0.0015 * min(alpha * 2.0, 1.0) * calm;
             let jitter = (rand01(&seed) * 2.0 - 1.0) * amp;
             p.pos += gn * (step + jitter);
             // Bleed off the velocity component along the normal: the pull
