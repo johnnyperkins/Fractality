@@ -45,13 +45,17 @@ fn cmul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
 fn field(dc: vec2<f32>) -> f32 {
     var dz = vec2<f32>(0.0, 0.0);
     var ri: u32 = 0u;
+    // Z_0 = 0 always, so the current reference value starts known and each
+    // iteration needs only one ref_orbit load (the next entry); the previous
+    // load is carried in a register across iterations.
+    var z_ref = vec2<f32>(0.0, 0.0);
     let last = params.ref_len - 1u;
     for (var n: u32 = 0u; n < params.max_iter; n = n + 1u) {
-        let z_ref = ref_orbit[ri];
         // dz_{n+1} = 2*Z_n*dz + dz^2 + dc
         dz = 2.0 * cmul(z_ref, dz) + cmul(dz, dz) + dc;
         ri = ri + 1u;
-        let z = ref_orbit[ri] + dz; // full z_{n+1}
+        let z_ref_next = ref_orbit[ri];
+        let z = z_ref_next + dz; // full z_{n+1}
         let m = dot(z, z);
         if (m > 256.0) {
             return f32(n) + 1.0 - log2(0.5 * log2(m));
@@ -61,6 +65,9 @@ fn field(dc: vec2<f32>) -> f32 {
         if (m < dot(dz, dz) || ri >= last) {
             dz = z;
             ri = 0u;
+            z_ref = vec2<f32>(0.0, 0.0);
+        } else {
+            z_ref = z_ref_next;
         }
     }
     return f32(params.max_iter);
@@ -244,7 +251,7 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
             // Shell particles get a much tighter cap: their gradient estimate
             // is the noisiest, so at high align force a 2% hop per frame reads
             // as boiling. Small steps converge just as surely, only smoother.
-            let max_step = view_height * (0.003 + 0.017 * calm);
+            let max_step = view_height * mix(0.003, 0.02, calm);
             let step = clamp(to_band * alpha, -max_step, max_step);
             // Jitter scales with calm too: shell particles get almost none,
             // so the diffusion ratchet only churns the outer flow.
