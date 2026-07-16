@@ -292,6 +292,7 @@ fn extract_particle_buffers(
     existing: Option<Res<ParticleBuffers>>,
     seed: Extract<Option<Res<ParticleSeed>>>,
     device: Res<RenderDevice>,
+    queue: Res<RenderQueue>,
 ) {
     if existing.is_some() {
         return;
@@ -299,22 +300,43 @@ fn extract_particle_buffers(
     let Some(seed) = seed.as_ref() else {
         return;
     };
-    // Allocate at full capacity; front-load the seeded particles, zero the rest.
-    // The live `count` uniform gates how many are simulated/drawn, so the count
-    // can be raised at runtime with no reallocation. Zeroed tail particles sit at
-    // the origin and get pulled into view by the recycle trickle as count rises.
-    let mut data = vec![bytemuck::Zeroable::zeroed(); MAX_PARTICLES as usize];
-    let n = seed.0.len().min(data.len());
-    data[..n].copy_from_slice(&seed.0[..n]);
-    let buffer = device.create_buffer_with_data(&BufferInitDescriptor {
+    // Allocate at full capacity and upload only the seeded prefix. wgpu
+    // zero-initializes buffers (WebGPU spec), so the tail needs no CPU-side
+    // staging or upload. The live `count` uniform gates how many are
+    // simulated/drawn, so the count can be raised at runtime with no
+    // reallocation. Zeroed tail particles sit at the origin and get pulled
+    // into view by the recycle trickle as count rises.
+    let buffer = device.create_buffer(&BufferDescriptor {
         label: Some("particle_buffer"),
-        usage: BufferUsages::STORAGE,
-        contents: bytemuck::cast_slice(&data),
+        size: MAX_PARTICLES as u64 * std::mem::size_of::<Particle>() as u64,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
     });
+    let n = seed.0.len().min(MAX_PARTICLES as usize);
+    if n > 0 {
+        queue.write_buffer(&buffer, 0, bytemuck::cast_slice(&seed.0[..n]));
+    }
     commands.insert_resource(ParticleBuffers {
         buffer,
         count: MAX_PARTICLES,
     });
+}
+
+/// Free the CPU-side seed once the render world has copied it into the GPU
+/// buffer. Extraction happens at the end of the frame the seed appears in, so
+/// by this system's second run the tens-of-MB Vec is dead weight.
+fn drop_particle_seed(
+    mut commands: Commands,
+    seed: Option<Res<ParticleSeed>>,
+    mut frames: Local<u32>,
+) {
+    if seed.is_none() {
+        return;
+    }
+    *frames += 1;
+    if *frames >= 2 {
+        commands.remove_resource::<ParticleSeed>();
+    }
 }
 
 fn prepare_particle_bind_groups(
@@ -452,6 +474,7 @@ impl Plugin for ParticlePlugin {
 
         app.add_plugins(ExtractResourcePlugin::<SimParams>::default());
         app.add_plugins(ExtractResourcePlugin::<RefOrbit>::default());
+        app.add_systems(Update, drop_particle_seed);
 
         let render_app = app.sub_app_mut(RenderApp);
         render_app
