@@ -6,6 +6,7 @@ use bevy::core_pipeline::bloom::Bloom;
 use bevy::prelude::*;
 use bevy::ui::RelativeCursorPosition;
 
+use crate::audio::{AudioCapture, AudioLevels};
 use crate::particles::MAX_PARTICLES;
 use crate::{ColorMode, FractalType, COLOR_MODES, FRACTAL_MODES};
 
@@ -33,6 +34,22 @@ pub struct Settings {
     /// Trail keep factor per frame (at 60 FPS). 0 disables trails entirely;
     /// higher = longer light-trails / motion blur.
     pub trail: f32,
+    /// Audio effect gains, live only while audio reactivity is on (levels are
+    /// zero otherwise, so these multiply nothing). 1.0 = designed intensity.
+    /// Beat/drop ring wave strength.
+    pub audio_pulse: f32,
+    /// Beat strobe + treble glitter strength.
+    pub audio_flash: f32,
+    /// Spectrum glow strength (frequency bands painted onto iteration depth).
+    pub audio_glow: f32,
+    /// Bass zoom-breathe amount.
+    pub audio_breathe: f32,
+    /// Julia parameter morph radius (fractal type julia only).
+    pub audio_morph: f32,
+    /// Stereo pan push strength.
+    pub audio_stereo: f32,
+    /// Mid-driven flow speed boost.
+    pub audio_flow: f32,
 }
 
 impl Default for Settings {
@@ -46,6 +63,13 @@ impl Default for Settings {
             dot_px: 1.0,
             bloom: 0.3,
             trail: 0.3,
+            audio_pulse: 1.0,
+            audio_flash: 1.0,
+            audio_glow: 1.0,
+            audio_breathe: 1.0,
+            audio_morph: 1.0,
+            audio_stereo: 1.0,
+            audio_flow: 1.0,
         }
     }
 }
@@ -60,6 +84,13 @@ pub enum Setting {
     DotSize,
     Bloom,
     Trail,
+    AudioPulse,
+    AudioFlash,
+    AudioGlow,
+    AudioBreathe,
+    AudioMorph,
+    AudioStereo,
+    AudioFlow,
 }
 
 /// Rows, in display order.
@@ -74,6 +105,17 @@ const SETTINGS: [Setting; 8] = [
     Setting::Trail,
 ];
 
+/// Audio-effect rows, shown only while audio reactivity is on.
+const AUDIO_SETTINGS: [Setting; 7] = [
+    Setting::AudioPulse,
+    Setting::AudioFlash,
+    Setting::AudioGlow,
+    Setting::AudioBreathe,
+    Setting::AudioMorph,
+    Setting::AudioStereo,
+    Setting::AudioFlow,
+];
+
 impl Setting {
     fn label(self) -> &'static str {
         match self {
@@ -85,6 +127,13 @@ impl Setting {
             Setting::DotSize => "Dot size",
             Setting::Bloom => "Bloom",
             Setting::Trail => "Trails",
+            Setting::AudioPulse => "Pulse",
+            Setting::AudioFlash => "Flash",
+            Setting::AudioGlow => "Spec glow",
+            Setting::AudioBreathe => "Breathe",
+            Setting::AudioMorph => "Julia morph",
+            Setting::AudioStereo => "Stereo push",
+            Setting::AudioFlow => "Flow boost",
         }
     }
 
@@ -99,6 +148,15 @@ impl Setting {
             Setting::DotSize => (0.1, 4.0),
             Setting::Bloom => (0.0, 1.0),
             Setting::Trail => (0.0, 0.98),
+            // All audio gains share one scale: 0 = effect off, 1 = designed
+            // intensity, 2 = double.
+            Setting::AudioPulse
+            | Setting::AudioFlash
+            | Setting::AudioGlow
+            | Setting::AudioBreathe
+            | Setting::AudioMorph
+            | Setting::AudioStereo
+            | Setting::AudioFlow => (0.0, 2.0),
         }
     }
 
@@ -112,6 +170,13 @@ impl Setting {
             Setting::DotSize => s.dot_px,
             Setting::Bloom => s.bloom,
             Setting::Trail => s.trail,
+            Setting::AudioPulse => s.audio_pulse,
+            Setting::AudioFlash => s.audio_flash,
+            Setting::AudioGlow => s.audio_glow,
+            Setting::AudioBreathe => s.audio_breathe,
+            Setting::AudioMorph => s.audio_morph,
+            Setting::AudioStereo => s.audio_stereo,
+            Setting::AudioFlow => s.audio_flow,
         }
     }
 
@@ -128,6 +193,13 @@ impl Setting {
             Setting::DotSize => s.dot_px = v,
             Setting::Bloom => s.bloom = v,
             Setting::Trail => s.trail = v,
+            Setting::AudioPulse => s.audio_pulse = v,
+            Setting::AudioFlash => s.audio_flash = v,
+            Setting::AudioGlow => s.audio_glow = v,
+            Setting::AudioBreathe => s.audio_breathe = v,
+            Setting::AudioMorph => s.audio_morph = v,
+            Setting::AudioStereo => s.audio_stereo = v,
+            Setting::AudioFlow => s.audio_flow = v,
         }
     }
 
@@ -187,6 +259,24 @@ struct FractalRow;
 #[derive(Component)]
 struct FractalValue;
 
+/// Clickable "Audio react" row; clicking toggles audio reactivity (same as V).
+#[derive(Component)]
+struct AudioRow;
+
+/// The text showing whether audio reactivity is on.
+#[derive(Component)]
+struct AudioValue;
+
+/// Marker on every clickable menu row, so track_pointer_over_menu shields the
+/// sim from their clicks without enumerating each row type.
+#[derive(Component)]
+struct MenuInteractive;
+
+/// Container for the audio-effect sliders; visible only while audio
+/// reactivity is on.
+#[derive(Component)]
+struct AudioSection;
+
 #[derive(Component)]
 struct SliderFill(Setting);
 
@@ -208,6 +298,8 @@ impl Plugin for MenuPlugin {
                     update_color_mode_text,
                     click_fractal,
                     update_fractal_text,
+                    click_audio,
+                    sync_audio_ui,
                     apply_bloom,
                 ),
             );
@@ -292,6 +384,50 @@ fn row_bundle(setting: Setting) -> impl Bundle {
     )
 }
 
+/// Clickable label + value row (fractal / color mode / audio react). The row
+/// marker drives the click handler, the value marker the label sync.
+fn value_row(
+    label: &'static str,
+    initial: &'static str,
+    row_marker: impl Component,
+    value_marker: impl Component,
+) -> impl Bundle {
+    (
+        Button,
+        Node {
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Center,
+            column_gap: Val::Px(10.0),
+            ..default()
+        },
+        MenuInteractive,
+        row_marker,
+        children![
+            (
+                Text::new(label),
+                TextFont {
+                    font_size: 16.0,
+                    ..default()
+                },
+                TextColor(Color::srgb(0.80, 0.85, 0.95)),
+                Node {
+                    width: Val::Px(110.0),
+                    ..default()
+                },
+            ),
+            (
+                Text::new(initial),
+                TextFont {
+                    font_size: 16.0,
+                    ..default()
+                },
+                TextColor(Color::srgb(1.0, 0.88, 0.5)),
+                value_marker,
+            ),
+        ],
+    )
+}
+
 fn heading_bundle(text: &str) -> impl Bundle {
     (
         Text::new(text),
@@ -314,13 +450,14 @@ fn control_bundle(text: &str) -> impl Bundle {
     )
 }
 
-const CONTROLS: [&str; 10] = [
+const CONTROLS: [&str; 11] = [
     "W / A / S / D  pan",
     "Scroll  zoom at cursor",
     "Left hold  blast   Right hold  vortex",
     "Space  dissolve",
     "Z  auto-zoom dive   C  color mode",
     "F  fractal type",
+    "V  audio reactivity",
     "P  screenshot",
     "Shift+1..9  save view   1..9  fly to it",
     "R  reset view",
@@ -351,72 +488,38 @@ fn build_menu(mut commands: Commands) {
             for setting in SETTINGS {
                 parent.spawn(row_bundle(setting));
             }
-            parent.spawn((
-                Button,
-                Node {
-                    flex_direction: FlexDirection::Row,
-                    align_items: AlignItems::Center,
-                    column_gap: Val::Px(10.0),
-                    ..default()
-                },
-                FractalRow,
-                children![
-                    (
-                        Text::new("Fractal"),
-                        TextFont {
-                            font_size: 16.0,
-                            ..default()
-                        },
-                        TextColor(Color::srgb(0.80, 0.85, 0.95)),
-                        Node {
-                            width: Val::Px(110.0),
-                            ..default()
-                        },
-                    ),
-                    (
-                        Text::new(FRACTAL_MODES[0]),
-                        TextFont {
-                            font_size: 16.0,
-                            ..default()
-                        },
-                        TextColor(Color::srgb(1.0, 0.88, 0.5)),
-                        FractalValue,
-                    ),
-                ],
-            ));
-            parent.spawn((
-                Button,
-                Node {
-                    flex_direction: FlexDirection::Row,
-                    align_items: AlignItems::Center,
-                    column_gap: Val::Px(10.0),
-                    ..default()
-                },
+            parent.spawn(value_row("Fractal", FRACTAL_MODES[0], FractalRow, FractalValue));
+            parent.spawn(value_row(
+                "Color mode",
+                COLOR_MODES[0],
                 ColorModeRow,
-                children![
-                    (
-                        Text::new("Color mode"),
-                        TextFont {
-                            font_size: 16.0,
-                            ..default()
-                        },
-                        TextColor(Color::srgb(0.80, 0.85, 0.95)),
-                        Node {
-                            width: Val::Px(110.0),
-                            ..default()
-                        },
-                    ),
-                    (
-                        Text::new(COLOR_MODES[0]),
-                        TextFont {
-                            font_size: 16.0,
-                            ..default()
-                        },
-                        TextColor(Color::srgb(1.0, 0.88, 0.5)),
-                        ColorModeValue,
-                    ),
-                ],
+                ColorModeValue,
             ));
+            parent.spawn(value_row("Audio react", "off", AudioRow, AudioValue));
+            parent
+                .spawn((
+                    Node {
+                        flex_direction: FlexDirection::Column,
+                        row_gap: Val::Px(8.0),
+                        margin: UiRect::top(Val::Px(4.0)),
+                        ..default()
+                    },
+                    Visibility::Hidden,
+                    AudioSection,
+                ))
+                .with_children(|col| {
+                    col.spawn((
+                        Text::new("AUDIO FX"),
+                        TextFont {
+                            font_size: 14.0,
+                            ..default()
+                        },
+                        TextColor(Color::srgb(0.7, 0.75, 0.85)),
+                    ));
+                    for setting in AUDIO_SETTINGS {
+                        col.spawn(row_bundle(setting));
+                    }
+                });
             parent
                 .spawn(Node {
                     flex_direction: FlexDirection::Column,
@@ -463,12 +566,7 @@ fn track_pointer_over_menu(
     mut over: ResMut<PointerOverMenu>,
     widgets: Query<
         &Interaction,
-        Or<(
-            With<MenuRoot>,
-            With<SliderTrack>,
-            With<ColorModeRow>,
-            With<FractalRow>,
-        )>,
+        Or<(With<MenuRoot>, With<SliderTrack>, With<MenuInteractive>)>,
     >,
 ) {
     over.0 = widgets.iter().any(|i| *i != Interaction::None);
@@ -568,11 +666,51 @@ fn update_fractal_text(
     }
 }
 
-fn apply_bloom(settings: Res<Settings>, mut bloom: Query<&mut Bloom>) {
-    if !settings.is_changed() {
+/// Clicking the row toggles audio reactivity, same as the V key.
+fn click_audio(
+    mut audio: ResMut<AudioCapture>,
+    rows: Query<&Interaction, (Changed<Interaction>, With<AudioRow>)>,
+) {
+    for interaction in &rows {
+        if *interaction == Interaction::Pressed {
+            audio.enabled = !audio.enabled;
+        }
+    }
+}
+
+/// Keep the on/off label and the AUDIO FX section in sync however the toggle
+/// happens (click or V). AudioCapture changes only on real transitions, so
+/// is_changed suffices. Visibility::Inherited keeps the section tied to the
+/// panel's own visibility.
+fn sync_audio_ui(
+    audio: Res<AudioCapture>,
+    mut texts: Query<&mut Text, With<AudioValue>>,
+    mut sections: Query<&mut Visibility, With<AudioSection>>,
+) {
+    if !audio.is_changed() {
         return;
     }
+    for mut text in &mut texts {
+        *text = Text::new(if audio.enabled { "on" } else { "off" });
+    }
+    for mut vis in &mut sections {
+        *vis = if audio.enabled {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+    }
+}
+
+/// Bloom follows the slider; with audio reactivity on, bass and beats pump it
+/// every frame. Once the levels have decayed to idle, only a slider change
+/// re-applies.
+fn apply_bloom(settings: Res<Settings>, audio: Res<AudioLevels>, mut bloom: Query<&mut Bloom>) {
+    if audio.is_idle() && !settings.is_changed() {
+        return;
+    }
+    let target = settings.bloom * (1.0 + audio.bass * 1.1 + audio.beat * 0.6);
     for mut b in &mut bloom {
-        b.intensity = settings.bloom;
+        b.intensity = target;
     }
 }

@@ -1,3 +1,4 @@
+mod audio;
 mod menu;
 mod particles;
 
@@ -14,10 +15,11 @@ use bevy::window::PresentMode;
 
 use bevy::math::DVec2;
 
+use audio::{AudioCapture, AudioLevels};
 use menu::{MenuPlugin, PointerOverMenu, Settings};
 use particles::{
-    generate_particles, reference_orbit, ParticlePlugin, ParticleSeed, RefOrbit, SimParams,
-    MAX_PARTICLES, REF_ORBIT_CAP,
+    generate_particles, julia_morph_c, reference_orbit, ParticlePlugin, ParticleSeed, RefOrbit,
+    SimParams, JULIA_C, JULIA_TYPE, MAX_PARTICLES, REF_ORBIT_CAP,
 };
 
 const BASE_ITER: u32 = 240;
@@ -124,6 +126,7 @@ fn main() {
     println!("  Z          auto-zoom dive at cursor");
     println!("  C          cycle color mode");
     println!("  F          cycle fractal type");
+    println!("  V          audio reactivity (system output drives the fractal)");
     println!("  P          screenshot (PNG in working dir)");
     println!("  Shift+1..9 save view, 1..9 fly back to it");
     println!("  R          reset view");
@@ -156,11 +159,20 @@ fn main() {
         .insert_resource(FlyTo::default())
         .insert_resource(SimParams::default())
         .insert_resource(RefOrbit::default())
+        .insert_resource(AudioCapture::default())
+        .insert_resource(AudioLevels::default())
         .add_systems(Startup, setup)
         .add_systems(
             Update,
             (
-                (handle_input, apply_fractal_switch, update_params).chain(),
+                (
+                    handle_input,
+                    apply_fractal_switch,
+                    audio::manage_capture,
+                    audio::update_audio,
+                    update_params,
+                )
+                    .chain(),
                 update_title,
             ),
         )
@@ -224,6 +236,7 @@ fn handle_input(
     mut auto_zoom: ResMut<AutoZoom>,
     mut bookmarks: ResMut<Bookmarks>,
     mut fly: ResMut<FlyTo>,
+    mut audio: ResMut<AudioCapture>,
     mut commands: Commands,
 ) {
     let dt = time.delta_secs() as f64;
@@ -270,6 +283,9 @@ fn handle_input(
     if keys.just_pressed(KeyCode::KeyF) {
         fractal.0 = (fractal.0 + 1) % FRACTAL_MODES.len() as u32;
         info!("fractal: {}", FRACTAL_MODES[fractal.0 as usize]);
+    }
+    if keys.just_pressed(KeyCode::KeyV) {
+        audio.enabled = !audio.enabled;
     }
     if keys.just_pressed(KeyCode::KeyP) {
         let stamp = std::time::SystemTime::now()
@@ -392,10 +408,11 @@ fn update_params(
     mouse: Res<ButtonInput<MouseButton>>,
     over_menu: Res<PointerOverMenu>,
     settings: Res<Settings>,
+    audio: Res<AudioLevels>,
     mut params: ResMut<SimParams>,
     mut ref_orbit: ResMut<RefOrbit>,
     mut frame: Local<u32>,
-    mut last_orbit_key: Local<Option<(DVec2, u32, u32)>>,
+    mut last_orbit_key: Local<Option<(DVec2, u32, u32, (f64, f64))>>,
 ) {
     let Ok(window) = windows.single() else {
         return;
@@ -404,10 +421,16 @@ fn update_params(
     let h = window.height().max(1.0);
     let aspect = (w / h) as f64;
 
+    // Zoom breathe: bass squeezes the RENDERED height only. view.height (and
+    // everything derived from it - reseed budget, orbit cache, iteration
+    // depth, zoom input) never sees the wobble, so it cannot feed back into
+    // navigation or force per-frame orbit recomputes.
+    let eff_height = view.height * (1.0 - 0.03 * audio.bass as f64 * settings.audio_breathe as f64);
+
     // Positions are center-relative, so clip = pos * scale (offset is zero).
     let scale = Vec2::new(
-        (2.0 / (view.height * aspect)) as f32,
-        (2.0 / view.height) as f32,
+        (2.0 / (eff_height * aspect)) as f32,
+        (2.0 / eff_height) as f32,
     );
 
     // Rebase amount for this frame, computed in f64 so it stays tiny and exact.
@@ -443,19 +466,32 @@ fn update_params(
     } else {
         0.0
     };
+    // From view.height, not eff_height: the breathe is render-only and must
+    // not modulate the physical blast/vortex radius.
     let radius = (view.height * 0.09) as f32;
 
     let dt = time.delta_secs().min(1.0 / 30.0);
 
     let count = settings.particle_count.clamp(1, MAX_PARTICLES);
     let max_iter = depth_iter(view.height, settings.detail);
+    // Julia morph: music orbits the Julia parameter around its home value, so
+    // the fractal shape itself dances. The GPU never sees c directly - the
+    // reference orbit encodes it - so a changed c just means a fresh orbit
+    // (cheap: <= REF_ORBIT_CAP f64 iterations, ~16 KB upload).
+    let jc = if fractal.0 == JULIA_TYPE && settings.audio_morph > 0.0 {
+        let amp = 0.04 * settings.audio_morph as f64 * (0.25 + audio.level as f64);
+        julia_morph_c(audio.morph_phase as f64, amp)
+    } else {
+        JULIA_C
+    };
     // High-precision reference orbit at the view center for perturbation.
     // Only recompute (and re-upload, via the generation bump) when the view
-    // center or iteration count actually changed; a static view pays nothing.
-    if *last_orbit_key != Some((view.center, max_iter, fractal.0)) {
-        ref_orbit.points = reference_orbit(view.center.x, view.center.y, max_iter, fractal.0);
+    // center, iteration count, or Julia c actually changed; a static view
+    // with no morph pays nothing.
+    if *last_orbit_key != Some((view.center, max_iter, fractal.0, jc)) {
+        ref_orbit.points = reference_orbit(view.center.x, view.center.y, max_iter, fractal.0, jc);
         ref_orbit.generation = ref_orbit.generation.wrapping_add(1);
-        *last_orbit_key = Some((view.center, max_iter, fractal.0));
+        *last_orbit_key = Some((view.center, max_iter, fractal.0, jc));
     }
 
     *frame = frame.wrapping_add(1);
@@ -493,9 +529,16 @@ fn update_params(
     // enabling trails at low strength does not darken the image.
     // The floor keeps the per-frame deposit large enough to register against
     // the f16 accumulator at very long trails / very high fps.
-    if settings.trail > 0.0 {
+    // A drop temporarily lengthens the trails (dreamy smear through the hit),
+    // easing back over a couple of seconds. Only when trails are already on.
+    let trail = if settings.trail > 0.0 {
+        (settings.trail + 0.3 * audio.drop).min(0.97)
+    } else {
+        settings.trail
+    };
+    if trail > 0.0 {
         let frames_60 = (time.delta_secs() * 60.0).clamp(0.1, 4.0);
-        let keep = settings.trail.powf(frames_60);
+        let keep = trail.powf(frames_60);
         u.trail_decay = keep;
         u.brightness *= (1.0 - keep).max(0.02);
     } else {
@@ -507,6 +550,32 @@ fn update_params(
     u.detail = settings.detail;
     u.color_mode = color_mode.0;
     u.fractal_type = fractal.0;
+
+    // Audio reactivity (V): mids push the streams faster, bass swells the
+    // dots, the overall level and beat lift brightness. Levels decay to zero
+    // while disabled, so every term collapses to identity with no branch.
+    // Shader-side effects (ring waves, treble shimmer, spectrum glow, pan
+    // push, hue spin) read the raw levels the same way.
+    u.flow_speed *= 1.0 + audio.mid * 2.5 * settings.audio_flow;
+    u.brightness *= 1.0 + audio.level * 0.6 + audio.beat * 0.5;
+    u.particle_size *= 1.0 + audio.bass * 0.7;
+    u.audio = Vec4::new(audio.bass, audio.mid, audio.treble, audio.beat);
+    u.audio_hue = audio.hue_phase;
+    u.audio2 = Vec4::new(
+        audio.beat_age,
+        audio.drop_age,
+        audio.pan * audio.level * settings.audio_stereo,
+        audio.level,
+    );
+    u.audio_fx = Vec4::new(
+        settings.audio_pulse,
+        settings.audio_flash,
+        settings.audio_glow,
+        0.0,
+    );
+    for i in 0..4 {
+        u.spectrum[i] = Vec4::from_slice(&audio.spectrum[i * 4..i * 4 + 4]);
+    }
 }
 
 fn update_title(

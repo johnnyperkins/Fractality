@@ -31,6 +31,19 @@ struct Params {
     fractal_type: u32,
     // Unused in this shader; present for layout parity with ParamsUniform.
     trail_decay: f32,
+    // Audio levels: x bass, y mid, z treble, w beat pulse. All zero while
+    // audio reactivity is off, so every use is a natural no-op.
+    audio: vec4<f32>,
+    // Music-driven palette hue offset.
+    audio_hue: f32,
+    // x seconds since last beat, y seconds since last drop, z pan push,
+    // w overall level.
+    audio2: vec4<f32>,
+    // Effect gains: x ring pulse (compute), y flash/glitter, z spectrum glow,
+    // w unused.
+    audio_fx: vec4<f32>,
+    // 16 log-spaced spectrum bins (bin 0 = lowest), packed 4 per vec4.
+    spectrum: array<vec4<f32>, 4>,
 };
 
 @group(0) @binding(0) var<storage, read> particles: array<Particle>;
@@ -89,8 +102,13 @@ fn vs(
             // as topography. Hue drifts slowly along depth and time, and the
             // rings crawl inward (band phase moves with time) so the picture
             // breathes even where nothing flows.
-            let stripe = pow(0.5 + 0.5 * cos(p.band * 2.2 - params.time * 0.8), 3.0);
-            let hue = fract(p.band * 0.013 + params.time * 0.012);
+            // Bass tightens/loosens the ring spacing subtly so the topography
+            // pumps with the music; hue rides the audio palette spin.
+            let stripe = pow(
+                0.5 + 0.5 * cos(p.band * (2.2 + params.audio.x * 0.5) - params.time * 0.8),
+                3.0,
+            );
+            let hue = fract(p.band * 0.013 + params.time * 0.012 + params.audio_hue);
             color = sinebow(hue) * (0.08 + 1.5 * stripe) * (0.35 + speed * 3.5);
         }
         case 2u: {
@@ -104,7 +122,8 @@ fn vs(
             // distribution across the ramp.
             let t = clamp(pow(speed * 2.4, 0.75), 0.0, 1.0);
             let ang = atan2(p.vel.y, p.vel.x) / 6.2831853;
-            let hue = 0.55 + 0.18 * cos(6.2831853 * (ang + params.time * 0.02));
+            let hue = 0.55 + 0.18 * cos(6.2831853 * (ang + params.time * 0.02))
+                + params.audio_hue * 0.25;
             var tint = sinebow(hue);
             tint = mix(vec3<f32>(0.25, 0.1, 0.7), tint, smoothstep(0.0, 0.25, t));
             tint = mix(tint, vec3<f32>(1.0, 1.0, 1.0), smoothstep(0.7, 1.0, t));
@@ -141,9 +160,40 @@ fn vs(
             // Classic: band hue shifted by speed plus a slow global drift.
             // Flat floor at 0.25 keeps the slow particles on the boundary (the
             // fractal shape itself) visible; speed lifts the streams on top.
-            let h = p.hue + speed * 0.95 + params.time * 0.015;
+            let h = p.hue + speed * 0.95 + params.time * 0.015 + params.audio_hue;
             color = sinebow(h) * (0.25 + speed * 5.5);
         }
+    }
+
+    // Audio: beat flash (whole cloud blinks brighter, pushed slightly toward
+    // white so it reads as a strobe, not just gain) and treble adds glitter
+    // via a per-particle flicker phased by hue. Levels are zero with audio
+    // off, so the guards only skip the work, never change the result.
+    let beat = params.audio.w * params.audio_fx.y;
+    if (beat > 0.001) {
+        color = mix(color, vec3<f32>(length(color)), beat * 0.35) * (1.0 + beat * 0.8);
+    }
+    let tr = params.audio.z * params.audio_fx.y;
+    if (tr > 0.02) {
+        let glitter = max(0.0, cos(params.time * 40.0 + p.hue * 300.0));
+        color *= 1.0 + tr * glitter * glitter * 0.8;
+    }
+    // Stereo tilt: the loud channel's side of the screen glows. Far more
+    // perceptible than the positional push alone, and reads instantly as
+    // "the music is over there". clip_xy.x is the screen x in -1..1.
+    let panb = params.audio2.z;
+    if (abs(panb) > 0.01) {
+        color *= 1.0 + max(0.0, clip_xy.x * sign(panb)) * abs(panb) * 1.2;
+    }
+
+    // Spectrum glow: each particle's iteration depth maps to a frequency
+    // band - bass lights the deep shell filaments, treble the outer haze -
+    // so the fractal becomes an equalizer shaped like itself.
+    if (params.audio2.w > 0.01) {
+        let d = clamp(p.band / f32(params.max_iter), 0.0, 1.0);
+        let bi = u32(clamp((1.0 - d) * 15.99, 0.0, 15.0));
+        let s = params.spectrum[bi / 4u][bi % 4u];
+        color *= 1.0 + s * s * 1.6 * params.audio_fx.z;
     }
 
     var out: VsOut;

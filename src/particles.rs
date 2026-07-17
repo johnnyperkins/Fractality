@@ -77,6 +77,20 @@ pub struct ParamsUniform {
     /// 60 FPS reference). 0 = trails off: particles draw straight to the view
     /// target and the trail texture path is skipped entirely.
     pub trail_decay: f32,
+    /// Audio reactivity levels: x bass, y mid, z treble, w beat pulse (1 on a
+    /// detected beat, exponential decay). All zero while disabled, so every
+    /// consumer is a natural no-op with no enable flag.
+    pub audio: Vec4,
+    /// Palette hue offset accumulated from music energy.
+    pub audio_hue: f32,
+    /// x seconds since last beat, y seconds since last drop (both saturate
+    /// high, so waves die out), z knob-scaled stereo pan push, w overall level.
+    pub audio2: Vec4,
+    /// Effect gains from the audio settings sliders: x ring pulse, y flash /
+    /// glitter, z spectrum glow, w unused.
+    pub audio_fx: Vec4,
+    /// 16 log-spaced spectrum bins (bin 0 = lowest), packed 4 per vec4.
+    pub spectrum: [Vec4; 4],
 }
 
 /// Max reference-orbit length (also caps max_iter). One vec2<f32> per entry.
@@ -97,9 +111,20 @@ pub struct RefOrbit {
     pub generation: u32,
 }
 
-/// Fixed Julia parameter for fractal type 4. Only the CPU needs it: the GPU
-/// delta iteration for Julia has no c term (dc seeds dz_0 instead).
+/// Fractal type id of the Julia set in FRACTAL_MODES and the shader switches.
+pub const JULIA_TYPE: u32 = 4;
+
+/// Home Julia parameter. Only the CPU needs it: the GPU delta iteration for
+/// Julia has no c term (dc seeds dz_0 instead), so c reaches the GPU only
+/// through the reference orbit.
 pub const JULIA_C: (f64, f64) = (-0.7269, 0.1889);
+
+/// Julia parameter for the audio morph: orbits JULIA_C at the given phase
+/// (0..1) and radius.
+pub fn julia_morph_c(phase: f64, radius: f64) -> (f64, f64) {
+    let th = phase * std::f64::consts::TAU;
+    (JULIA_C.0 + radius * th.cos(), JULIA_C.1 + radius * th.sin())
+}
 
 /// One iteration of the selected fractal map in f64. Types must match the
 /// switch in the compute shader: 0 Mandelbrot (also Julia's map), 1 Burning
@@ -121,11 +146,11 @@ fn fractal_step(zx: f64, zy: f64, cx: f64, cy: f64, ftype: u32) -> (f64, f64) {
 }
 
 /// Initial z and effective c for a point of the given fractal. Julia iterates
-/// the point itself under a fixed c; everything else iterates from 0 with the
-/// point as c.
-fn orbit_start(x: f64, y: f64, ftype: u32) -> (f64, f64, f64, f64) {
-    if ftype == 4 {
-        (x, y, JULIA_C.0, JULIA_C.1)
+/// the point itself under the given c (the audio morph orbits it around
+/// JULIA_C); everything else iterates from 0 with the point as c.
+fn orbit_start(x: f64, y: f64, ftype: u32, jc: (f64, f64)) -> (f64, f64, f64, f64) {
+    if ftype == JULIA_TYPE {
+        (x, y, jc.0, jc.1)
     } else {
         (0.0, 0.0, x, y)
     }
@@ -143,8 +168,8 @@ fn inv_log2_power(ftype: u32) -> f64 {
 
 /// Iterate the selected map at the reference point in f64, storing Z_0..Z_n as
 /// f32 pairs. Stops at max_iter, REF_ORBIT_CAP, or when the orbit diverges hard.
-pub fn reference_orbit(cx: f64, cy: f64, max_iter: u32, ftype: u32) -> Vec<[f32; 2]> {
-    let (mut zx, mut zy, ccx, ccy) = orbit_start(cx, cy, ftype);
+pub fn reference_orbit(cx: f64, cy: f64, max_iter: u32, ftype: u32, jc: (f64, f64)) -> Vec<[f32; 2]> {
+    let (mut zx, mut zy, ccx, ccy) = orbit_start(cx, cy, ftype, jc);
     let mut v = Vec::with_capacity((max_iter as usize + 1).min(REF_ORBIT_CAP));
     v.push([zx as f32, zy as f32]); // Z_0 (0 except Julia, where it's the center)
     for _ in 0..max_iter {
@@ -171,7 +196,7 @@ pub struct ParticleSeed(pub Arc<Vec<Particle>>);
 /// radius (256.0) must be identical to field() in the WGSL shaders so that
 /// CPU band values match GPU field values.
 fn smooth_iter(x: f64, y: f64, max_iter: u32, ftype: u32) -> f32 {
-    let (mut zx, mut zy, cx, cy) = orbit_start(x, y, ftype);
+    let (mut zx, mut zy, cx, cy) = orbit_start(x, y, ftype, JULIA_C);
     let ilp = inv_log2_power(ftype);
     for i in 0..max_iter {
         let (nx, ny) = fractal_step(zx, zy, cx, cy, ftype);

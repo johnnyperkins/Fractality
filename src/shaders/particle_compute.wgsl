@@ -31,6 +31,19 @@ struct Params {
     fractal_type: u32,
     // Unused in this shader; present for layout parity with ParamsUniform.
     trail_decay: f32,
+    // Audio levels: x bass, y mid, z treble, w beat pulse. All zero while
+    // audio reactivity is off, so every use is a natural no-op.
+    audio: vec4<f32>,
+    // Music-driven palette hue offset (unused here; layout parity).
+    audio_hue: f32,
+    // x seconds since last beat, y seconds since last drop (saturate high),
+    // z knob-scaled stereo pan push, w overall level.
+    audio2: vec4<f32>,
+    // Effect gains: x ring pulse, y flash/glitter (render), z spectrum glow
+    // (render), w unused.
+    audio_fx: vec4<f32>,
+    // 16 log-spaced spectrum bins (unused here; layout parity).
+    spectrum: array<vec4<f32>, 4>,
 };
 
 @group(0) @binding(0) var<storage, read_write> particles: array<Particle>;
@@ -218,6 +231,55 @@ fn field_grad(dc: vec2<f32>) -> FieldGrad {
     return FieldGrad(f32(params.max_iter), vec2<f32>(0.0, 0.0));
 }
 
+// Ring waves die past these ages; one definition keeps beat_impulse and the
+// staggered path's liveness check in sync.
+const BEAT_AGE_MAX: f32 = 1.2;
+const DROP_AGE_MAX: f32 = 2.0;
+// Wavefront travel speed, in view heights per second.
+const WAVE_SPEED: f32 = 1.4;
+
+fn wave_live() -> bool {
+    return params.audio2.x < BEAT_AGE_MAX || params.audio2.y < DROP_AGE_MAX;
+}
+
+// A gaussian shell at the radius an `age`-old wavefront has reached, fading
+// as it travels.
+fn ring(r: f32, age: f32, vh: f32) -> f32 {
+    let d = (r - age * WAVE_SPEED * vh) / (vh * 0.08);
+    return exp(-d * d) * exp(-age * 2.5);
+}
+
+// Beat/drop shockwaves: expanding rings from the view center - a pond ripple
+// traveling through the cloud, not a uniform push. A drop fires a triple
+// wave. Scales with view_height so it feels identical at any zoom depth, and
+// is cheap enough (length + a few exp) to run on the staggered fast path so
+// the wavefront hits every particle every frame. Amplitudes are sized to
+// displace, not eject: much higher and the cloud blows off screen and the
+// view goes dark until the recycle repopulates it.
+fn beat_impulse(pos: vec2<f32>, view_height: f32) -> vec2<f32> {
+    let beat_age = params.audio2.x;
+    let drop_age = params.audio2.y;
+    let r = length(pos);
+    var dir = vec2<f32>(0.0, 1.0);
+    if (r > view_height * 1e-5) {
+        dir = pos / r;
+    }
+    var a = 0.0;
+    if (beat_age < BEAT_AGE_MAX) {
+        a += ring(r, beat_age, view_height) * 5.0;
+    }
+    if (drop_age < DROP_AGE_MAX) {
+        // Triple wave, 0.18 s apart, each softer than the last.
+        for (var k = 0u; k < 3u; k = k + 1u) {
+            let ag = drop_age - 0.18 * f32(k);
+            if (ag >= 0.0) {
+                a += ring(r, ag, view_height) * (9.0 - 2.0 * f32(k));
+            }
+        }
+    }
+    return dir * a * view_height * params.audio_fx.x;
+}
+
 fn hash_u32(x0: u32) -> u32 {
     var h = x0;
     h = h ^ (h >> 16u);
@@ -316,6 +378,17 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
     let depth_est = p.band / f32(params.max_iter);
     let calm_est = 1.0 - 0.95 * smoothstep(0.25, 0.75, depth_est);
     if (calm_est < 0.2 && dist > radius * 2.0 && (idx + params.frame) % 4u != 0u) {
+        // Staggered particles still ride a live ring wave (impulse plus
+        // integration, a few ALU ops), so the wavefront stays smooth without
+        // paying the full field cost on beat frames. Damp here too: the full
+        // path only runs 1 frame in 4 for these particles, and integrating
+        // velocity every beat frame with quarter-rate damping lets the kick
+        // run away and carry the cloud off screen.
+        if (wave_live()) {
+            p.vel += beat_impulse(p.pos, view_height) * dt;
+            p.vel *= max(0.0, 1.0 - params.damping * dt);
+            p.pos += p.vel * dt;
+        }
         particles[idx] = p;
         return;
     }
@@ -387,6 +460,22 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
         } else {
             impulse = dir * fall * fall * radius * 5.0;
         }
+    }
+
+    // Audio reactivity: ring waves, a fine treble sparkle jitter, and a
+    // stereo pan push (panned audio leans the whole cloud left/right;
+    // audio2.z is already knob- and level-scaled on the CPU).
+    if (wave_live()) {
+        impulse += beat_impulse(p.pos, view_height);
+    }
+    // Gain sized so a full pan swing reaches a clearly visible drift
+    // (terminal velocity = gain / damping ~ 0.8 vh/s at pan 1).
+    impulse += vec2<f32>(params.audio2.z, 0.0) * view_height * 2.5;
+    let tr = params.audio.z;
+    if (tr > 0.02) {
+        let a = rand01(&seed) * 6.2831853;
+        let amp = tr * tr * view_height * 0.004 * rand01(&seed);
+        p.pos += vec2<f32>(cos(a), sin(a)) * amp;
     }
 
     // Calm particles converge onto their (slow) desired velocity much faster,
