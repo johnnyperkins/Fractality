@@ -30,6 +30,9 @@ pub struct Settings {
     pub dot_px: f32,
     /// Bloom intensity.
     pub bloom: f32,
+    /// Trail keep factor per frame (at 60 FPS). 0 disables trails entirely;
+    /// higher = longer light-trails / motion blur.
+    pub trail: f32,
 }
 
 impl Default for Settings {
@@ -42,6 +45,7 @@ impl Default for Settings {
             brightness: 1.1,
             dot_px: 1.0,
             bloom: 0.3,
+            trail: 0.3,
         }
     }
 }
@@ -55,10 +59,11 @@ pub enum Setting {
     Brightness,
     DotSize,
     Bloom,
+    Trail,
 }
 
 /// Rows, in display order.
-const SETTINGS: [Setting; 7] = [
+const SETTINGS: [Setting; 8] = [
     Setting::ParticleCount,
     Setting::Detail,
     Setting::FlowSpeed,
@@ -66,6 +71,7 @@ const SETTINGS: [Setting; 7] = [
     Setting::Brightness,
     Setting::DotSize,
     Setting::Bloom,
+    Setting::Trail,
 ];
 
 impl Setting {
@@ -78,6 +84,7 @@ impl Setting {
             Setting::Brightness => "Brightness",
             Setting::DotSize => "Dot size",
             Setting::Bloom => "Bloom",
+            Setting::Trail => "Trails",
         }
     }
 
@@ -91,6 +98,7 @@ impl Setting {
             Setting::Brightness => (0.1, 4.0),
             Setting::DotSize => (0.1, 4.0),
             Setting::Bloom => (0.0, 1.0),
+            Setting::Trail => (0.0, 0.98),
         }
     }
 
@@ -103,6 +111,7 @@ impl Setting {
             Setting::Brightness => s.brightness,
             Setting::DotSize => s.dot_px,
             Setting::Bloom => s.bloom,
+            Setting::Trail => s.trail,
         }
     }
 
@@ -118,6 +127,7 @@ impl Setting {
             Setting::Brightness => s.brightness = v,
             Setting::DotSize => s.dot_px = v,
             Setting::Bloom => s.bloom = v,
+            Setting::Trail => s.trail = v,
         }
     }
 

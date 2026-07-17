@@ -6,13 +6,14 @@ use std::sync::Arc;
 use bevy::asset::DirectAssetAccessExt;
 use bevy::math::DVec2;
 use bevy::core_pipeline::core_2d::graph::{Core2d, Node2d};
+use bevy::core_pipeline::fullscreen_vertex_shader::fullscreen_shader_vertex_state;
 use bevy::prelude::*;
 use bevy::render::{
     extract_resource::{ExtractResource, ExtractResourcePlugin},
     graph::CameraDriverLabel,
     render_graph::{self, RenderGraph, RenderGraphApp, RenderLabel, ViewNode, ViewNodeRunner},
     render_resource::binding_types::{
-        storage_buffer_read_only_sized, storage_buffer_sized, uniform_buffer,
+        storage_buffer_read_only_sized, storage_buffer_sized, texture_2d, uniform_buffer,
     },
     render_resource::*,
     renderer::{RenderContext, RenderDevice, RenderQueue},
@@ -72,6 +73,10 @@ pub struct ParamsUniform {
     /// Fractal formula (F cycles): 0 Mandelbrot, 1 Burning Ship, 2 Tricorn,
     /// 3 Multibrot-3, 4 Julia. Must match the switch in the compute shader.
     pub fractal_type: u32,
+    /// Per-frame trail keep factor, frame-rate corrected (settings.trail at a
+    /// 60 FPS reference). 0 = trails off: particles draw straight to the view
+    /// target and the trail texture path is skipped entirely.
+    pub trail_decay: f32,
 }
 
 /// Max reference-orbit length (also caps max_iter). One vec2<f32> per entry.
@@ -269,8 +274,24 @@ struct ParticleBindGroups {
 struct ParticlePipelines {
     compute_layout: BindGroupLayout,
     render_layout: BindGroupLayout,
+    composite_layout: BindGroupLayout,
     compute_pipeline: CachedComputePipelineId,
     render_pipeline: CachedRenderPipelineId,
+    fade_pipeline: CachedRenderPipelineId,
+    composite_pipeline: CachedRenderPipelineId,
+}
+
+/// Persistent screen-sized HDR texture the particles accumulate into when
+/// trails are on. Faded a little each frame instead of cleared, then blitted
+/// onto the view target. Recreated on resize; cleared on (re)enable.
+#[derive(Resource)]
+struct TrailTexture {
+    view: TextureView,
+    bind_group: BindGroup,
+    size: (u32, u32),
+    /// First trail frame after enable/resize: clear instead of loading stale
+    /// (or garbage) history.
+    needs_clear: bool,
 }
 
 impl FromWorld for ParticlePipelines {
@@ -297,10 +318,19 @@ impl FromWorld for ParticlePipelines {
                 ),
             ),
         );
+        let composite_layout = device.create_bind_group_layout(
+            "trail_composite_layout",
+            &BindGroupLayoutEntries::single(
+                ShaderStages::FRAGMENT,
+                texture_2d(TextureSampleType::Float { filterable: false }),
+            ),
+        );
         let compute_shader: Handle<Shader> =
             world.load_asset("embedded://fractality/shaders/particle_compute.wgsl");
         let render_shader: Handle<Shader> =
             world.load_asset("embedded://fractality/shaders/particle_render.wgsl");
+        let trail_shader: Handle<Shader> =
+            world.load_asset("embedded://fractality/shaders/trail.wgsl");
         let cache = world.resource::<PipelineCache>();
         let compute_pipeline = cache.queue_compute_pipeline(ComputePipelineDescriptor {
             label: Some("particle_compute_pipeline".into()),
@@ -347,11 +377,64 @@ impl FromWorld for ParticlePipelines {
             multisample: MultisampleState::default(),
             zero_initialize_workgroup_memory: false,
         });
+        // Both trail passes are fullscreen-triangle fragments over the HDR
+        // target; only entry point, layout, and blend differ.
+        let trail_pass = |label: &'static str,
+                          entry: &'static str,
+                          layout: Vec<BindGroupLayout>,
+                          blend: Option<BlendState>| RenderPipelineDescriptor {
+            label: Some(label.into()),
+            layout,
+            push_constant_ranges: vec![],
+            vertex: fullscreen_shader_vertex_state(),
+            fragment: Some(FragmentState {
+                shader: trail_shader.clone(),
+                shader_defs: vec![],
+                entry_point: entry.into(),
+                targets: vec![Some(ColorTargetState {
+                    format: ViewTarget::TEXTURE_FORMAT_HDR,
+                    blend,
+                    write_mask: ColorWrites::ALL,
+                })],
+            }),
+            primitive: PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: MultisampleState::default(),
+            zero_initialize_workgroup_memory: false,
+        };
+        // Fade pass: darken the trail texture in place. The fragment outputs
+        // white; src_factor Zero / dst_factor Constant makes the result
+        // dst * blend_constant, and the draw node sets the blend constant to
+        // the per-frame keep factor. No bind group needed.
+        let fade_blend = BlendComponent {
+            src_factor: BlendFactor::Zero,
+            dst_factor: BlendFactor::Constant,
+            operation: BlendOperation::Add,
+        };
+        let fade_pipeline = cache.queue_render_pipeline(trail_pass(
+            "trail_fade_pipeline",
+            "fs_fade",
+            vec![],
+            Some(BlendState {
+                color: fade_blend,
+                alpha: fade_blend,
+            }),
+        ));
+        // Composite pass: copy the trail texture onto the view target 1:1.
+        let composite_pipeline = cache.queue_render_pipeline(trail_pass(
+            "trail_composite_pipeline",
+            "fs_composite",
+            vec![composite_layout.clone()],
+            None,
+        ));
         Self {
             compute_layout,
             render_layout,
+            composite_layout,
             compute_pipeline,
             render_pipeline,
+            fade_pipeline,
+            composite_pipeline,
         }
     }
 }
@@ -465,6 +548,75 @@ fn prepare_particle_bind_groups(
     commands.insert_resource(ParticleBindGroups { compute, render });
 }
 
+/// Keep the trail texture matching the view size, and track when it needs a
+/// clear (first frame after enabling trails, or after a resize). Created
+/// lazily: a session that never turns trails on allocates nothing.
+fn prepare_trail_texture(
+    mut commands: Commands,
+    device: Res<RenderDevice>,
+    pipelines: Res<ParticlePipelines>,
+    params: Option<Res<SimParams>>,
+    views: Query<&ViewTarget>,
+    existing: Option<ResMut<TrailTexture>>,
+    mut was_active: Local<bool>,
+) {
+    let active = params.map_or(false, |p| p.0.trail_decay > 0.0);
+    // Trails never used this session: nothing to size-track or invalidate.
+    if !active && existing.is_none() {
+        *was_active = false;
+        return;
+    }
+    let Ok(view_target) = views.single() else {
+        *was_active = false;
+        return;
+    };
+    let extent = view_target.main_texture().size();
+    let size = (extent.width, extent.height);
+
+    let recreate = existing.as_ref().map_or(true, |t| t.size != size);
+    if recreate {
+        if !active {
+            *was_active = false;
+            return;
+        }
+        let texture = device.create_texture(&TextureDescriptor {
+            label: Some("trail_texture"),
+            size: Extent3d {
+                width: size.0,
+                height: size.1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: ViewTarget::TEXTURE_FORMAT_HDR,
+            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&TextureViewDescriptor::default());
+        let bind_group = device.create_bind_group(
+            "trail_composite_bind_group",
+            &pipelines.composite_layout,
+            &BindGroupEntries::single(&view),
+        );
+        commands.insert_resource(TrailTexture {
+            view,
+            bind_group,
+            size,
+            needs_clear: true,
+        });
+    } else if let Some(mut trail) = existing {
+        // Re-enabling after a disabled stretch starts from black, not from
+        // whatever the texture held when trails were last on. Write only on
+        // change to avoid per-frame change-detection churn.
+        let clear = !*was_active;
+        if trail.needs_clear != clear {
+            trail.needs_clear = clear;
+        }
+    }
+    *was_active = active;
+}
+
 struct ParticleComputeNode;
 
 impl render_graph::Node for ParticleComputeNode {
@@ -527,21 +679,74 @@ impl ViewNode for ParticleDrawNode {
         let Some(pipeline) = cache.get_render_pipeline(pipelines.render_pipeline) else {
             return Ok(());
         };
-        let mut pass = render_context.begin_tracked_render_pass(RenderPassDescriptor {
-            label: Some("particle_draw_pass"),
-            color_attachments: &[Some(view_target.get_color_attachment())],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-        });
         // Draw only the active count (buffer holds up to MAX_PARTICLES).
-        let count = world
-            .get_resource::<SimParams>()
-            .map_or(0, |p| p.0.count)
-            .min(buffers.count);
-        pass.set_render_pipeline(pipeline);
-        pass.set_bind_group(0, &bind_groups.render, &[]);
-        pass.draw(0..6, 0..count);
+        let params = world.get_resource::<SimParams>();
+        let count = params.map_or(0, |p| p.0.count).min(buffers.count);
+        let decay = params.map_or(0.0, |p| p.0.trail_decay);
+
+        // Trail path needs the texture and both extra pipelines ready;
+        // otherwise (including trails off) draw straight to the view target.
+        let trail = world
+            .get_resource::<TrailTexture>()
+            .filter(|_| decay > 0.0)
+            .and_then(|t| {
+                let fade = cache.get_render_pipeline(pipelines.fade_pipeline)?;
+                let composite = cache.get_render_pipeline(pipelines.composite_pipeline)?;
+                Some((t, fade, composite))
+            });
+
+        {
+            // One particle pass either way; only the target differs. With
+            // trails on, fade the previous frame first, then add this frame's
+            // particles on top of the persistent trail texture.
+            let (label, attachment) = match &trail {
+                Some((t, _, _)) => (
+                    "trail_accumulate_pass",
+                    RenderPassColorAttachment {
+                        view: &t.view,
+                        resolve_target: None,
+                        ops: Operations {
+                            load: if t.needs_clear {
+                                LoadOp::Clear(LinearRgba::BLACK.into())
+                            } else {
+                                LoadOp::Load
+                            },
+                            store: StoreOp::Store,
+                        },
+                    },
+                ),
+                None => ("particle_draw_pass", view_target.get_color_attachment()),
+            };
+            let mut pass = render_context.begin_tracked_render_pass(RenderPassDescriptor {
+                label: Some(label),
+                color_attachments: &[Some(attachment)],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            if let Some((t, fade, _)) = &trail {
+                if !t.needs_clear {
+                    pass.set_render_pipeline(fade);
+                    pass.set_blend_constant(LinearRgba::rgb(decay, decay, decay));
+                    pass.draw(0..3, 0..1);
+                }
+            }
+            pass.set_render_pipeline(pipeline);
+            pass.set_bind_group(0, &bind_groups.render, &[]);
+            pass.draw(0..6, 0..count);
+        }
+        if let Some((trail, _, composite)) = trail {
+            let mut pass = render_context.begin_tracked_render_pass(RenderPassDescriptor {
+                label: Some("trail_composite_pass"),
+                color_attachments: &[Some(view_target.get_color_attachment())],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_render_pipeline(composite);
+            pass.set_bind_group(0, &trail.bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
         Ok(())
     }
 }
@@ -552,6 +757,7 @@ impl Plugin for ParticlePlugin {
     fn build(&self, app: &mut App) {
         bevy::asset::embedded_asset!(app, "shaders/particle_compute.wgsl");
         bevy::asset::embedded_asset!(app, "shaders/particle_render.wgsl");
+        bevy::asset::embedded_asset!(app, "shaders/trail.wgsl");
 
         app.add_plugins(ExtractResourcePlugin::<SimParams>::default());
         app.add_plugins(ExtractResourcePlugin::<RefOrbit>::default());
@@ -562,7 +768,8 @@ impl Plugin for ParticlePlugin {
             .add_systems(ExtractSchedule, extract_particle_buffers)
             .add_systems(
                 Render,
-                prepare_particle_bind_groups.in_set(RenderSet::PrepareBindGroups),
+                (prepare_particle_bind_groups, prepare_trail_texture)
+                    .in_set(RenderSet::PrepareBindGroups),
             );
         render_app
             .add_render_graph_node::<ViewNodeRunner<ParticleDrawNode>>(Core2d, ParticleDrawLabel);

@@ -482,6 +482,25 @@ fn update_params(
     // Normalize brightness by density so a given user setting looks the same at
     // any particle count, then scale by the user's brightness knob.
     u.brightness = settings.brightness * (500_000.0f32 / count as f32).sqrt();
+    // Trails: per-frame keep factor, corrected to a 60 FPS reference so the
+    // trail length is frame-rate independent. 0 = off (direct draw path).
+    // With per-frame keep factor `keep`, additive accumulation converges to
+    // emission / (1 - keep), so scale emission by exactly (1 - keep). This is
+    // both frame-rate independent (steady state = b regardless of fps) and
+    // jitter-proof: at steady state each frame outputs keep*S + (1-keep)*b = b
+    // no matter how dt fluctuates, so vsync-off frame-time noise cannot pulse
+    // the brightness. It is also continuous at trail -> 0 (factor -> 1), so
+    // enabling trails at low strength does not darken the image.
+    // The floor keeps the per-frame deposit large enough to register against
+    // the f16 accumulator at very long trails / very high fps.
+    if settings.trail > 0.0 {
+        let frames_60 = (time.delta_secs() * 60.0).clamp(0.1, 4.0);
+        let keep = settings.trail.powf(frames_60);
+        u.trail_decay = keep;
+        u.brightness *= (1.0 - keep).max(0.02);
+    } else {
+        u.trail_decay = 0.0;
+    }
     u.ref_len = ref_orbit.points.len() as u32;
     u.frame = *frame;
     u.reseed_rate = reseed_rate;
