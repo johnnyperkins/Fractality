@@ -489,21 +489,43 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let m = dot(ze, ze);
                 if (m > 1e-12) {
                     let a0 = atan2(ze.y, ze.x);
-                    // log2(m) sweeps ~2.4 rad smoothly WITHIN each cell
-                    // (escape overshoot encodes the fractional iteration),
-                    // bending the flat cells into curved eddies. The sine
-                    // term waves each stream serpentine over time, phased
-                    // by a0 so cells desync instead of wagging in unison.
-                    // audio_hue spins the whole field with music energy
-                    // (zero when audio reactivity is off).
-                    let a = a0 + 0.3 * log2(max(m, 1.0))
-                        + 0.6 * sin(a0 * 3.0 + params.time * 0.7)
-                        + params.time * 0.25 + params.audio_hue;
+                    // u is the fractional-iteration coordinate (escape
+                    // overshoot) - it varies ACROSS bands, so any monotonic
+                    // use of it paints band-parallel stripes. Keep it only
+                    // as a gentle wave phase.
+                    let u = 0.5 * log2(max(m, 1.0));
+                    // Ray angle tripled: the external-ray pinwheel cells
+                    // run perpendicular to the iteration bands, so scaling
+                    // a0 (not u) makes transverse structure dominate and
+                    // kills the layered look. The sine waves each stream
+                    // serpentine over time, phased by both coordinates so
+                    // neighboring eddies desync. audio_hue spins the whole
+                    // field with music energy, and each detected beat adds
+                    // a sharp extra twist that decays with the beat pulse
+                    // (both exactly zero when audio is off).
+                    let av = a0 * 3.0
+                        + 0.5 * sin(u * 2.4 + a0 + params.time * 0.7)
+                        + params.time * 0.25 + params.audio_hue
+                        + params.audio.w * 1.2;
+                    // Geometry-anchored wind: rotate the LOCAL contour
+                    // normal by the cell angle instead of using a fixed
+                    // screen direction. gn turns with the fractal's shape,
+                    // so streams curl around filaments and spiral into
+                    // bulbs rather than blowing in straight lines across
+                    // them. gn is unit length, so the rotation is too.
+                    let dir = vec2<f32>(
+                        gn.x * cos(av) - gn.y * sin(av),
+                        gn.x * sin(av) + gn.y * cos(av),
+                    );
                     // Speed lanes: gentle per-cell magnitude variation so
-                    // the wind has gusts instead of one uniform pace.
-                    let gust = 0.75 + 0.25 * sin(a0 * 2.0 - params.time * 0.5);
-                    desired = vec2<f32>(cos(a), sin(a))
-                        * settle * mix(0.3, 1.0, calm) * base * 1.5 * gust;
+                    // the wind has gusts instead of one uniform pace. The
+                    // calm floor stays high - a low floor made deep bands
+                    // crawl at 1/3 speed, itself a layering artifact - and
+                    // settle gets a floor for the same reason (raw settle
+                    // tracks band error, another band-parallel signal).
+                    let gust = 0.75 + 0.25 * sin(a0 * 5.0 + u - params.time * 0.5);
+                    desired = dir * mix(0.6, 1.0, settle)
+                        * mix(0.55, 1.0, calm) * base * 1.5 * gust;
                 } else {
                     desired = correct;
                 }
