@@ -18,16 +18,15 @@ const N: usize = 1024;
 pub const SPECTRUM_BINS: usize = 16;
 
 /// Lock-free channel from the capture thread. Values are f32 bits in
-/// AtomicU32 (bands and spectrum already auto-gained to ~0..1, pan in
-/// -1..1); `beats`/`drops` increment per event so the reader can't miss
-/// short pulses between frames.
+/// AtomicU32 (bands and spectrum already auto-gained to ~0..1);
+/// `beats`/`drops` increment per event so the reader can't miss short
+/// pulses between frames.
 #[derive(Default)]
 pub struct AudioShared {
     bass: AtomicU32,
     mid: AtomicU32,
     treble: AtomicU32,
     level: AtomicU32,
-    pan: AtomicU32,
     spectrum: [AtomicU32; SPECTRUM_BINS],
     beats: AtomicU32,
     drops: AtomicU32,
@@ -41,7 +40,6 @@ struct RawLevels {
     mid: f32,
     treble: f32,
     level: f32,
-    pan: f32,
     spectrum: [f32; SPECTRUM_BINS],
     beats: u32,
     drops: u32,
@@ -54,7 +52,6 @@ impl AudioShared {
             mid: load_f32(&self.mid),
             treble: load_f32(&self.treble),
             level: load_f32(&self.level),
-            pan: load_f32(&self.pan),
             spectrum: std::array::from_fn(|i| load_f32(&self.spectrum[i])),
             beats: self.beats.load(Ordering::Relaxed),
             drops: self.drops.load(Ordering::Relaxed),
@@ -88,8 +85,6 @@ pub struct AudioLevels {
     pub mid: f32,
     pub treble: f32,
     pub level: f32,
-    /// Stereo balance of the source, -1 (left) .. 1 (right).
-    pub pan: f32,
     /// Log-spaced per-band energies, bin 0 = lowest frequencies.
     pub spectrum: [f32; SPECTRUM_BINS],
     /// Beat pulse: jumps to 1 on a detected beat (or drop), exponential decay.
@@ -119,7 +114,6 @@ impl Default for AudioLevels {
             mid: 0.0,
             treble: 0.0,
             level: 0.0,
-            pan: 0.0,
             spectrum: [0.0; SPECTRUM_BINS],
             beat: 0.0,
             drop: 0.0,
@@ -155,7 +149,6 @@ impl AudioLevels {
             && self.mid == 0.0
             && self.treble == 0.0
             && self.level == 0.0
-            && self.pan == 0.0
             && self.beat == 0.0
             && self.drop == 0.0
             && self.spectrum.iter().all(|&s| s == 0.0)
@@ -234,10 +227,6 @@ fn capture_loop(mut stdout: impl Read, shared: Arc<AudioShared>) {
 
     let mut peaks = [1e-5f32; 4];
     let mut spec_peaks = [1e-5f32; SPECTRUM_BINS];
-    // Pan gets auto-gain too: raw L/R imbalance is tiny (~0.05) on typical
-    // mostly-centered mixes, so normalize to its own recent peak like the
-    // bands. The floor keeps near-mono content from amplifying noise.
-    let mut pan_peak = 0.05f32;
     // ~1 s of bass-power history for beat detection (energy flux).
     let mut hist = [0.0f32; 43];
     let mut hist_i = 0usize;
@@ -250,7 +239,7 @@ fn capture_loop(mut stdout: impl Read, shared: Arc<AudioShared>) {
     let mut windows_seen = 0u32;
     let mut last_drop = Instant::now();
 
-    let mut bytes = vec![0u8; N * 8]; // stereo interleaved f32
+    let mut bytes = vec![0u8; N * 4]; // mono f32
     let mut re = [0.0f32; N];
     let mut im = [0.0f32; N];
     let mut power = [0.0f32; N / 2];
@@ -259,14 +248,8 @@ fn capture_loop(mut stdout: impl Read, shared: Arc<AudioShared>) {
             break;
         }
         im.fill(0.0);
-        let mut l_pow = 0.0f32;
-        let mut r_pow = 0.0f32;
-        for ((r, frame), w) in re.iter_mut().zip(bytes.chunks_exact(8)).zip(&window) {
-            let l = f32::from_le_bytes(frame[0..4].try_into().unwrap());
-            let rt = f32::from_le_bytes(frame[4..8].try_into().unwrap());
-            l_pow += l * l;
-            r_pow += rt * rt;
-            *r = (l + rt) * 0.5 * w;
+        for ((r, chunk), w) in re.iter_mut().zip(bytes.chunks_exact(4)).zip(&window) {
+            *r = f32::from_le_bytes(chunk.try_into().unwrap()) * w;
         }
         fft(&mut re, &mut im);
         // Per-bin power once; every band below is a range sum over this.
@@ -274,13 +257,6 @@ fn capture_loop(mut stdout: impl Read, shared: Arc<AudioShared>) {
             *p = r * r + i_ * i_;
         }
         let band_sum = |lo: usize, hi: usize| power[lo..hi].iter().sum::<f32>();
-
-        // Stereo pan from raw channel RMS, normalized to its recent width.
-        let (l_rms, r_rms) = (l_pow.sqrt(), r_pow.sqrt());
-        let pan = ((r_rms - l_rms) / (l_rms + r_rms + 1e-6)).clamp(-1.0, 1.0);
-        pan_peak = pan_peak.max(0.05); // re-assert the noise floor each window
-        let pan_n = pan.signum() * autogain(&mut pan_peak, pan.abs());
-        store_f32(&shared.pan, pan_n);
 
         // The three bands are contiguous, so the overall level is their union.
         let bass_s = band_sum(b0, b1);
@@ -335,11 +311,11 @@ fn capture_loop(mut stdout: impl Read, shared: Arc<AudioShared>) {
 }
 
 /// Spawn pw-record capturing the default sink's monitor (i.e. whatever the
-/// PC is playing), f32le stereo RATE Hz to stdout.
+/// PC is playing), f32le mono RATE Hz to stdout.
 fn start_capture() -> std::io::Result<(Child, Arc<AudioShared>)> {
     let mut child = Command::new("pw-record")
         .args(["--properties", "{ stream.capture.sink=true }"])
-        .args(["--format", "f32", "--channels", "2", "--rate"])
+        .args(["--format", "f32", "--channels", "1", "--rate"])
         .arg(RATE.to_string())
         .arg("-")
         .stdout(Stdio::piped())
@@ -406,10 +382,10 @@ pub fn update_audio(
     let raw = shared.map(|s| s.snapshot()).unwrap_or_default();
     // A single non-finite value here poisons brightness/size uniforms and
     // blacks the whole frame; scrub before it enters the smoothing.
-    let clean = |v: f32, lo: f32| if v.is_finite() { v.clamp(lo, 1.0) } else { 0.0 };
+    let clean = |v: f32| if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 };
     let env = |cur: f32, target: f32| {
         let k = if target > cur { 30.0 } else { 5.0 };
-        snap(cur + (clean(target, 0.0) - cur) * (k * dt).min(1.0))
+        snap(cur + (clean(target) - cur) * (k * dt).min(1.0))
     };
 
     let l = &mut *levels;
@@ -419,11 +395,6 @@ pub fn update_audio(
     l.level = env(l.level, raw.level);
     for i in 0..SPECTRUM_BINS {
         l.spectrum[i] = env(l.spectrum[i], raw.spectrum[i]);
-    }
-    // Pan is signed; symmetric smoothing, snapped so idle settles at 0.
-    l.pan += (clean(raw.pan, -1.0) - l.pan) * (10.0 * dt).min(1.0);
-    if l.pan.abs() < SNAP_EPS {
-        l.pan = 0.0;
     }
 
     // Event pulses and ages. Decay first; an event this frame overwrites.

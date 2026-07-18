@@ -561,12 +561,7 @@ fn update_params(
     u.particle_size *= 1.0 + audio.bass * 0.7;
     u.audio = Vec4::new(audio.bass, audio.mid, audio.treble, audio.beat);
     u.audio_hue = audio.hue_phase;
-    u.audio2 = Vec4::new(
-        audio.beat_age,
-        audio.drop_age,
-        audio.pan * audio.level * settings.audio_stereo,
-        audio.level,
-    );
+    u.audio2 = Vec4::new(audio.beat_age, audio.drop_age, 0.0, audio.level);
     u.audio_fx = Vec4::new(
         settings.audio_pulse,
         settings.audio_flash,

@@ -46,8 +46,6 @@ pub struct Settings {
     pub audio_breathe: f32,
     /// Julia parameter morph radius (fractal type julia only).
     pub audio_morph: f32,
-    /// Stereo pan push strength.
-    pub audio_stereo: f32,
     /// Mid-driven flow speed boost.
     pub audio_flow: f32,
 }
@@ -68,7 +66,6 @@ impl Default for Settings {
             audio_glow: 1.0,
             audio_breathe: 1.0,
             audio_morph: 1.0,
-            audio_stereo: 1.0,
             audio_flow: 1.0,
         }
     }
@@ -89,7 +86,6 @@ pub enum Setting {
     AudioGlow,
     AudioBreathe,
     AudioMorph,
-    AudioStereo,
     AudioFlow,
 }
 
@@ -106,13 +102,12 @@ const SETTINGS: [Setting; 8] = [
 ];
 
 /// Audio-effect rows, shown only while audio reactivity is on.
-const AUDIO_SETTINGS: [Setting; 7] = [
+const AUDIO_SETTINGS: [Setting; 6] = [
     Setting::AudioPulse,
     Setting::AudioFlash,
     Setting::AudioGlow,
     Setting::AudioBreathe,
     Setting::AudioMorph,
-    Setting::AudioStereo,
     Setting::AudioFlow,
 ];
 
@@ -132,7 +127,6 @@ impl Setting {
             Setting::AudioGlow => "Spec glow",
             Setting::AudioBreathe => "Breathe",
             Setting::AudioMorph => "Julia morph",
-            Setting::AudioStereo => "Stereo push",
             Setting::AudioFlow => "Flow boost",
         }
     }
@@ -155,7 +149,6 @@ impl Setting {
             | Setting::AudioGlow
             | Setting::AudioBreathe
             | Setting::AudioMorph
-            | Setting::AudioStereo
             | Setting::AudioFlow => (0.0, 2.0),
         }
     }
@@ -175,7 +168,6 @@ impl Setting {
             Setting::AudioGlow => s.audio_glow,
             Setting::AudioBreathe => s.audio_breathe,
             Setting::AudioMorph => s.audio_morph,
-            Setting::AudioStereo => s.audio_stereo,
             Setting::AudioFlow => s.audio_flow,
         }
     }
@@ -198,7 +190,6 @@ impl Setting {
             Setting::AudioGlow => s.audio_glow = v,
             Setting::AudioBreathe => s.audio_breathe = v,
             Setting::AudioMorph => s.audio_morph = v,
-            Setting::AudioStereo => s.audio_stereo = v,
             Setting::AudioFlow => s.audio_flow = v,
         }
     }

@@ -84,7 +84,7 @@ pub struct ParamsUniform {
     /// Palette hue offset accumulated from music energy.
     pub audio_hue: f32,
     /// x seconds since last beat, y seconds since last drop (both saturate
-    /// high, so waves die out), z knob-scaled stereo pan push, w overall level.
+    /// high, so waves die out), z unused, w overall level.
     pub audio2: Vec4,
     /// Effect gains from the audio settings sliders: x ring pulse, y flash /
     /// glitter, z spectrum glow, w unused.

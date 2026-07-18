@@ -37,7 +37,7 @@ struct Params {
     // Music-driven palette hue offset (unused here; layout parity).
     audio_hue: f32,
     // x seconds since last beat, y seconds since last drop (saturate high),
-    // z knob-scaled stereo pan push, w overall level.
+    // z unused, w overall level.
     audio2: vec4<f32>,
     // Effect gains: x ring pulse, y flash/glitter (render), z spectrum glow
     // (render), w unused.
@@ -462,15 +462,10 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
-    // Audio reactivity: ring waves, a fine treble sparkle jitter, and a
-    // stereo pan push (panned audio leans the whole cloud left/right;
-    // audio2.z is already knob- and level-scaled on the CPU).
+    // Audio reactivity: ring waves plus a fine treble sparkle jitter.
     if (wave_live()) {
         impulse += beat_impulse(p.pos, view_height);
     }
-    // Gain sized so a full pan swing reaches a clearly visible drift
-    // (terminal velocity = gain / damping ~ 0.8 vh/s at pan 1).
-    impulse += vec2<f32>(params.audio2.z, 0.0) * view_height * 2.5;
     let tr = params.audio.z;
     if (tr > 0.02) {
         let a = rand01(&seed) * 6.2831853;

@@ -36,7 +36,7 @@ struct Params {
     audio: vec4<f32>,
     // Music-driven palette hue offset.
     audio_hue: f32,
-    // x seconds since last beat, y seconds since last drop, z pan push,
+    // x seconds since last beat, y seconds since last drop, z unused,
     // w overall level.
     audio2: vec4<f32>,
     // Effect gains: x ring pulse (compute), y flash/glitter, z spectrum glow,
@@ -178,14 +178,6 @@ fn vs(
         let glitter = max(0.0, cos(params.time * 40.0 + p.hue * 300.0));
         color *= 1.0 + tr * glitter * glitter * 0.8;
     }
-    // Stereo tilt: the loud channel's side of the screen glows. Far more
-    // perceptible than the positional push alone, and reads instantly as
-    // "the music is over there". clip_xy.x is the screen x in -1..1.
-    let panb = params.audio2.z;
-    if (abs(panb) > 0.01) {
-        color *= 1.0 + max(0.0, clip_xy.x * sign(panb)) * abs(panb) * 1.2;
-    }
-
     // Spectrum glow: each particle's iteration depth maps to a frequency
     // band - bass lights the deep shell filaments, treble the outer haze -
     // so the fractal becomes an equalizer shaped like itself.
