@@ -73,6 +73,10 @@ pub struct ParamsUniform {
     /// Fractal formula (F cycles): 0 Mandelbrot, 1 Burning Ship, 2 Tricorn,
     /// 3 Multibrot-3, 4 Julia. Must match the switch in the compute shader.
     pub fractal_type: u32,
+    /// Particle flow style (G cycles / menu dropdown): 0 contour, 1 layers,
+    /// 2 gravity, 3 erupt, 4 pulse, 5 dynamics. Must match the switch in the
+    /// compute shader.
+    pub flow_mode: u32,
     /// Per-frame trail keep factor, frame-rate corrected (settings.trail at a
     /// 60 FPS reference). 0 = trails off: particles draw straight to the view
     /// target and the trail texture path is skipped entirely.

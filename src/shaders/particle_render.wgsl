@@ -29,6 +29,8 @@ struct Params {
     dissolve: f32,
     color_mode: u32,
     fractal_type: u32,
+    // Flow style (unused in this shader; layout parity).
+    flow_mode: u32,
     // Unused in this shader; present for layout parity with ParamsUniform.
     trail_decay: f32,
     // Audio levels: x bass, y mid, z treble, w beat pulse. All zero while

@@ -8,7 +8,7 @@ use bevy::ui::RelativeCursorPosition;
 
 use crate::audio::{AudioCapture, AudioLevels};
 use crate::particles::MAX_PARTICLES;
-use crate::{ColorMode, FractalType, COLOR_MODES, FRACTAL_MODES};
+use crate::{ColorMode, FlowMode, FractalType, COLOR_MODES, FLOW_MODES, FRACTAL_MODES};
 
 /// Live-tunable knobs. Source of truth for the whole app.
 #[derive(Resource)]
@@ -250,6 +250,22 @@ struct FractalRow;
 #[derive(Component)]
 struct FractalValue;
 
+/// Clickable "Flow" row; clicking opens/closes the flow-mode dropdown.
+#[derive(Component)]
+struct FlowRow;
+
+/// The text showing the active flow mode name.
+#[derive(Component)]
+struct FlowValue;
+
+/// The dropdown list itself (hidden until the row is clicked).
+#[derive(Component)]
+struct FlowDropdown;
+
+/// One selectable entry in the flow dropdown.
+#[derive(Component)]
+struct FlowOption(u32);
+
 /// Clickable "Audio react" row; clicking toggles audio reactivity (same as V).
 #[derive(Component)]
 struct AudioRow;
@@ -289,6 +305,9 @@ impl Plugin for MenuPlugin {
                     update_color_mode_text,
                     click_fractal,
                     update_fractal_text,
+                    click_flow_row,
+                    click_flow_option,
+                    update_flow_text,
                     click_audio,
                     sync_audio_ui,
                     apply_bloom,
@@ -447,7 +466,7 @@ const CONTROLS: [&str; 11] = [
     "Left hold  blast   Right hold  vortex",
     "Space  dissolve",
     "Z  auto-zoom dive   C  color mode",
-    "F  fractal type",
+    "F  fractal type   G  flow mode",
     "V  audio reactivity",
     "P  screenshot",
     "Shift+1..9  save view   1..9  fly to it",
@@ -480,6 +499,66 @@ fn build_menu(mut commands: Commands) {
                 parent.spawn(row_bundle(setting));
             }
             parent.spawn(value_row("Fractal", FRACTAL_MODES[0], FractalRow, FractalValue));
+            // Flow row: click toggles a dropdown of flow modes. The shared
+            // value_row supplies the label/value shell; the caret and the
+            // absolutely positioned dropdown overlay (floats over the rows
+            // below instead of pushing them down) are appended as extra
+            // children.
+            parent
+                .spawn(value_row("Flow", FLOW_MODES[0], FlowRow, FlowValue))
+                .with_children(|row| {
+                    row.spawn((
+                        Text::new("\u{25be}"),
+                        TextFont {
+                            font_size: 12.0,
+                            ..default()
+                        },
+                        TextColor(Color::srgb(0.6, 0.65, 0.75)),
+                    ));
+                    row.spawn((
+                        Node {
+                            position_type: PositionType::Absolute,
+                            left: Val::Px(120.0),
+                            top: Val::Px(22.0),
+                            flex_direction: FlexDirection::Column,
+                            padding: UiRect::all(Val::Px(4.0)),
+                            row_gap: Val::Px(2.0),
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgba(0.08, 0.09, 0.15, 0.98)),
+                        BorderRadius::all(Val::Px(5.0)),
+                        GlobalZIndex(10),
+                        // Inherited (not Visible) when open, so closing the
+                        // whole menu also hides an open dropdown.
+                        Visibility::Hidden,
+                        Interaction::default(),
+                        MenuInteractive,
+                        FlowDropdown,
+                    ))
+                    .with_children(|dd| {
+                        for (i, name) in FLOW_MODES.iter().enumerate() {
+                            dd.spawn((
+                                Button,
+                                Node {
+                                    padding: UiRect::axes(Val::Px(10.0), Val::Px(3.0)),
+                                    ..default()
+                                },
+                                BackgroundColor(Color::NONE),
+                                BorderRadius::all(Val::Px(3.0)),
+                                MenuInteractive,
+                                FlowOption(i as u32),
+                                children![(
+                                    Text::new(*name),
+                                    TextFont {
+                                        font_size: 15.0,
+                                        ..default()
+                                    },
+                                    TextColor(Color::srgb(0.85, 0.88, 0.95)),
+                                )],
+                            ));
+                        }
+                    });
+                });
             parent.spawn(value_row(
                 "Color mode",
                 COLOR_MODES[0],
@@ -654,6 +733,59 @@ fn update_fractal_text(
     }
     for mut text in &mut texts {
         *text = Text::new(FRACTAL_MODES[fractal.0 as usize]);
+    }
+}
+
+/// Clicking the Flow row opens/closes the dropdown. Options are children of
+/// the dropdown overlay and capture their own clicks (focus blocks the row),
+/// so a selection click never re-toggles here.
+fn click_flow_row(
+    rows: Query<&Interaction, (Changed<Interaction>, With<FlowRow>)>,
+    mut dropdowns: Query<&mut Visibility, With<FlowDropdown>>,
+) {
+    for interaction in &rows {
+        if *interaction == Interaction::Pressed {
+            for mut vis in &mut dropdowns {
+                *vis = if *vis == Visibility::Hidden {
+                    Visibility::Inherited
+                } else {
+                    Visibility::Hidden
+                };
+            }
+        }
+    }
+}
+
+/// Option hover highlight + click-to-select, closing the dropdown.
+fn click_flow_option(
+    mut mode: ResMut<FlowMode>,
+    mut options: Query<
+        (&Interaction, &FlowOption, &mut BackgroundColor),
+        Changed<Interaction>,
+    >,
+    mut dropdowns: Query<&mut Visibility, With<FlowDropdown>>,
+) {
+    for (interaction, option, mut bg) in &mut options {
+        match interaction {
+            Interaction::Pressed => {
+                mode.0 = option.0;
+                for mut vis in &mut dropdowns {
+                    *vis = Visibility::Hidden;
+                }
+            }
+            Interaction::Hovered => bg.0 = TRACK_HOVER,
+            Interaction::None => bg.0 = Color::NONE,
+        }
+    }
+}
+
+/// Keep the flow name in sync however the mode changes (dropdown or G key).
+fn update_flow_text(mode: Res<FlowMode>, mut texts: Query<&mut Text, With<FlowValue>>) {
+    if !mode.is_changed() {
+        return;
+    }
+    for mut text in &mut texts {
+        *text = Text::new(FLOW_MODES[mode.0 as usize]);
     }
 }
 

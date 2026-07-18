@@ -45,6 +45,14 @@ pub struct FractalType(pub u32);
 pub const FRACTAL_MODES: [&str; 5] =
     ["mandelbrot", "burning ship", "tricorn", "multibrot-3", "julia"];
 
+/// Particle flow style, cycled with G (or picked from the menu dropdown).
+/// Ids must match the flow_mode switch in the compute shader.
+#[derive(Resource, Default)]
+pub struct FlowMode(pub u32);
+
+pub const FLOW_MODES: [&str; 6] =
+    ["contour", "layers", "gravity", "erupt", "pulse", "dynamics"];
+
 /// Home view (center, height) per fractal, used on R reset and when switching.
 fn fractal_default_view(ftype: u32) -> (DVec2, f64) {
     match ftype {
@@ -126,6 +134,7 @@ fn main() {
     println!("  Z          auto-zoom dive at cursor");
     println!("  C          cycle color mode");
     println!("  F          cycle fractal type");
+    println!("  G          cycle flow mode");
     println!("  V          audio reactivity (system output drives the fractal)");
     println!("  P          screenshot (PNG in working dir)");
     println!("  Shift+1..9 save view, 1..9 fly back to it");
@@ -154,6 +163,7 @@ fn main() {
         .insert_resource(Dissolve(false))
         .insert_resource(ColorMode::default())
         .insert_resource(FractalType::default())
+        .insert_resource(FlowMode::default())
         .insert_resource(AutoZoom::default())
         .insert_resource(Bookmarks::default())
         .insert_resource(FlyTo::default())
@@ -233,6 +243,7 @@ fn handle_input(
     mut dissolve: ResMut<Dissolve>,
     mut color_mode: ResMut<ColorMode>,
     mut fractal: ResMut<FractalType>,
+    mut flow_mode: ResMut<FlowMode>,
     mut auto_zoom: ResMut<AutoZoom>,
     mut bookmarks: ResMut<Bookmarks>,
     mut fly: ResMut<FlyTo>,
@@ -283,6 +294,10 @@ fn handle_input(
     if keys.just_pressed(KeyCode::KeyF) {
         fractal.0 = (fractal.0 + 1) % FRACTAL_MODES.len() as u32;
         info!("fractal: {}", FRACTAL_MODES[fractal.0 as usize]);
+    }
+    if keys.just_pressed(KeyCode::KeyG) {
+        flow_mode.0 = (flow_mode.0 + 1) % FLOW_MODES.len() as u32;
+        info!("flow mode: {}", FLOW_MODES[flow_mode.0 as usize]);
     }
     if keys.just_pressed(KeyCode::KeyV) {
         audio.enabled = !audio.enabled;
@@ -405,6 +420,7 @@ fn update_params(
     dissolve: Res<Dissolve>,
     color_mode: Res<ColorMode>,
     fractal: Res<FractalType>,
+    flow_mode: Res<FlowMode>,
     mouse: Res<ButtonInput<MouseButton>>,
     over_menu: Res<PointerOverMenu>,
     settings: Res<Settings>,
@@ -550,6 +566,7 @@ fn update_params(
     u.detail = settings.detail;
     u.color_mode = color_mode.0;
     u.fractal_type = fractal.0;
+    u.flow_mode = flow_mode.0;
 
     // Audio reactivity (V): mids push the streams faster, bass swells the
     // dots, the overall level and beat lift brightness. Levels decay to zero

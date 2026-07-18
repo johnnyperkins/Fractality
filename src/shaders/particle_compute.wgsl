@@ -29,6 +29,9 @@ struct Params {
     dissolve: f32,
     color_mode: u32,
     fractal_type: u32,
+    // Flow style: 0 contour, 1 layers, 2 gravity, 3 erupt, 4 pulse,
+    // 5 dynamics.
+    flow_mode: u32,
     // Unused in this shader; present for layout parity with ParamsUniform.
     trail_decay: f32,
     // Audio levels: x bass, y mid, z treble, w beat pulse. All zero while
@@ -408,12 +411,23 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
     var to_band = 0.0;
     var on_contour = false;
     var calm = 1.0;
+    // Gravity/erupt are radial: particles drift freely along the normal, so
+    // the band pull (and its normal-velocity bleed) must not fight them.
+    let radial_mode = params.flow_mode == 2u || params.flow_mode == 3u;
     // Upper bound rejects the rare overflowed derivative (inf gl) so gn stays
     // finite; NaN gl fails the compare and also falls through to the home pull.
     if (gl > 1e-4 && gl < 1e30 && f0 < f32(params.max_iter) - 0.5) {
         gn = grad / gl;
         let tangent = vec2<f32>(-gn.y, gn.x);
-        let band_err = p.band - f0;
+        // Pulse mode: the home band itself breathes, a slow wave phased by
+        // band depth so contours expand/contract in traveling ripples. The
+        // shifted band feeds both the tangential error and the positional
+        // pull below, so the whole cloud follows the wave coherently.
+        var band = p.band;
+        if (params.flow_mode == 4u) {
+            band += sin(params.time * 1.1 + p.band * 1.7) * 1.5;
+        }
+        let band_err = band - f0;
         let err = clamp(band_err * 0.7, -2.0, 2.0);
         // Settle factor: a large band error means the local field varies
         // violently (deep boundary filaments), where the tangent direction is
@@ -430,11 +444,59 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
         // The normal velocity correction also rides the noisy gradient, so on
         // the shell it mostly injects thrash; the capped positional pull below
         // holds those particles instead. Keep it strong only for outer flow.
-        desired = (tangent * settle * calm + gn * err * mix(0.25, 1.0, calm))
-            * params.flow_speed * view_height;
+        let base = params.flow_speed * view_height;
+        let correct = gn * err * mix(0.25, 1.0, calm) * base;
+        switch params.flow_mode {
+            case 1u: {
+                // Layers: adjacent iso-bands stream in opposite directions,
+                // so neighboring contour ribbons shear past each other.
+                let s = select(1.0, -1.0, fract(band * 0.25) < 0.5);
+                desired = tangent * s * settle * calm * base + correct;
+            }
+            case 2u: {
+                // Gravity: everything rains inward along the gradient and
+                // piles up on the shell (calm freezes it there). The band
+                // pull is disabled below so nothing fights the fall.
+                desired = gn * settle * calm * base * 2.0;
+            }
+            case 3u: {
+                // Erupt: particles boil off the set outward; recycling
+                // reseeds the boundary so the fountain never runs dry.
+                desired = -gn * mix(0.3, 1.0, settle) * base * 2.0;
+            }
+            case 5u: {
+                // Dynamics: flow along the fractal's own one-step map,
+                // v = f(z) - z. For c-plane fractals Z_1 = C (orbit starts
+                // at 0), so the full coordinate is ref_orbit[1] + dc; for
+                // Julia z = ref_orbit[0] + dc and c falls out of Z_1 =
+                // Z_0^2 + c. Normalized: only the direction field matters.
+                var zc: vec2<f32>;
+                var cc: vec2<f32>;
+                if (params.fractal_type == 4u) {
+                    zc = ref_orbit[0] + p.pos;
+                    cc = ref_orbit[1] - cmul(ref_orbit[0], ref_orbit[0]);
+                } else {
+                    zc = ref_orbit[1] + p.pos;
+                    cc = zc;
+                }
+                let v = cmul(zc, zc) + cc - zc;
+                let vl = length(v);
+                if (vl > 1e-12) {
+                    desired = v / vl * settle * calm * base + correct;
+                } else {
+                    desired = correct;
+                }
+            }
+            default: {
+                // Contour (classic): advect along iso-lines.
+                desired = tangent * settle * calm * base + correct;
+            }
+        }
         // Spatial distance from the particle to its home contour along the
         // normal: (band - f0) is the field-unit error, /gl converts to distance.
-        to_band = clamp((p.band - f0) / gl, -view_height, view_height);
+        if (!radial_mode) {
+            to_band = clamp((band - f0) / gl, -view_height, view_height);
+        }
         on_contour = true;
     } else {
         desired = (p.home - p.pos) * 0.6;
@@ -496,7 +558,7 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
         // normal gives the slow melt off the contours.
         let jitter = (rand01(&seed) * 2.0 - 1.0) * view_height * 0.008;
         p.pos += gn * jitter;
-    } else if (on_contour && dt > 0.0) {
+    } else if (on_contour && dt > 0.0 && !radial_mode) {
         let alpha = clamp(params.band_k * dt, 0.0, 1.0);
         // Cap the per-frame pull step to a small fraction of the view. The
         // field varies violently near the boundary, so even the exact
