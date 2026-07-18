@@ -37,7 +37,8 @@ struct Params {
     // Audio levels: x bass, y mid, z treble, w beat pulse. All zero while
     // audio reactivity is off, so every use is a natural no-op.
     audio: vec4<f32>,
-    // Music-driven palette hue offset (unused here; layout parity).
+    // Music-driven hue/phase accumulator; the dynamics flow mode spins its
+    // direction field by it.
     audio_hue: f32,
     // x seconds since last beat, y seconds since last drop (saturate high),
     // z unused, w overall level.
@@ -189,6 +190,11 @@ fn field(dc: vec2<f32>) -> f32 {
 struct FieldGrad {
     f: f32,
     grad: vec2<f32>,
+    // Full z at escape (zero for interior points). Its argument is the
+    // escape angle: repeated squaring doubles it each iteration, so it
+    // decorrelates at filament scale no matter how deep the zoom - the
+    // dynamics flow mode steers by it.
+    zesc: vec2<f32>,
 };
 
 // ln(2)^2, chain-rule constant for the smooth-field gradient.
@@ -221,7 +227,7 @@ fn field_grad(dc: vec2<f32>) -> FieldGrad {
         if (m > 256.0) {
             let u = 0.5 * log2(m);
             let g = -cmul(z, conj(der)) / (m * u * LN2_SQ) * ilp;
-            return FieldGrad(f32(n) + 1.0 - log2(u) * ilp, g);
+            return FieldGrad(f32(n) + 1.0 - log2(u) * ilp, g, z);
         }
         if (m < dot(dz, dz) || ri >= last) {
             dz = z - ref0;
@@ -231,7 +237,7 @@ fn field_grad(dc: vec2<f32>) -> FieldGrad {
             z_ref = z_ref_next;
         }
     }
-    return FieldGrad(f32(params.max_iter), vec2<f32>(0.0, 0.0));
+    return FieldGrad(f32(params.max_iter), vec2<f32>(0.0, 0.0), vec2<f32>(0.0, 0.0));
 }
 
 // Ring waves die past these ages; one definition keeps beat_impulse and the
@@ -411,9 +417,12 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
     var to_band = 0.0;
     var on_contour = false;
     var calm = 1.0;
-    // Gravity/erupt are radial: particles drift freely along the normal, so
-    // the band pull (and its normal-velocity bleed) must not fight them.
-    let radial_mode = params.flow_mode == 2u || params.flow_mode == 3u;
+    // Gravity/erupt/dynamics are free-flowing: particles cross contours by
+    // design, so the band pull (and its normal-velocity bleed, which would
+    // project all motion onto the tangent) must not fight them. The recycle
+    // trickle respawns drifters back onto the boundary.
+    let free_flow = params.flow_mode == 2u || params.flow_mode == 3u
+        || params.flow_mode == 5u;
     // Upper bound rejects the rare overflowed derivative (inf gl) so gn stays
     // finite; NaN gl fails the compare and also falls through to the home pull.
     if (gl > 1e-4 && gl < 1e30 && f0 < f32(params.max_iter) - 0.5) {
@@ -465,24 +474,36 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
                 desired = -gn * mix(0.3, 1.0, settle) * base * 2.0;
             }
             case 5u: {
-                // Dynamics: flow along the fractal's own one-step map,
-                // v = f(z) - z. For c-plane fractals Z_1 = C (orbit starts
-                // at 0), so the full coordinate is ref_orbit[1] + dc; for
-                // Julia z = ref_orbit[0] + dc and c falls out of Z_1 =
-                // Z_0^2 + c. Normalized: only the direction field matters.
-                var zc: vec2<f32>;
-                var cc: vec2<f32>;
-                if (params.fractal_type == 4u) {
-                    zc = ref_orbit[0] + p.pos;
-                    cc = ref_orbit[1] - cmul(ref_orbit[0], ref_orbit[0]);
-                } else {
-                    zc = ref_orbit[1] + p.pos;
-                    cc = zc;
-                }
-                let v = cmul(zc, zc) + cc - zc;
-                let vl = length(v);
-                if (vl > 1e-12) {
-                    desired = v / vl * settle * calm * base + correct;
+                // Dynamics: steer by the particle's own orbit escape angle.
+                // Iterated squaring doubles the angle every step, so
+                // arg(z_escape) decorrelates at the finest visible filament
+                // scale at ANY zoom depth (the binary-decomposition cells of
+                // the fractal), unlike a fixed map field which flattens to a
+                // constant direction once the view is tiny next to C. The
+                // slow time drift keeps the whole pattern churning. Free
+                // flow (no band pull): particles ride the direction cells
+                // across contours like wind, and the recycle trickle keeps
+                // repainting the boundary behind them. Calm only softens
+                // (not freezes) on the shell so the streams stay alive.
+                let ze = fg.zesc;
+                let m = dot(ze, ze);
+                if (m > 1e-12) {
+                    let a0 = atan2(ze.y, ze.x);
+                    // log2(m) sweeps ~2.4 rad smoothly WITHIN each cell
+                    // (escape overshoot encodes the fractional iteration),
+                    // bending the flat cells into curved eddies. The sine
+                    // term waves each stream serpentine over time, phased
+                    // by a0 so cells desync instead of wagging in unison.
+                    // audio_hue spins the whole field with music energy
+                    // (zero when audio reactivity is off).
+                    let a = a0 + 0.3 * log2(max(m, 1.0))
+                        + 0.6 * sin(a0 * 3.0 + params.time * 0.7)
+                        + params.time * 0.25 + params.audio_hue;
+                    // Speed lanes: gentle per-cell magnitude variation so
+                    // the wind has gusts instead of one uniform pace.
+                    let gust = 0.75 + 0.25 * sin(a0 * 2.0 - params.time * 0.5);
+                    desired = vec2<f32>(cos(a), sin(a))
+                        * settle * mix(0.3, 1.0, calm) * base * 1.5 * gust;
                 } else {
                     desired = correct;
                 }
@@ -494,7 +515,7 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
         // Spatial distance from the particle to its home contour along the
         // normal: (band - f0) is the field-unit error, /gl converts to distance.
-        if (!radial_mode) {
+        if (!free_flow) {
             to_band = clamp((band - f0) / gl, -view_height, view_height);
         }
         on_contour = true;
@@ -558,7 +579,7 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
         // normal gives the slow melt off the contours.
         let jitter = (rand01(&seed) * 2.0 - 1.0) * view_height * 0.008;
         p.pos += gn * jitter;
-    } else if (on_contour && dt > 0.0 && !radial_mode) {
+    } else if (on_contour && dt > 0.0 && !free_flow) {
         let alpha = clamp(params.band_k * dt, 0.0, 1.0);
         // Cap the per-frame pull step to a small fraction of the view. The
         // field varies violently near the boundary, so even the exact
