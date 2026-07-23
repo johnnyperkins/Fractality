@@ -349,9 +349,12 @@ impl FromWorld for ParticlePipelines {
         );
         let composite_layout = device.create_bind_group_layout(
             "trail_composite_layout",
-            &BindGroupLayoutEntries::single(
+            &BindGroupLayoutEntries::sequential(
                 ShaderStages::FRAGMENT,
-                texture_2d(TextureSampleType::Float { filterable: false }),
+                (
+                    texture_2d(TextureSampleType::Float { filterable: false }),
+                    uniform_buffer::<ParamsUniform>(false),
+                ),
             ),
         );
         let compute_shader: Handle<Shader> =
@@ -585,6 +588,7 @@ fn prepare_trail_texture(
     device: Res<RenderDevice>,
     pipelines: Res<ParticlePipelines>,
     params: Option<Res<SimParams>>,
+    uniform: Res<ParticleUniform>,
     views: Query<&ViewTarget>,
     existing: Option<ResMut<TrailTexture>>,
     mut was_active: Local<bool>,
@@ -622,11 +626,16 @@ fn prepare_trail_texture(
             usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
+        // The uniform buffer is allocated on its first write; until then the
+        // bind group can't exist, so retry next frame.
+        let Some(binding) = uniform.0.binding() else {
+            return;
+        };
         let view = texture.create_view(&TextureViewDescriptor::default());
         let bind_group = device.create_bind_group(
             "trail_composite_bind_group",
             &pipelines.composite_layout,
-            &BindGroupEntries::single(&view),
+            &BindGroupEntries::sequential((&view, binding)),
         );
         commands.insert_resource(TrailTexture {
             view,
