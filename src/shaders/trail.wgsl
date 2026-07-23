@@ -78,14 +78,16 @@ fn fs_composite(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 
     let base = textureLoad(trail_tex, vec2<i32>(sp), 0);
     let beat = params.audio.w * params.audio_fx.y;
-    if (beat < 0.01) {
+    // High cutoff: with the pulse decaying exp(-6t), fringes last ~0.3 s per
+    // beat instead of smearing continuously through a whole track.
+    if (beat < 0.15) {
         return base;
     }
     // Radial split: zero at screen center, growing toward the edges, so the
     // bloom reads as the whole frame flaring outward. R samples outward,
     // B inward, G anchors.
     let dir = (pos.xy - dims * 0.5) / max(dims.y, 1.0);
-    let off = dir * beat * beat * 14.0;
+    let off = dir * beat * beat * 5.0;
     let r = textureLoad(trail_tex, clamp(vec2<i32>(sp + off), vec2<i32>(0), hi), 0).r;
     let b = textureLoad(trail_tex, clamp(vec2<i32>(sp - off), vec2<i32>(0), hi), 0).b;
     return vec4<f32>(r, base.g, b, base.a);
