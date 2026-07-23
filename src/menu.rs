@@ -607,12 +607,12 @@ fn build_menu(mut commands: Commands) {
             parent
                 .spawn((
                     Node {
+                        display: Display::None,
                         flex_direction: FlexDirection::Column,
                         row_gap: Val::Px(8.0),
                         margin: UiRect::top(Val::Px(4.0)),
                         ..default()
                     },
-                    Visibility::Hidden,
                     KaleidoSection,
                 ))
                 .with_children(|col| {
@@ -632,12 +632,12 @@ fn build_menu(mut commands: Commands) {
             parent
                 .spawn((
                     Node {
+                        display: Display::None,
                         flex_direction: FlexDirection::Column,
                         row_gap: Val::Px(8.0),
                         margin: UiRect::top(Val::Px(4.0)),
                         ..default()
                     },
-                    Visibility::Hidden,
                     AudioSection,
                 ))
                 .with_children(|col| {
@@ -866,12 +866,12 @@ fn click_kaleido(
 
 /// Keep the on/off label and the KALEIDOSCOPE section in sync however the
 /// toggle happens (click or K). The per-frame rotation accumulator bypasses
-/// change detection, so only real toggles land here. Visibility::Inherited
-/// keeps the section tied to the panel's own visibility.
+/// change detection, so only real toggles land here. Display::None collapses
+/// the section entirely (no reserved space), accordion-style.
 fn sync_kaleido_ui(
     kaleido: Res<Kaleido>,
     mut texts: Query<&mut Text, With<KaleidoValue>>,
-    mut sections: Query<&mut Visibility, With<KaleidoSection>>,
+    mut sections: Query<&mut Node, With<KaleidoSection>>,
 ) {
     if !kaleido.is_changed() {
         return;
@@ -879,12 +879,8 @@ fn sync_kaleido_ui(
     for mut text in &mut texts {
         *text = Text::new(if kaleido.on { "on" } else { "off" });
     }
-    for mut vis in &mut sections {
-        *vis = if kaleido.on {
-            Visibility::Inherited
-        } else {
-            Visibility::Hidden
-        };
+    for mut node in &mut sections {
+        node.display = if kaleido.on { Display::Flex } else { Display::None };
     }
 }
 
@@ -902,12 +898,12 @@ fn click_audio(
 
 /// Keep the on/off label and the AUDIO FX section in sync however the toggle
 /// happens (click or V). AudioCapture changes only on real transitions, so
-/// is_changed suffices. Visibility::Inherited keeps the section tied to the
-/// panel's own visibility.
+/// is_changed suffices. Display::None collapses the section entirely (no
+/// reserved space), accordion-style.
 fn sync_audio_ui(
     audio: Res<AudioCapture>,
     mut texts: Query<&mut Text, With<AudioValue>>,
-    mut sections: Query<&mut Visibility, With<AudioSection>>,
+    mut sections: Query<&mut Node, With<AudioSection>>,
 ) {
     if !audio.is_changed() {
         return;
@@ -915,12 +911,8 @@ fn sync_audio_ui(
     for mut text in &mut texts {
         *text = Text::new(if audio.enabled { "on" } else { "off" });
     }
-    for mut vis in &mut sections {
-        *vis = if audio.enabled {
-            Visibility::Inherited
-        } else {
-            Visibility::Hidden
-        };
+    for mut node in &mut sections {
+        node.display = if audio.enabled { Display::Flex } else { Display::None };
     }
 }
 
