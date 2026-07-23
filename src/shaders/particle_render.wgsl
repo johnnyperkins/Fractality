@@ -158,6 +158,39 @@ fn vs(
             );
             color = ramp * (0.4 + speed * 3.0);
         }
+        case 4u: {
+            // Audio aurora: the music owns the palette. Two anchor tones sit
+            // half a wheel apart and swing hard with the band energies (bass
+            // drags tone A through half the wheel, treble tone B through the
+            // other half); a particle blends between them by speed, so shell
+            // and streams pull toward opposite tones without ever collapsing
+            // to one hue. On top of that, each particle's iteration depth
+            // maps to one of the 16 spectrum bins and that bin's energy
+            // detunes its hue and lights it up - the nested depth rings
+            // become an equalizer wearing different colors per frequency.
+            // Mid energy sends hue waves traveling inward across the depth
+            // rings, and a beat kicks every hue a step around the wheel, so
+            // the whole swarm visibly reacts to hits, not just brightens.
+            let d = clamp(p.band / f32(params.max_iter), 0.0, 1.0);
+            let bi = u32(clamp((1.0 - d) * 15.99, 0.0, 15.0));
+            let s = params.spectrum[bi / 4u][bi % 4u];
+            let hue_a = params.audio.x * 0.5 + params.audio_hue;
+            let hue_b = 0.5 + params.audio.z * 0.5 + params.audio_hue;
+            let t = smoothstep(0.02, 0.3, speed);
+            var hue = mix(hue_a, hue_b, t)
+                + s * 0.15
+                + params.audio.y * 0.15 * sin(p.band * 0.35 - params.time * 3.0)
+                + params.audio.w * 0.1;
+            // Silence stays dim near-mono silver; sound saturates and the
+            // particle's own spectrum bin drives most of its glow, so quiet
+            // passages go dark ember and busy ones blaze ring by ring.
+            let level = params.audio2.w;
+            let sat = clamp(level * 2.0, 0.0, 1.0);
+            let tone = mix(vec3<f32>(0.4, 0.45, 0.6), sinebow(fract(hue)), sat);
+            color = tone
+                * (0.2 + speed * 3.5 + s * s * (0.5 + level * 2.5)
+                    + params.audio.w * 1.5);
+        }
         default: {
             // Classic: band hue shifted by speed plus a slow global drift.
             // Flat floor at 0.25 keeps the slow particles on the boundary (the

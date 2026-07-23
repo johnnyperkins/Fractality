@@ -67,8 +67,8 @@ pub struct ParamsUniform {
     /// 1.0 = dissolve mode (Space): flow field inert, particles melt off their
     /// contours via diffusion; mouse impulses still apply. 0.0 = normal flow.
     pub dissolve: f32,
-    /// Palette selector for the render shader (C cycles): 0 classic, 1 bands,
-    /// 2 velocity, 3 heat.
+    /// Palette selector for the render shader (C cycles): 0 classic, 1 rings,
+    /// 2 electric, 3 inferno, 4 audio aurora.
     pub color_mode: u32,
     /// Fractal formula (F cycles): 0 Mandelbrot, 1 Burning Ship, 2 Tricorn,
     /// 3 Multibrot-3, 4 Julia. Must match the switch in the compute shader.

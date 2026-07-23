@@ -34,7 +34,7 @@ struct Dissolve(bool);
 #[derive(Resource, Default)]
 pub struct ColorMode(pub u32);
 
-pub const COLOR_MODES: [&str; 4] = ["classic", "rings", "electric", "inferno"];
+pub const COLOR_MODES: [&str; 5] = ["classic", "rings", "electric", "inferno", "audio aurora"];
 
 /// Fractal formula selector, cycled with F (or by clicking the menu row).
 /// Ids must match the switch in the compute shader and fractal_step() on the
