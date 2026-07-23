@@ -64,6 +64,34 @@ fn fractal_default_view(ftype: u32) -> (DVec2, f64) {
     }
 }
 
+/// Kaleidoscope state. Fold count cycled with K (or by clicking the menu
+/// row): 0 (off) -> 6 -> 8. Pure display effect in the trail composite
+/// shader; the simulation never sees it. `rot` is the music-driven rotation
+/// angle, accumulated per frame.
+#[derive(Resource, Default)]
+pub struct Kaleido {
+    pub n: u32,
+    pub rot: f32,
+}
+
+impl Kaleido {
+    pub fn cycle(&mut self) {
+        self.n = match self.n {
+            0 => 6,
+            6 => 8,
+            _ => 0,
+        };
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self.n {
+            0 => "off",
+            6 => "6-fold",
+            _ => "8-fold",
+        }
+    }
+}
+
 /// Continuous zoom dive toward the cursor, toggled with Z. Any manual
 /// navigation (wheel, pan, R) cancels it.
 #[derive(Resource, Default)]
@@ -135,6 +163,7 @@ fn main() {
     println!("  C          cycle color mode");
     println!("  F          cycle fractal type");
     println!("  G          cycle flow mode");
+    println!("  K          kaleidoscope (off / 6-fold / 8-fold)");
     println!("  V          audio reactivity (system output drives the fractal)");
     println!("  P          screenshot (PNG in working dir)");
     println!("  Shift+1..9 save view, 1..9 fly back to it");
@@ -164,6 +193,7 @@ fn main() {
         .insert_resource(ColorMode::default())
         .insert_resource(FractalType::default())
         .insert_resource(FlowMode::default())
+        .insert_resource(Kaleido::default())
         .insert_resource(AutoZoom::default())
         .insert_resource(Bookmarks::default())
         .insert_resource(FlyTo::default())
@@ -244,6 +274,7 @@ fn handle_input(
     mut color_mode: ResMut<ColorMode>,
     mut fractal: ResMut<FractalType>,
     mut flow_mode: ResMut<FlowMode>,
+    mut kaleido: ResMut<Kaleido>,
     mut auto_zoom: ResMut<AutoZoom>,
     mut bookmarks: ResMut<Bookmarks>,
     mut fly: ResMut<FlyTo>,
@@ -298,6 +329,10 @@ fn handle_input(
     if keys.just_pressed(KeyCode::KeyG) {
         flow_mode.0 = (flow_mode.0 + 1) % FLOW_MODES.len() as u32;
         info!("flow mode: {}", FLOW_MODES[flow_mode.0 as usize]);
+    }
+    if keys.just_pressed(KeyCode::KeyK) {
+        kaleido.cycle();
+        info!("kaleidoscope: {}", kaleido.label());
     }
     if keys.just_pressed(KeyCode::KeyV) {
         audio.enabled = !audio.enabled;
@@ -421,6 +456,7 @@ fn update_params(
     color_mode: Res<ColorMode>,
     fractal: Res<FractalType>,
     flow_mode: Res<FlowMode>,
+    mut kaleido: ResMut<Kaleido>,
     mouse: Res<ButtonInput<MouseButton>>,
     over_menu: Res<PointerOverMenu>,
     settings: Res<Settings>,
@@ -578,12 +614,22 @@ fn update_params(
     u.particle_size *= 1.0 + audio.bass * 0.7;
     u.audio = Vec4::new(audio.bass, audio.mid, audio.treble, audio.beat);
     u.audio_hue = audio.hue_phase;
-    u.audio2 = Vec4::new(audio.beat_age, audio.drop_age, 0.0, audio.level);
+    // Kaleidoscope rotation: slow constant drift so the mandala is never
+    // static, plus music level and beats spinning it up. Accumulated here
+    // (not derived from time) so the speed reacts, not the absolute angle.
+    // Bypass change detection: the per-frame accumulation must not mark the
+    // resource changed, or the menu's label sync (gated on is_changed) would
+    // rewrite its text every frame. Only n changes (K / menu click) flag.
+    if kaleido.n > 0 {
+        kaleido.bypass_change_detection().rot +=
+            time.delta_secs() * (0.05 + audio.level * 0.8 + audio.beat * 1.2);
+    }
+    u.audio2 = Vec4::new(audio.beat_age, audio.drop_age, kaleido.rot, audio.level);
     u.audio_fx = Vec4::new(
         settings.audio_pulse,
         settings.audio_flash,
         settings.audio_glow,
-        0.0,
+        kaleido.n as f32,
     );
     for i in 0..4 {
         u.spectrum[i] = Vec4::from_slice(&audio.spectrum[i * 4..i * 4 + 4]);

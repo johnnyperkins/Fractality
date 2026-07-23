@@ -88,13 +88,25 @@ pub struct ParamsUniform {
     /// Palette hue offset accumulated from music energy.
     pub audio_hue: f32,
     /// x seconds since last beat, y seconds since last drop (both saturate
-    /// high, so waves die out), z unused, w overall level.
+    /// high, so waves die out), z kaleidoscope rotation angle (radians,
+    /// music-driven), w overall level.
     pub audio2: Vec4,
     /// Effect gains from the audio settings sliders: x ring pulse, y flash /
-    /// glitter, z spectrum glow, w unused.
+    /// glitter, z spectrum glow, w kaleidoscope segment count (0 = off).
     pub audio_fx: Vec4,
     /// 16 log-spaced spectrum bins (bin 0 = lowest), packed 4 per vec4.
     pub spectrum: [Vec4; 4],
+}
+
+impl ParamsUniform {
+    /// Whether this frame renders through the offscreen trail texture plus
+    /// composite pass (vs particles drawn straight to the view target):
+    /// trails on, or kaleidoscope on (the fold happens in the composite
+    /// shader; with decay 0 the fade pass wipes the texture each frame so no
+    /// trails appear). Must match the `n >= 2.0` enable check in trail.wgsl.
+    pub fn needs_composite(&self) -> bool {
+        self.trail_decay > 0.0 || self.audio_fx.w >= 2.0
+    }
 }
 
 /// Max reference-orbit length (also caps max_iter). One vec2<f32> per entry.
@@ -593,7 +605,7 @@ fn prepare_trail_texture(
     existing: Option<ResMut<TrailTexture>>,
     mut was_active: Local<bool>,
 ) {
-    let active = params.map_or(false, |p| p.0.trail_decay > 0.0);
+    let active = params.map_or(false, |p| p.0.needs_composite());
     // Trails never used this session: nothing to size-track or invalidate.
     if !active && existing.is_none() {
         *was_active = false;
@@ -721,12 +733,13 @@ impl ViewNode for ParticleDrawNode {
         let params = world.get_resource::<SimParams>();
         let count = params.map_or(0, |p| p.0.count).min(buffers.count);
         let decay = params.map_or(0.0, |p| p.0.trail_decay);
+        let composite = params.map_or(false, |p| p.0.needs_composite());
 
-        // Trail path needs the texture and both extra pipelines ready;
-        // otherwise (including trails off) draw straight to the view target.
+        // Composite path needs the texture and both extra pipelines ready;
+        // otherwise draw straight to the view target.
         let trail = world
             .get_resource::<TrailTexture>()
-            .filter(|_| decay > 0.0)
+            .filter(|_| composite)
             .and_then(|t| {
                 let fade = cache.get_render_pipeline(pipelines.fade_pipeline)?;
                 let composite = cache.get_render_pipeline(pipelines.composite_pipeline)?;
@@ -737,6 +750,9 @@ impl ViewNode for ParticleDrawNode {
             // One particle pass either way; only the target differs. With
             // trails on, fade the previous frame first, then add this frame's
             // particles on top of the persistent trail texture.
+            // Kaleidoscope-only frames (decay 0) keep no history: clear via
+            // the load op instead of running the fade pass, which at blend
+            // constant 0 would just be a fullscreen multiply-by-zero.
             let (label, attachment) = match &trail {
                 Some((t, _, _)) => (
                     "trail_accumulate_pass",
@@ -744,7 +760,7 @@ impl ViewNode for ParticleDrawNode {
                         view: &t.view,
                         resolve_target: None,
                         ops: Operations {
-                            load: if t.needs_clear {
+                            load: if t.needs_clear || decay <= 0.0 {
                                 LoadOp::Clear(LinearRgba::BLACK.into())
                             } else {
                                 LoadOp::Load
@@ -763,7 +779,7 @@ impl ViewNode for ParticleDrawNode {
                 occlusion_query_set: None,
             });
             if let Some((t, fade, _)) = &trail {
-                if !t.needs_clear {
+                if !t.needs_clear && decay > 0.0 {
                     pass.set_render_pipeline(fade);
                     pass.set_blend_constant(LinearRgba::rgb(decay, decay, decay));
                     pass.draw(0..3, 0..1);

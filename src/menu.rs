@@ -8,7 +8,7 @@ use bevy::ui::RelativeCursorPosition;
 
 use crate::audio::{AudioCapture, AudioLevels};
 use crate::particles::MAX_PARTICLES;
-use crate::{ColorMode, FlowMode, FractalType, COLOR_MODES, FLOW_MODES, FRACTAL_MODES};
+use crate::{ColorMode, FlowMode, FractalType, Kaleido, COLOR_MODES, FLOW_MODES, FRACTAL_MODES};
 
 /// Live-tunable knobs. Source of truth for the whole app.
 #[derive(Resource)]
@@ -266,6 +266,14 @@ struct FlowDropdown;
 #[derive(Component)]
 struct FlowOption(u32);
 
+/// Clickable "Kaleidoscope" row; clicking cycles the fold count (same as K).
+#[derive(Component)]
+struct KaleidoRow;
+
+/// The text showing the active kaleidoscope mode.
+#[derive(Component)]
+struct KaleidoValue;
+
 /// Clickable "Audio react" row; clicking toggles audio reactivity (same as V).
 #[derive(Component)]
 struct AudioRow;
@@ -308,6 +316,8 @@ impl Plugin for MenuPlugin {
                     click_flow_row,
                     click_flow_option,
                     update_flow_text,
+                    click_kaleido,
+                    update_kaleido_text,
                     click_audio,
                     sync_audio_ui,
                     apply_bloom,
@@ -467,7 +477,7 @@ const CONTROLS: [&str; 11] = [
     "Space  dissolve",
     "Z  auto-zoom dive   C  color mode",
     "F  fractal type   G  flow mode",
-    "V  audio reactivity",
+    "K  kaleidoscope   V  audio reactivity",
     "P  screenshot",
     "Shift+1..9  save view   1..9  fly to it",
     "R  reset view",
@@ -565,6 +575,7 @@ fn build_menu(mut commands: Commands) {
                 ColorModeRow,
                 ColorModeValue,
             ));
+            parent.spawn(value_row("Kaleidoscope", "off", KaleidoRow, KaleidoValue));
             parent.spawn(value_row("Audio react", "off", AudioRow, AudioValue));
             parent
                 .spawn((
@@ -786,6 +797,33 @@ fn update_flow_text(mode: Res<FlowMode>, mut texts: Query<&mut Text, With<FlowVa
     }
     for mut text in &mut texts {
         *text = Text::new(FLOW_MODES[mode.0 as usize]);
+    }
+}
+
+/// Clicking the row cycles the kaleidoscope fold count, same as the K key.
+fn click_kaleido(
+    mut kaleido: ResMut<Kaleido>,
+    rows: Query<&Interaction, (Changed<Interaction>, With<KaleidoRow>)>,
+) {
+    for interaction in &rows {
+        if *interaction == Interaction::Pressed {
+            kaleido.cycle();
+        }
+    }
+}
+
+/// Keep the kaleidoscope label in sync however the mode changes (click or K).
+/// The per-frame rotation accumulator bypasses change detection, so only real
+/// fold-count changes land here.
+fn update_kaleido_text(
+    kaleido: Res<Kaleido>,
+    mut texts: Query<&mut Text, With<KaleidoValue>>,
+) {
+    if !kaleido.is_changed() {
+        return;
+    }
+    for mut text in &mut texts {
+        *text = Text::new(kaleido.label());
     }
 }
 

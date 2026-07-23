@@ -38,8 +38,10 @@ struct Params {
     // x bass, y mid, z treble, w beat pulse.
     audio: vec4<f32>,
     audio_hue: f32,
+    // z kaleidoscope rotation angle (radians, music-driven).
     audio2: vec4<f32>,
     // Effect gains: y flash/glitter also gates the chromatic bloom.
+    // w kaleidoscope segment count (0 = off).
     audio_fx: vec4<f32>,
     spectrum: array<vec4<f32>, 4>,
 };
@@ -54,7 +56,27 @@ fn fs_fade() -> @location(0) vec4<f32> {
 
 @fragment
 fn fs_composite(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
-    let base = textureLoad(trail_tex, vec2<i32>(pos.xy), 0);
+    let dims = vec2<f32>(textureDimensions(trail_tex));
+    let hi = vec2<i32>(dims) - vec2<i32>(1);
+
+    // Kaleidoscope (K): fold the screen N-fold around its center before
+    // sampling. The pixel's angle is rotated (music-driven spin), wrapped
+    // into one wedge of width tau/N, and mirrored about the wedge center,
+    // so one wedge of the source image tiles the screen as a mandala.
+    var sp = pos.xy;
+    let n = params.audio_fx.w;
+    if (n >= 2.0) {
+        let center = dims * 0.5;
+        let d = pos.xy - center;
+        let seg = 6.2831853 / n;
+        var a = atan2(d.y, d.x) - params.audio2.z;
+        a = a - seg * floor(a / seg);
+        a = min(a, seg - a);
+        sp = center + length(d) * vec2<f32>(cos(a), sin(a));
+        sp = clamp(sp, vec2<f32>(0.0), dims - vec2<f32>(1.0));
+    }
+
+    let base = textureLoad(trail_tex, vec2<i32>(sp), 0);
     let beat = params.audio.w * params.audio_fx.y;
     if (beat < 0.01) {
         return base;
@@ -62,11 +84,9 @@ fn fs_composite(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     // Radial split: zero at screen center, growing toward the edges, so the
     // bloom reads as the whole frame flaring outward. R samples outward,
     // B inward, G anchors.
-    let dims = vec2<f32>(textureDimensions(trail_tex));
     let dir = (pos.xy - dims * 0.5) / max(dims.y, 1.0);
     let off = dir * beat * beat * 14.0;
-    let hi = vec2<i32>(dims) - vec2<i32>(1);
-    let r = textureLoad(trail_tex, clamp(vec2<i32>(pos.xy + off), vec2<i32>(0), hi), 0).r;
-    let b = textureLoad(trail_tex, clamp(vec2<i32>(pos.xy - off), vec2<i32>(0), hi), 0).b;
+    let r = textureLoad(trail_tex, clamp(vec2<i32>(sp + off), vec2<i32>(0), hi), 0).r;
+    let b = textureLoad(trail_tex, clamp(vec2<i32>(sp - off), vec2<i32>(0), hi), 0).b;
     return vec4<f32>(r, base.g, b, base.a);
 }
