@@ -48,6 +48,12 @@ pub struct Settings {
     pub audio_morph: f32,
     /// Mid-driven flow speed boost.
     pub audio_flow: f32,
+    /// Kaleidoscope fold count (mirror wedges), live only while the
+    /// kaleidoscope is on. Integer-snapped by the slider.
+    pub kaleido_folds: f32,
+    /// Kaleidoscope spin gain: scales the drift + music-driven rotation.
+    /// 0 = static wedges.
+    pub kaleido_spin: f32,
 }
 
 impl Default for Settings {
@@ -67,6 +73,8 @@ impl Default for Settings {
             audio_breathe: 1.0,
             audio_morph: 1.0,
             audio_flow: 1.0,
+            kaleido_folds: 6.0,
+            kaleido_spin: 1.0,
         }
     }
 }
@@ -87,6 +95,8 @@ pub enum Setting {
     AudioBreathe,
     AudioMorph,
     AudioFlow,
+    KaleidoFolds,
+    KaleidoSpin,
 }
 
 /// Rows, in display order.
@@ -111,6 +121,9 @@ const AUDIO_SETTINGS: [Setting; 6] = [
     Setting::AudioFlow,
 ];
 
+/// Kaleidoscope rows, shown only while the kaleidoscope is on.
+const KALEIDO_SETTINGS: [Setting; 2] = [Setting::KaleidoFolds, Setting::KaleidoSpin];
+
 impl Setting {
     fn label(self) -> &'static str {
         match self {
@@ -128,6 +141,8 @@ impl Setting {
             Setting::AudioBreathe => "Breathe",
             Setting::AudioMorph => "Julia morph",
             Setting::AudioFlow => "Flow boost",
+            Setting::KaleidoFolds => "Folds",
+            Setting::KaleidoSpin => "Spin",
         }
     }
 
@@ -150,6 +165,8 @@ impl Setting {
             | Setting::AudioBreathe
             | Setting::AudioMorph
             | Setting::AudioFlow => (0.0, 2.0),
+            Setting::KaleidoFolds => (2.0, 16.0),
+            Setting::KaleidoSpin => (0.0, 2.0),
         }
     }
 
@@ -169,6 +186,8 @@ impl Setting {
             Setting::AudioBreathe => s.audio_breathe,
             Setting::AudioMorph => s.audio_morph,
             Setting::AudioFlow => s.audio_flow,
+            Setting::KaleidoFolds => s.kaleido_folds,
+            Setting::KaleidoSpin => s.kaleido_spin,
         }
     }
 
@@ -191,6 +210,9 @@ impl Setting {
             Setting::AudioBreathe => s.audio_breathe = v,
             Setting::AudioMorph => s.audio_morph = v,
             Setting::AudioFlow => s.audio_flow = v,
+            // Snap to whole folds: fractional mirror counts make no sense.
+            Setting::KaleidoFolds => s.kaleido_folds = v.round(),
+            Setting::KaleidoSpin => s.kaleido_spin = v,
         }
     }
 
@@ -210,6 +232,7 @@ impl Setting {
                     format!("{:.0}k", v / 1_000.0)
                 }
             }
+            Setting::KaleidoFolds => format!("{v:.0}"),
             _ => format!("{v:.2}"),
         }
     }
@@ -266,13 +289,18 @@ struct FlowDropdown;
 #[derive(Component)]
 struct FlowOption(u32);
 
-/// Clickable "Kaleidoscope" row; clicking cycles the fold count (same as K).
+/// Clickable "Kaleidoscope" row; clicking toggles it (same as K).
 #[derive(Component)]
 struct KaleidoRow;
 
-/// The text showing the active kaleidoscope mode.
+/// The text showing whether the kaleidoscope is on.
 #[derive(Component)]
 struct KaleidoValue;
+
+/// Container for the kaleidoscope sliders (folds / spin); visible only while
+/// the kaleidoscope is on.
+#[derive(Component)]
+struct KaleidoSection;
 
 /// Clickable "Audio react" row; clicking toggles audio reactivity (same as V).
 #[derive(Component)]
@@ -317,7 +345,7 @@ impl Plugin for MenuPlugin {
                     click_flow_option,
                     update_flow_text,
                     click_kaleido,
-                    update_kaleido_text,
+                    sync_kaleido_ui,
                     click_audio,
                     sync_audio_ui,
                     apply_bloom,
@@ -576,6 +604,30 @@ fn build_menu(mut commands: Commands) {
                 ColorModeValue,
             ));
             parent.spawn(value_row("Kaleidoscope", "off", KaleidoRow, KaleidoValue));
+            parent
+                .spawn((
+                    Node {
+                        flex_direction: FlexDirection::Column,
+                        row_gap: Val::Px(8.0),
+                        margin: UiRect::top(Val::Px(4.0)),
+                        ..default()
+                    },
+                    Visibility::Hidden,
+                    KaleidoSection,
+                ))
+                .with_children(|col| {
+                    col.spawn((
+                        Text::new("KALEIDOSCOPE"),
+                        TextFont {
+                            font_size: 14.0,
+                            ..default()
+                        },
+                        TextColor(Color::srgb(0.7, 0.75, 0.85)),
+                    ));
+                    for setting in KALEIDO_SETTINGS {
+                        col.spawn(row_bundle(setting));
+                    }
+                });
             parent.spawn(value_row("Audio react", "off", AudioRow, AudioValue));
             parent
                 .spawn((
@@ -800,30 +852,39 @@ fn update_flow_text(mode: Res<FlowMode>, mut texts: Query<&mut Text, With<FlowVa
     }
 }
 
-/// Clicking the row cycles the kaleidoscope fold count, same as the K key.
+/// Clicking the row toggles the kaleidoscope, same as the K key.
 fn click_kaleido(
     mut kaleido: ResMut<Kaleido>,
     rows: Query<&Interaction, (Changed<Interaction>, With<KaleidoRow>)>,
 ) {
     for interaction in &rows {
         if *interaction == Interaction::Pressed {
-            kaleido.cycle();
+            kaleido.on = !kaleido.on;
         }
     }
 }
 
-/// Keep the kaleidoscope label in sync however the mode changes (click or K).
-/// The per-frame rotation accumulator bypasses change detection, so only real
-/// fold-count changes land here.
-fn update_kaleido_text(
+/// Keep the on/off label and the KALEIDOSCOPE section in sync however the
+/// toggle happens (click or K). The per-frame rotation accumulator bypasses
+/// change detection, so only real toggles land here. Visibility::Inherited
+/// keeps the section tied to the panel's own visibility.
+fn sync_kaleido_ui(
     kaleido: Res<Kaleido>,
     mut texts: Query<&mut Text, With<KaleidoValue>>,
+    mut sections: Query<&mut Visibility, With<KaleidoSection>>,
 ) {
     if !kaleido.is_changed() {
         return;
     }
     for mut text in &mut texts {
-        *text = Text::new(kaleido.label());
+        *text = Text::new(if kaleido.on { "on" } else { "off" });
+    }
+    for mut vis in &mut sections {
+        *vis = if kaleido.on {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
     }
 }
 

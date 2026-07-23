@@ -64,32 +64,14 @@ fn fractal_default_view(ftype: u32) -> (DVec2, f64) {
     }
 }
 
-/// Kaleidoscope state. Fold count cycled with K (or by clicking the menu
-/// row): 0 (off) -> 6 -> 8. Pure display effect in the trail composite
-/// shader; the simulation never sees it. `rot` is the music-driven rotation
-/// angle, accumulated per frame.
+/// Kaleidoscope state. Toggled with K (or by clicking the menu row); the fold
+/// count and spin gain live in Settings sliders, shown only while on. Pure
+/// display effect in the trail composite shader; the simulation never sees
+/// it. `rot` is the music-driven rotation angle, accumulated per frame.
 #[derive(Resource, Default)]
 pub struct Kaleido {
-    pub n: u32,
+    pub on: bool,
     pub rot: f32,
-}
-
-impl Kaleido {
-    pub fn cycle(&mut self) {
-        self.n = match self.n {
-            0 => 6,
-            6 => 8,
-            _ => 0,
-        };
-    }
-
-    pub fn label(&self) -> &'static str {
-        match self.n {
-            0 => "off",
-            6 => "6-fold",
-            _ => "8-fold",
-        }
-    }
 }
 
 /// Continuous zoom dive toward the cursor, toggled with Z. Any manual
@@ -163,7 +145,7 @@ fn main() {
     println!("  C          cycle color mode");
     println!("  F          cycle fractal type");
     println!("  G          cycle flow mode");
-    println!("  K          kaleidoscope (off / 6-fold / 8-fold)");
+    println!("  K          kaleidoscope (folds / spin sliders in menu)");
     println!("  V          audio reactivity (system output drives the fractal)");
     println!("  P          screenshot (PNG in working dir)");
     println!("  Shift+1..9 save view, 1..9 fly back to it");
@@ -331,8 +313,8 @@ fn handle_input(
         info!("flow mode: {}", FLOW_MODES[flow_mode.0 as usize]);
     }
     if keys.just_pressed(KeyCode::KeyK) {
-        kaleido.cycle();
-        info!("kaleidoscope: {}", kaleido.label());
+        kaleido.on = !kaleido.on;
+        info!("kaleidoscope: {}", if kaleido.on { "on" } else { "off" });
     }
     if keys.just_pressed(KeyCode::KeyV) {
         audio.enabled = !audio.enabled;
@@ -615,21 +597,23 @@ fn update_params(
     u.audio = Vec4::new(audio.bass, audio.mid, audio.treble, audio.beat);
     u.audio_hue = audio.hue_phase;
     // Kaleidoscope rotation: slow constant drift so the mandala is never
-    // static, plus music level and beats spinning it up. Accumulated here
-    // (not derived from time) so the speed reacts, not the absolute angle.
+    // static, plus music level and beats spinning it up, all scaled by the
+    // Spin slider (0 = frozen wedges). Accumulated here (not derived from
+    // time) so the speed reacts, not the absolute angle.
     // Bypass change detection: the per-frame accumulation must not mark the
     // resource changed, or the menu's label sync (gated on is_changed) would
-    // rewrite its text every frame. Only n changes (K / menu click) flag.
-    if kaleido.n > 0 {
-        kaleido.bypass_change_detection().rot +=
-            time.delta_secs() * (0.05 + audio.level * 0.8 + audio.beat * 1.2);
+    // rewrite its text every frame. Only the toggle (K / menu click) flags.
+    if kaleido.on {
+        kaleido.bypass_change_detection().rot += time.delta_secs()
+            * settings.kaleido_spin
+            * (0.05 + audio.level * 0.8 + audio.beat * 1.2);
     }
     u.audio2 = Vec4::new(audio.beat_age, audio.drop_age, kaleido.rot, audio.level);
     u.audio_fx = Vec4::new(
         settings.audio_pulse,
         settings.audio_flash,
         settings.audio_glow,
-        kaleido.n as f32,
+        if kaleido.on { settings.kaleido_folds } else { 0.0 },
     );
     for i in 0..4 {
         u.spectrum[i] = Vec4::from_slice(&audio.spectrum[i * 4..i * 4 + 4]);
