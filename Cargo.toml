@@ -4,7 +4,22 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-bevy = { version = "0.16", features = ["wayland"] }
+# Default features off: skips bevy_audio (audio.rs uses an external capture
+# process), gltf/scene/animation, and asset loaders this app never touches.
+# For a wasm build add "webgpu" (the compute shaders rule out webgl2).
+bevy = { version = "0.16", default-features = false, features = [
+    "bevy_winit",
+    "bevy_ui",
+    "bevy_text",
+    "default_font",
+    "bevy_core_pipeline",
+    "bevy_log",
+    "multi_threaded",
+    "png",
+    "tonemapping_luts",
+    "wayland",
+    "x11",
+] }
 bytemuck = { version = "1", features = ["derive"] }
 rayon = "1"
 fastrand = "2"
@@ -15,3 +30,4 @@ opt-level = 1
 opt-level = 3
 [profile.release]
 lto = "thin"
+strip = true
