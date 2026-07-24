@@ -59,7 +59,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            particle_count: 2_000_000,
+            particle_count: crate::DEFAULT_COUNT,
             detail: 1.0,
             flow_speed: 0.081,
             align_force: 15.0,

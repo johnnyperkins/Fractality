@@ -1,14 +1,12 @@
-// Audio reactivity: captures whatever the PC is playing (default sink
-// monitor via `pw-record`, PipeWire) on a background thread, runs a small
-// FFT, and publishes normalized band levels, a 16-bin spectrum, stereo pan,
-// and beat/drop counters through atomics. The main world smooths these per
-// frame into AudioLevels, which update_params folds into the sim uniforms.
+// Audio reactivity: captures audio on a per-platform path (native: default
+// sink monitor via `pw-record`/PipeWire; web: tab/system audio via a screen
+// share, falling back to the microphone), runs a small FFT per 1024-sample
+// window, and publishes normalized band levels, a 16-bin spectrum, and
+// beat/drop counters through atomics. The main world smooths these per frame
+// into AudioLevels, which update_params folds into the sim uniforms.
 
-use std::io::Read;
-use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use bevy::prelude::*;
 
@@ -17,7 +15,7 @@ const N: usize = 1024;
 /// Log-spaced spectrum resolution published to the shaders.
 pub const SPECTRUM_BINS: usize = 16;
 
-/// Lock-free channel from the capture thread. Values are f32 bits in
+/// Lock-free channel from the capture callback/thread. Values are f32 bits in
 /// AtomicU32 (bands and spectrum already auto-gained to ~0..1);
 /// `beats`/`drops` increment per event so the reader can't miss short
 /// pulses between frames.
@@ -73,7 +71,14 @@ fn load_f32(a: &AtomicU32) -> f32 {
 #[derive(Resource, Default)]
 pub struct AudioCapture {
     pub enabled: bool,
-    capture: Option<(Child, Arc<AudioShared>)>,
+    capture: Option<Capture>,
+}
+
+/// A live capture: the shared level atomics plus whatever platform object
+/// keeps the stream alive. Dropping it tears the capture down.
+struct Capture {
+    shared: Arc<AudioShared>,
+    _platform: platform::Handle,
 }
 
 /// Smoothed audio levels the sim reads each frame. All zero (decayed) while
@@ -201,64 +206,101 @@ fn autogain(peak: &mut f32, amp: f32) -> f32 {
     (amp / *peak).clamp(0.0, 1.0)
 }
 
-/// Capture loop: reads f32le stereo frames from pw-record's stdout, one FFT
-/// window per read (~23 ms). Exits when `running` is cleared or the pipe
-/// closes (pw-record died / no audio server).
-fn capture_loop(mut stdout: impl Read, shared: Arc<AudioShared>) {
-    // Hann window, precomputed.
-    let mut window = [0.0f32; N];
-    for (i, w) in window.iter_mut().enumerate() {
-        *w = 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / N as f32).cos();
-    }
-    // Bin width = RATE / N (~43 Hz). Band edges in Hz -> bins.
-    let bin = |hz: f32| ((hz * N as f32 / RATE as f32) as usize).clamp(1, N / 2);
-    let (b0, b1) = (bin(30.0), bin(250.0));
-    let (m1, t1) = (bin(2000.0), bin(8000.0));
-    // Log-spaced 16-bin spectrum edges over the same 30 Hz..8 kHz span, made
-    // strictly monotonic (the low bins would otherwise collapse onto one FFT
-    // bin at this resolution).
-    let mut edges = [0usize; SPECTRUM_BINS + 1];
-    for (i, e) in edges.iter_mut().enumerate() {
-        *e = bin(30.0 * (8000.0f32 / 30.0).powf(i as f32 / SPECTRUM_BINS as f32));
-    }
-    for i in 1..edges.len() {
-        edges[i] = edges[i].max(edges[i - 1] + 1);
-    }
+/// One FFT window's worth of analysis state, shared by the native capture
+/// thread and the web audio callback. Timing is stream time in seconds,
+/// accumulated from windows processed (window duration = N / sample_rate),
+/// so it needs no clock - std::time::Instant panics on wasm. The old
+/// Instant-based code also only checked at window boundaries, so with a
+/// real-time source the decisions are identical.
+struct WindowProcessor {
+    /// Hann window, precomputed.
+    window: [f32; N],
+    // Band edges as FFT bin indices (bass 30-250 Hz, mid to 2 kHz, treble to
+    // 8 kHz), plus the 16 log-spaced spectrum edges over the same span.
+    b0: usize,
+    b1: usize,
+    m1: usize,
+    t1: usize,
+    edges: [usize; SPECTRUM_BINS + 1],
+    peaks: [f32; 4],
+    spec_peaks: [f32; SPECTRUM_BINS],
+    /// ~1 s of bass-power history for beat detection (energy flux).
+    hist: [f32; 43],
+    hist_i: usize,
+    hist_n: usize,
+    /// Short/long energy EMAs for drop detection (a sustained surge well
+    /// above the recent norm). ~0.25 s and ~4 s time constants.
+    ema_short: f32,
+    ema_long: f32,
+    /// Seconds of audio consumed; advances by `window_dt` per window.
+    t: f64,
+    window_dt: f64,
+    last_beat: f64,
+    last_drop: f64,
+}
 
-    let mut peaks = [1e-5f32; 4];
-    let mut spec_peaks = [1e-5f32; SPECTRUM_BINS];
-    // ~1 s of bass-power history for beat detection (energy flux).
-    let mut hist = [0.0f32; 43];
-    let mut hist_i = 0usize;
-    let mut hist_n = 0usize;
-    let mut last_beat = Instant::now();
-    // Short/long energy EMAs for drop detection (a sustained surge well above
-    // the recent norm). ~0.25 s and ~4 s time constants at 43 windows/s.
-    let mut ema_short = 0.0f32;
-    let mut ema_long = 0.0f32;
-    let mut windows_seen = 0u32;
-    let mut last_drop = Instant::now();
-
-    let mut bytes = vec![0u8; N * 4]; // mono f32
-    let mut re = [0.0f32; N];
-    let mut im = [0.0f32; N];
-    let mut power = [0.0f32; N / 2];
-    while shared.running.load(Ordering::Relaxed) {
-        if stdout.read_exact(&mut bytes).is_err() {
-            break;
+impl WindowProcessor {
+    fn new(rate: f32) -> Self {
+        let mut window = [0.0f32; N];
+        for (i, w) in window.iter_mut().enumerate() {
+            *w = 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / N as f32).cos();
         }
-        im.fill(0.0);
-        for ((r, chunk), w) in re.iter_mut().zip(bytes.chunks_exact(4)).zip(&window) {
-            *r = f32::from_le_bytes(chunk.try_into().unwrap()) * w;
+        // Bin width = rate / N (~43 Hz at 44.1 kHz). Band edges in Hz -> bins.
+        let bin = |hz: f32| ((hz * N as f32 / rate) as usize).clamp(1, N / 2);
+        // Log-spaced 16-bin spectrum edges over the 30 Hz..8 kHz span, made
+        // strictly monotonic (the low bins would otherwise collapse onto one
+        // FFT bin at this resolution).
+        let mut edges = [0usize; SPECTRUM_BINS + 1];
+        for (i, e) in edges.iter_mut().enumerate() {
+            *e = bin(30.0 * (8000.0f32 / 30.0).powf(i as f32 / SPECTRUM_BINS as f32));
+        }
+        for i in 1..edges.len() {
+            edges[i] = edges[i].max(edges[i - 1] + 1);
+        }
+        Self {
+            window,
+            b0: bin(30.0),
+            b1: bin(250.0),
+            m1: bin(2000.0),
+            t1: bin(8000.0),
+            edges,
+            peaks: [1e-5; 4],
+            spec_peaks: [1e-5; SPECTRUM_BINS],
+            hist: [0.0; 43],
+            hist_i: 0,
+            hist_n: 0,
+            ema_short: 0.0,
+            ema_long: 0.0,
+            t: 0.0,
+            window_dt: N as f64 / rate as f64,
+            // t starts at 0, so beats hold off ~150 ms and drops 8 s after
+            // capture start, matching the old Instant::now() initialization.
+            last_beat: 0.0,
+            last_drop: 0.0,
+        }
+    }
+
+    /// Analyze one N-sample mono window and publish the results.
+    fn process(&mut self, samples: &[f32; N], shared: &AudioShared) {
+        // Advance the stream clock first: after window k, t = k * window_dt,
+        // which is the wall time the old Instant-based code observed when it
+        // checked cooldowns at this same point (real-time source assumed).
+        self.t += self.window_dt;
+        let mut re = [0.0f32; N];
+        let mut im = [0.0f32; N];
+        for ((r, s), w) in re.iter_mut().zip(samples).zip(&self.window) {
+            *r = s * w;
         }
         fft(&mut re, &mut im);
         // Per-bin power once; every band below is a range sum over this.
+        let mut power = [0.0f32; N / 2];
         for (p, (r, i_)) in power.iter_mut().zip(re.iter().zip(im.iter())) {
             *p = r * r + i_ * i_;
         }
         let band_sum = |lo: usize, hi: usize| power[lo..hi].iter().sum::<f32>();
 
         // The three bands are contiguous, so the overall level is their union.
+        let (b0, b1, m1, t1) = (self.b0, self.b1, self.m1, self.t1);
         let bass_s = band_sum(b0, b1);
         let mid_s = band_sum(b1, m1);
         let treble_s = band_sum(m1, t1);
@@ -267,83 +309,320 @@ fn capture_loop(mut stdout: impl Read, shared: Arc<AudioShared>) {
         let treble_p = treble_s / (t1 - m1) as f32;
         let level_p = (bass_s + mid_s + treble_s) / (t1 - b0) as f32;
 
-        store_f32(&shared.bass, autogain(&mut peaks[0], bass_p.sqrt()));
-        store_f32(&shared.mid, autogain(&mut peaks[1], mid_p.sqrt()));
-        store_f32(&shared.treble, autogain(&mut peaks[2], treble_p.sqrt()));
-        store_f32(&shared.level, autogain(&mut peaks[3], level_p.sqrt()));
+        store_f32(&shared.bass, autogain(&mut self.peaks[0], bass_p.sqrt()));
+        store_f32(&shared.mid, autogain(&mut self.peaks[1], mid_p.sqrt()));
+        store_f32(&shared.treble, autogain(&mut self.peaks[2], treble_p.sqrt()));
+        store_f32(&shared.level, autogain(&mut self.peaks[3], level_p.sqrt()));
 
         // Per-bin spectrum, each bin auto-gained independently so quiet
         // frequency regions still register visually.
         for i in 0..SPECTRUM_BINS {
-            let p = band_sum(edges[i], edges[i + 1]) / (edges[i + 1] - edges[i]) as f32;
-            store_f32(&shared.spectrum[i], autogain(&mut spec_peaks[i], p.sqrt()));
+            let (lo, hi) = (self.edges[i], self.edges[i + 1]);
+            let p = band_sum(lo, hi) / (hi - lo) as f32;
+            store_f32(&shared.spectrum[i], autogain(&mut self.spec_peaks[i], p.sqrt()));
         }
 
         // Beat: bass power spikes well above its recent average.
-        if hist_n >= 12 {
-            let mean = hist[..hist_n].iter().sum::<f32>() / hist_n as f32;
-            if bass_p > mean * 1.6 + 1e-7
-                && last_beat.elapsed() > Duration::from_millis(150)
-            {
+        if self.hist_n >= 12 {
+            let mean = self.hist[..self.hist_n].iter().sum::<f32>() / self.hist_n as f32;
+            if bass_p > mean * 1.6 + 1e-7 && self.t - self.last_beat > 0.15 {
                 shared.beats.fetch_add(1, Ordering::Relaxed);
-                last_beat = Instant::now();
+                self.last_beat = self.t;
             }
         }
-        hist[hist_i] = bass_p;
-        hist_i = (hist_i + 1) % hist.len();
-        hist_n = (hist_n + 1).min(hist.len());
+        self.hist[self.hist_i] = bass_p;
+        self.hist_i = (self.hist_i + 1) % self.hist.len();
+        self.hist_n = (self.hist_n + 1).min(self.hist.len());
 
         // Drop: short-term energy surges over the long-term norm (build-up
         // then hit). Warm-up and a long cooldown keep it a rare event.
-        ema_short += (level_p - ema_short) * 0.093;
-        ema_long += (level_p - ema_long) * 0.0058;
-        windows_seen += 1;
-        if windows_seen > 86
-            && ema_long > 1e-7
-            && ema_short > ema_long * 3.0
-            && last_drop.elapsed() > Duration::from_secs(8)
+        self.ema_short += (level_p - self.ema_short) * 0.093;
+        self.ema_long += (level_p - self.ema_long) * 0.0058;
+        // ~2 s warm-up (86 windows at 44.1 kHz, matching the original gate).
+        if self.t > 2.0
+            && self.ema_long > 1e-7
+            && self.ema_short > self.ema_long * 3.0
+            && self.t - self.last_drop > 8.0
         {
             shared.drops.fetch_add(1, Ordering::Relaxed);
-            last_drop = Instant::now();
+            self.last_drop = self.t;
         }
     }
-    shared.running.store(false, Ordering::Relaxed);
 }
 
-/// Spawn pw-record capturing the default sink's monitor (i.e. whatever the
-/// PC is playing), f32le mono RATE Hz to stdout.
-fn start_capture() -> std::io::Result<(Child, Arc<AudioShared>)> {
-    let mut child = Command::new("pw-record")
-        .args(["--properties", "{ stream.capture.sink=true }"])
-        .args(["--format", "f32", "--channels", "1", "--rate"])
-        .arg(RATE.to_string())
-        .arg("-")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let stdout = child.stdout.take().expect("piped stdout");
-    let shared = Arc::new(AudioShared {
-        running: AtomicBool::new(true),
-        ..Default::default()
-    });
-    let thread_shared = shared.clone();
-    std::thread::spawn(move || capture_loop(stdout, thread_shared));
-    Ok((child, shared))
+/// Native capture: spawn pw-record on the default sink's monitor (whatever
+/// the PC is playing) and analyze its stdout on a background thread.
+#[cfg(not(target_arch = "wasm32"))]
+mod platform {
+    use std::io::Read;
+    use std::process::{Child, Command, Stdio};
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+
+    use super::{AudioShared, WindowProcessor, N, RATE};
+
+    pub const DESCRIPTION: &str = "capturing system output";
+
+    /// Owns the pw-record child; dropping it stops the thread and reaps the
+    /// process off-thread (wait() on the main thread would block the frame).
+    pub struct Handle {
+        child: Option<Child>,
+        shared: Arc<AudioShared>,
+    }
+
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            self.shared.running.store(false, Ordering::Relaxed);
+            if let Some(mut child) = self.child.take() {
+                let _ = child.kill();
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+            }
+        }
+    }
+
+    /// Capture loop: reads f32le mono frames from pw-record's stdout, one FFT
+    /// window per read (~23 ms). Exits when `running` is cleared or the pipe
+    /// closes (pw-record died / no audio server).
+    fn capture_loop(mut stdout: impl Read, shared: Arc<AudioShared>) {
+        let mut proc = WindowProcessor::new(RATE as f32);
+        let mut bytes = vec![0u8; N * 4];
+        let mut samples = [0.0f32; N];
+        while shared.running.load(Ordering::Relaxed) {
+            if stdout.read_exact(&mut bytes).is_err() {
+                break;
+            }
+            for (s, chunk) in samples.iter_mut().zip(bytes.chunks_exact(4)) {
+                *s = f32::from_le_bytes(chunk.try_into().unwrap());
+            }
+            proc.process(&samples, &shared);
+        }
+        shared.running.store(false, Ordering::Relaxed);
+    }
+
+    pub fn start_capture(shared: Arc<AudioShared>) -> std::io::Result<Handle> {
+        let mut child = Command::new("pw-record")
+            .args(["--properties", "{ stream.capture.sink=true }"])
+            .args(["--format", "f32", "--channels", "1", "--rate"])
+            .arg(RATE.to_string())
+            .arg("-")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let stdout = child.stdout.take().expect("piped stdout");
+        let thread_shared = shared.clone();
+        std::thread::spawn(move || capture_loop(stdout, thread_shared));
+        Ok(Handle {
+            child: Some(child),
+            shared,
+        })
+    }
 }
 
-/// Start/stop the capture process to match the enabled flag, and disable if
-/// the capture thread died (no PipeWire, pw-record missing, pipe closed).
-/// Steady states only read (Deref), so the resource is marked changed only
-/// on real transitions - UI systems rely on that.
+/// Web capture: getDisplayMedia (user picks a tab / screen and shares its
+/// audio; on Chrome+Windows "share system audio" covers everything), falling
+/// back to getUserMedia (microphone). A ScriptProcessorNode hands us mono
+/// N-sample buffers on the main thread - wasm here is single-threaded, so the
+/// "capture thread" is just a JS callback feeding the same WindowProcessor.
+#[cfg(target_arch = "wasm32")]
+mod platform {
+    use std::cell::{Cell, RefCell};
+    use std::io;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+
+    use bevy::prelude::warn;
+    use wasm_bindgen::prelude::*;
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_futures::JsFuture;
+    use web_sys::js_sys;
+    use web_sys::{
+        AudioContext, AudioContextOptions, AudioProcessingEvent, MediaStream, MediaStreamTrack,
+        ScriptProcessorNode,
+    };
+
+    use super::{AudioShared, WindowProcessor, N, RATE};
+
+    pub const DESCRIPTION: &str = "pick a tab/screen and tick 'share audio' (mic fallback)";
+
+    // The JS audio graph lives in a thread-local, not in the Handle: the
+    // Handle sits inside a Bevy Resource, which must be Send+Sync, and JS
+    // objects are neither. Wasm without atomics is single-threaded, so the
+    // Handle's Drop and the async setup both run on this one thread.
+    // `ACTIVE` holds the id of the capture that owns the slot; a setup that
+    // finishes after its Handle died (or after a newer capture started) sees
+    // the mismatch and tears itself down instead of leaking a live stream.
+    thread_local! {
+        static GRAPH: RefCell<Option<Graph>> = const { RefCell::new(None) };
+        static ACTIVE: Cell<u64> = const { Cell::new(0) };
+    }
+    static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+    /// Send+Sync token for one capture attempt; dropping it tears down the
+    /// audio graph if this attempt still owns it.
+    pub struct Handle(u64);
+
+    struct Graph {
+        ctx: AudioContext,
+        stream: MediaStream,
+        processor: ScriptProcessorNode,
+        _on_audio: Closure<dyn FnMut(AudioProcessingEvent)>,
+        _on_ended: Closure<dyn FnMut()>,
+    }
+
+    fn stop_tracks(tracks: js_sys::Array) {
+        for t in tracks.iter() {
+            t.unchecked_into::<MediaStreamTrack>().stop();
+        }
+    }
+
+    fn teardown(g: Graph) {
+        g.processor.set_onaudioprocess(None);
+        let _ = g.ctx.close();
+        stop_tracks(g.stream.get_tracks());
+    }
+
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            if ACTIVE.get() == self.0 {
+                ACTIVE.set(0);
+                if let Some(g) = GRAPH.with_borrow_mut(Option::take) {
+                    teardown(g);
+                }
+            }
+        }
+    }
+
+    /// Returns immediately; the permission prompt and graph construction run
+    /// async. Failures surface by clearing `shared.running`, which the next
+    /// manage_capture pass treats as "capture stopped".
+    pub fn start_capture(shared: Arc<AudioShared>) -> io::Result<Handle> {
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        ACTIVE.set(id);
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Err(e) = setup(shared.clone(), id).await {
+                warn!("web audio capture failed: {e:?}");
+                shared.running.store(false, Ordering::Relaxed);
+            }
+        });
+        Ok(Handle(id))
+    }
+
+    async fn setup(shared: Arc<AudioShared>, id: u64) -> Result<(), JsValue> {
+        let window = web_sys::window().ok_or("no window")?;
+        let devices = window.navigator().media_devices()?;
+
+        // Tab/screen audio first (video must be requested; we stop its track
+        // right away). Denied/unsupported -> microphone.
+        let display = web_sys::DisplayMediaStreamConstraints::new();
+        display.set_audio(&JsValue::TRUE);
+        display.set_video(&JsValue::TRUE);
+        let stream: MediaStream = match JsFuture::from(
+            devices.get_display_media_with_constraints(&display)?,
+        )
+        .await
+        {
+            Ok(s) => s.unchecked_into(),
+            Err(_) => {
+                let mic = web_sys::MediaStreamConstraints::new();
+                mic.set_audio(&JsValue::TRUE);
+                JsFuture::from(devices.get_user_media_with_constraints(&mic)?)
+                    .await?
+                    .unchecked_into()
+            }
+        };
+        stop_tracks(stream.get_video_tracks());
+        if stream.get_audio_tracks().length() == 0 {
+            stop_tracks(stream.get_tracks());
+            return Err("no audio track shared (tick 'share tab audio' in the picker)".into());
+        }
+
+        // Ask for the native analysis rate; if the browser resamples to
+        // something else anyway, ctx.sample_rate() reports it and the
+        // processor's band math follows.
+        let opts = AudioContextOptions::new();
+        opts.set_sample_rate(RATE as f32);
+        let ctx = AudioContext::new_with_context_options(&opts)?;
+        // The V keypress's user activation may not survive the await chain;
+        // resume() makes autoplay-suspended contexts start anyway.
+        let _ = ctx.resume();
+
+        let source = ctx.create_media_stream_source(&stream)?;
+        let processor = ctx
+            .create_script_processor_with_buffer_size_and_number_of_input_channels_and_number_of_output_channels(
+                N as u32, 1, 1,
+            )?;
+
+        let mut proc = WindowProcessor::new(ctx.sample_rate());
+        let mut samples = [0.0f32; N];
+        let cb_shared = shared.clone();
+        let on_audio = Closure::<dyn FnMut(AudioProcessingEvent)>::new(
+            move |ev: AudioProcessingEvent| {
+                if !cb_shared.running.load(Ordering::Relaxed) {
+                    return;
+                }
+                if let Ok(buf) = ev.input_buffer() {
+                    if buf.copy_from_channel(&mut samples, 0).is_ok() {
+                        proc.process(&samples, &cb_shared);
+                    }
+                }
+            },
+        );
+        processor.set_onaudioprocess(Some(on_audio.as_ref().unchecked_ref()));
+        source.connect_with_audio_node(&processor)?;
+        // A ScriptProcessorNode only fires while wired to the destination.
+        // Its output stays silent (we never write the output buffer), so the
+        // captured tab is not echoed.
+        processor.connect_with_audio_node(&ctx.destination())?;
+
+        // Browser "stop sharing" bar ends the track; treat it as capture loss.
+        let ended_shared = shared.clone();
+        let on_ended = Closure::<dyn FnMut()>::new(move || {
+            ended_shared.running.store(false, Ordering::Relaxed);
+        });
+        let track: MediaStreamTrack = stream.get_audio_tracks().get(0).unchecked_into();
+        track.set_onended(Some(on_ended.as_ref().unchecked_ref()));
+
+        let graph = Graph {
+            ctx,
+            stream,
+            processor,
+            _on_audio: on_audio,
+            _on_ended: on_ended,
+        };
+        // Our Handle died (or was replaced) while the permission prompt was
+        // up: don't leak a live capture nobody owns.
+        if ACTIVE.get() != id {
+            teardown(graph);
+            return Ok(());
+        }
+        GRAPH.with_borrow_mut(|slot| *slot = Some(graph));
+        Ok(())
+    }
+}
+
+/// Start/stop the capture to match the enabled flag, and disable if the
+/// capture died (native: no PipeWire / pw-record missing / pipe closed; web:
+/// permission denied or sharing stopped). Steady states only read (Deref),
+/// so the resource is marked changed only on real transitions - UI systems
+/// rely on that.
 pub fn manage_capture(mut audio: ResMut<AudioCapture>) {
     if audio.enabled && audio.capture.is_none() {
-        match start_capture() {
-            Ok(capture) => {
-                info!("audio reactivity ON (capturing system output)");
-                audio.capture = Some(capture);
+        let shared = Arc::new(AudioShared {
+            running: AtomicBool::new(true),
+            ..Default::default()
+        });
+        match platform::start_capture(shared.clone()) {
+            Ok(handle) => {
+                info!("audio reactivity ON ({})", platform::DESCRIPTION);
+                audio.capture = Some(Capture {
+                    shared,
+                    _platform: handle,
+                });
             }
             Err(e) => {
-                warn!("audio capture failed to start (pw-record): {e}");
+                warn!("audio capture failed to start: {e}");
                 audio.enabled = false;
             }
         }
@@ -351,25 +630,18 @@ pub fn manage_capture(mut audio: ResMut<AudioCapture>) {
         && audio
             .capture
             .as_ref()
-            .is_some_and(|(_, s)| !s.running.load(Ordering::Relaxed))
+            .is_some_and(|c| !c.shared.running.load(Ordering::Relaxed))
     {
-        warn!("audio capture stopped (pipe closed); disabling audio reactivity");
+        warn!("audio capture stopped; disabling audio reactivity");
         audio.enabled = false;
     }
     if !audio.enabled && audio.capture.is_some() {
-        if let Some((mut child, shared)) = audio.capture.take() {
-            shared.running.store(false, Ordering::Relaxed);
-            let _ = child.kill();
-            // Reap off-thread: wait() on the main thread would block the frame.
-            std::thread::spawn(move || {
-                let _ = child.wait();
-            });
-            info!("audio reactivity OFF");
-        }
+        audio.capture = None;
+        info!("audio reactivity OFF");
     }
 }
 
-/// Per-frame smoothing of the raw thread levels into AudioLevels: fast
+/// Per-frame smoothing of the raw capture levels into AudioLevels: fast
 /// attack, slower release (punchy but not strobing), event ages for the ring
 /// waves, palette hue and Julia morph accumulation.
 pub fn update_audio(
@@ -378,7 +650,7 @@ pub fn update_audio(
     mut levels: ResMut<AudioLevels>,
 ) {
     let dt = time.delta_secs();
-    let shared = capture.capture.as_ref().filter(|_| capture.enabled).map(|(_, s)| s);
+    let shared = capture.capture.as_ref().filter(|_| capture.enabled).map(|c| &c.shared);
     let raw = shared.map(|s| s.snapshot()).unwrap_or_default();
     // A single non-finite value here poisons brightness/size uniforms and
     // blacks the whole frame; scrub before it enters the smoothing.

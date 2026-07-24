@@ -1,6 +1,12 @@
 # Rust build output
 /target
 
+# wasm-bindgen output (build-web.sh / build-web-singlefile.sh);
+# index.html stays tracked
+/web/fractality.js
+/web/fractality_bg.wasm
+/web/fractality-standalone.html
+
 # Backtrace / debug
 *.pdb
 *.log

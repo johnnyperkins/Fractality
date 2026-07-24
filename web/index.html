@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Fractality</title>
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      background: #000;
+      overflow: hidden;
+    }
+    #fractality-canvas {
+      width: 100%;
+      height: 100%;
+      display: block;
+      outline: none;
+    }
+    #no-webgpu {
+      color: #ccc;
+      font: 16px/1.6 system-ui, sans-serif;
+      max-width: 40em;
+      margin: 20vh auto;
+      padding: 0 1em;
+      display: none;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="fractality-canvas"></canvas>
+  <div id="no-webgpu">
+    <h1>WebGPU required</h1>
+    <p>
+      Fractality runs its particle simulation in compute shaders, which need
+      WebGPU. Use a recent Chrome/Edge, or enable WebGPU in your browser.
+    </p>
+  </div>
+  <script type="module">
+    if (!navigator.gpu) {
+      document.getElementById("fractality-canvas").style.display = "none";
+      document.getElementById("no-webgpu").style.display = "block";
+    } else {
+      const { default: init } = await import("./fractality.js");
+      await init();
+    }
+  </script>
+</body>
+</html>

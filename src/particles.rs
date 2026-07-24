@@ -20,6 +20,7 @@ use bevy::render::{
     view::ViewTarget,
     Extract, ExtractSchedule, Render, RenderApp, RenderSet,
 };
+#[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 
 /// GPU particle, 32 bytes. Layout must match the WGSL Particle struct exactly.
@@ -115,7 +116,13 @@ pub const REF_ORBIT_CAP: usize = 2048;
 /// GPU particle buffer capacity. The full buffer is always allocated; the live
 /// `count` uniform caps how many are actually simulated/drawn, so the settings
 /// menu can change particle count instantly with no buffer reallocation.
+#[cfg(not(target_arch = "wasm32"))]
 pub const MAX_PARTICLES: u32 = 12_000_000;
+/// WebGPU's default maxStorageBufferBindingSize is 128 MiB; at 32 bytes per
+/// particle, 4M (128 MB) is the largest count that binds without requesting
+/// higher limits.
+#[cfg(target_arch = "wasm32")]
+pub const MAX_PARTICLES: u32 = 4_000_000;
 
 /// CPU-computed f64 reference orbit at the view center, stored as f32 pairs.
 /// Perturbation keeps full f32 precision because particle deltas stay small.
@@ -241,8 +248,14 @@ fn spawn_rect(ftype: u32) -> (f64, f64, f64, f64) {
 
 pub fn generate_particles(count: usize, max_iter: u32, center: DVec2, ftype: u32) -> Vec<Particle> {
     let (x0, x1, y0, y1) = spawn_rect(ftype);
-    (0..count)
-        .into_par_iter()
+    // rayon has no plain wasm story (needs SharedArrayBuffer plumbing), so the
+    // web build generates sequentially; the smaller default count keeps
+    // startup tolerable.
+    #[cfg(not(target_arch = "wasm32"))]
+    let range = (0..count).into_par_iter();
+    #[cfg(target_arch = "wasm32")]
+    let range = 0..count;
+    range
         .map(|i| {
             let mut rng =
                 fastrand::Rng::with_seed(0x9E3779B97F4A7C15u64.wrapping_mul(i as u64 + 1));

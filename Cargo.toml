@@ -6,7 +6,6 @@ edition = "2021"
 [dependencies]
 # Default features off: skips bevy_audio (audio.rs uses an external capture
 # process), gltf/scene/animation, and asset loaders this app never touches.
-# For a wasm build add "webgpu" (the compute shaders rule out webgl2).
 bevy = { version = "0.16", default-features = false, features = [
     "bevy_winit",
     "bevy_ui",
@@ -14,15 +13,49 @@ bevy = { version = "0.16", default-features = false, features = [
     "default_font",
     "bevy_core_pipeline",
     "bevy_log",
-    "multi_threaded",
     "png",
     "tonemapping_luts",
+] }
+bytemuck = { version = "1", features = ["derive"] }
+fastrand = "2"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+bevy = { version = "0.16", default-features = false, features = [
+    "multi_threaded",
     "wayland",
     "x11",
 ] }
-bytemuck = { version = "1", features = ["derive"] }
 rayon = "1"
-fastrand = "2"
+
+# Web build needs "webgpu": the compute shaders rule out webgl2.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+bevy = { version = "0.16", default-features = false, features = ["webgpu"] }
+console_error_panic_hook = "0.1"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+    "AudioBuffer",
+    "Blob",
+    "Document",
+    "Element",
+    "HtmlCanvasElement",
+    "HtmlElement",
+    "Url",
+    "AudioContext",
+    "AudioContextOptions",
+    "AudioDestinationNode",
+    "AudioNode",
+    "AudioProcessingEvent",
+    "DisplayMediaStreamConstraints",
+    "MediaDevices",
+    "MediaStream",
+    "MediaStreamAudioSourceNode",
+    "MediaStreamConstraints",
+    "MediaStreamTrack",
+    "Navigator",
+    "ScriptProcessorNode",
+    "Window",
+] }
 
 [profile.dev]
 opt-level = 1

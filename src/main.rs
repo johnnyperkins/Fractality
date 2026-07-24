@@ -9,6 +9,7 @@ use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
 use bevy::render::camera::ClearColorConfig;
+#[cfg(not(target_arch = "wasm32"))]
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 use bevy::render::view::Msaa;
 use bevy::window::PresentMode;
@@ -126,12 +127,83 @@ fn depth_iter(height: f64, detail: f32) -> u32 {
     raw.clamp(60.0, (REF_ORBIT_CAP - 1) as f64) as u32
 }
 
+/// Startup particle count when no CLI argument overrides it (also the
+/// Settings::default() value). Lower on web: generation is single-threaded
+/// there (no rayon), and the menu slider can raise it live anyway.
+#[cfg(not(target_arch = "wasm32"))]
+const DEFAULT_COUNT: u32 = 2_000_000;
+#[cfg(target_arch = "wasm32")]
+const DEFAULT_COUNT: u32 = 500_000;
+
+/// Wall-clock seconds for the screenshot filename. Wasm has no SystemTime;
+/// session uptime is unique enough there (the browser dedups collisions).
+fn screenshot_stamp(time: &Time) -> u64 {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = time;
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        time.elapsed_secs() as u64
+    }
+}
+
+/// Web screenshot: snapshot the composited canvas via toBlob and trigger a
+/// download. Bevy's Screenshot entity path (GPU buffer readback) comes back
+/// black on the browser WebGPU backend; the canvas always holds the last
+/// presented frame, so this needs no readback at all.
+#[cfg(target_arch = "wasm32")]
+fn web_screenshot(path: &str) {
+    use wasm_bindgen::closure::Closure;
+    use wasm_bindgen::JsCast;
+
+    let Some(canvas) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id("fractality-canvas"))
+        .and_then(|e| e.dyn_into::<web_sys::HtmlCanvasElement>().ok())
+    else {
+        warn!("screenshot: canvas #fractality-canvas not found");
+        return;
+    };
+    let name = path.to_owned();
+    // once_into_js: freed after the browser invokes it (leaks only if the
+    // browser never calls back, which it does even on encode failure).
+    let cb = Closure::once_into_js(move |blob: Option<web_sys::Blob>| {
+        let Some(blob) = blob else {
+            return;
+        };
+        let Ok(url) = web_sys::Url::create_object_url_with_blob(&blob) else {
+            return;
+        };
+        if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+            if let Ok(link) = doc.create_element("a") {
+                let _ = link.set_attribute("href", &url);
+                let _ = link.set_attribute("download", &name);
+                if let Ok(el) = link.dyn_into::<web_sys::HtmlElement>() {
+                    el.click();
+                }
+            }
+        }
+        let _ = web_sys::Url::revoke_object_url(&url);
+    });
+    if canvas.to_blob(cb.unchecked_ref()).is_err() {
+        warn!("screenshot: canvas.toBlob failed");
+    }
+}
+
 fn main() {
+    #[cfg(target_arch = "wasm32")]
+    console_error_panic_hook::set_once();
+
     let count = std::env::args()
         .nth(1)
         .map(|s| s.replace('_', ""))
         .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(2_000_000)
+        .unwrap_or(DEFAULT_COUNT)
         .min(MAX_PARTICLES);
 
     println!("Fractality controls:");
@@ -158,6 +230,10 @@ fn main() {
                 primary_window: Some(Window {
                     title: "Fractality".into(),
                     present_mode: PresentMode::AutoNoVsync,
+                    // Web: attach to the page's canvas and track its size.
+                    // Both fields are no-ops on native.
+                    canvas: Some("#fractality-canvas".into()),
+                    fit_canvas_to_parent: true,
                     ..default()
                 }),
                 ..default()
@@ -216,7 +292,8 @@ fn setup(mut commands: Commands, settings: Res<Settings>) {
         Msaa::Off,
     ));
 
-    let start = std::time::Instant::now();
+    // bevy_platform's Instant works on wasm; std's panics there.
+    let start = bevy::platform::time::Instant::now();
     // Positions are stored relative to the view center; seed at the default one.
     // Seed only the initial active count (fast startup). The GPU buffer is sized
     // to MAX_PARTICLES; raising the count later fills the tail via recycle.
@@ -320,15 +397,18 @@ fn handle_input(
         audio.enabled = !audio.enabled;
     }
     if keys.just_pressed(KeyCode::KeyP) {
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let stamp = screenshot_stamp(&time);
         let path = format!("fractality_{stamp}.png");
         info!("saving screenshot to {path}");
+        #[cfg(not(target_arch = "wasm32"))]
         commands
             .spawn(Screenshot::primary_window())
             .observe(save_to_disk(path));
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = &mut commands; // only the native path spawns anything
+            web_screenshot(&path);
+        }
     }
 
     // Bookmarks: Shift+digit saves the current view, plain digit flies to it.
