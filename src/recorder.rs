@@ -92,8 +92,10 @@ mod native {
     const BITRATE_BPS: u32 = 20_000_000;
 
     /// A live recording. Dropping it closes the channel, which ends the
-    /// encoder loop and finalizes the mp4 (joined off-thread so the app
-    /// never hitches; the loop logs the "saved" line itself when done).
+    /// encoder loop and finalizes the mp4. The join is synchronous: the brief
+    /// hitch at stop time is the price of the moov index reliably reaching
+    /// disk even when the drop is the app quitting (a detached joiner would
+    /// be killed at process exit, truncating the file mid-finalize).
     pub(super) struct Handle {
         tx: Option<SyncSender<Frame>>,
         join: Option<std::thread::JoinHandle<()>>,
@@ -105,13 +107,11 @@ mod native {
 
     impl Drop for Handle {
         fn drop(&mut self) {
+            info!("recording stopped, finalizing");
             drop(self.tx.take());
             if let Some(join) = self.join.take() {
-                std::thread::spawn(move || {
-                    let _ = join.join();
-                });
+                let _ = join.join();
             }
-            info!("recording stopped, finalizing");
         }
     }
 
@@ -348,6 +348,17 @@ mod native {
     }
 
     fn encode_loop(rx: Receiver<Frame>, file: File, path: String) {
+        // Delete the eagerly created file if no sample ever reached it
+        // (encoder init failure, or a take stopped before the first
+        // readback landed): a zero-byte mp4 on disk helps nobody.
+        if encode_frames(rx, file, &path) == 0 {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// Runs the encode until the channel closes or a fatal error; returns
+    /// the number of timeline frames written into the mp4.
+    fn encode_frames(rx: Receiver<Frame>, file: File, path: &str) -> u64 {
         let mut file = Some(file);
         let mut state: Option<EncState> = None;
         let mut written: u64 = 0;
@@ -372,21 +383,28 @@ mod native {
                     Ok(s) => state = Some(s),
                     Err(e) => {
                         error!("recording: {e}");
-                        return;
+                        return written;
                     }
                 }
             }
             let st = state.as_mut().unwrap();
+            // A frame captured mid-resize can land at a different size than
+            // the encoder was initialized with; slicing it with the old
+            // dimensions would panic the thread. Skip such stragglers (the
+            // capture side stops the take on the next frame anyway).
+            if (w, h) != (st.yuv.w, st.yuv.h) {
+                continue;
+            }
             let Some((r, b)) = rb_offsets(frame.format) else {
                 error!("recording: unsupported surface format {:?}", frame.format);
-                return;
+                return written;
             };
             st.yuv.fill(&frame.data, frame.w as usize, r, b);
             let bs = match st.encoder.encode(&st.yuv) {
                 Ok(bs) => bs,
                 Err(e) => {
                     error!("recording: encode failed: {e}");
-                    return;
+                    return written;
                 }
             };
             let is_sync = matches!(bs.frame_type(), FrameType::IDR);
@@ -429,7 +447,7 @@ mod native {
                 };
                 if let Err(e) = st.writer.add_track(&track) {
                     error!("recording: mp4 track setup failed: {e}");
-                    return;
+                    return written;
                 }
                 st.track_added = true;
             }
@@ -442,18 +460,19 @@ mod native {
             };
             if let Err(e) = st.writer.write_sample(1, &mp4_sample) {
                 error!("recording: mp4 sample write failed: {e}");
-                return;
+                return written;
             }
             written += n as u64;
         }
         if let Some(mut st) = state {
             if let Err(e) = st.writer.write_end() {
                 error!("recording: mp4 finalize failed: {e}");
-                return;
+                return written;
             }
             let secs = written as f64 / FPS;
             info!("recording saved to {path} ({written} frames, {secs:.1}s)");
         }
+        written
     }
 
     #[cfg(test)]
@@ -571,6 +590,10 @@ mod web {
             if let Ok(blob) = web_sys::Blob::new_with_blob_sequence_and_options(&chunks, &opts) {
                 webutil::download_blob(&blob, &name);
             }
+            // The forgotten closures pin this array for the page's lifetime;
+            // empty it so the take's blobs (potentially hundreds of MB) can
+            // be collected once the download is handed off.
+            chunks.set_length(0);
         });
         rec.set_onstop(Some(on_stop.as_ref().unchecked_ref()));
         // The browser calls these after stop(); dropping them now would kill
