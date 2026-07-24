@@ -25,17 +25,22 @@ bevy = { version = "0.16", default-features = false, features = [
     "wayland",
     "x11",
 ] }
+mp4 = "0.14.0"
+openh264 = "0.9.7"
 rayon = "1"
 
 # Web build needs "webgpu": the compute shaders rule out webgl2.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 bevy = { version = "0.16", default-features = false, features = ["webgpu"] }
 console_error_panic_hook = "0.1"
+js-sys = "0.3"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = [
     "AudioBuffer",
     "Blob",
+    "BlobEvent",
+    "BlobPropertyBag",
     "Document",
     "Element",
     "HtmlCanvasElement",
@@ -48,6 +53,7 @@ web-sys = { version = "0.3", features = [
     "AudioProcessingEvent",
     "DisplayMediaStreamConstraints",
     "MediaDevices",
+    "MediaRecorder",
     "MediaStream",
     "MediaStreamAudioSourceNode",
     "MediaStreamConstraints",

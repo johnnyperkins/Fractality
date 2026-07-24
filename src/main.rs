@@ -1,6 +1,9 @@
 mod audio;
 mod menu;
 mod particles;
+mod recorder;
+#[cfg(target_arch = "wasm32")]
+mod webutil;
 
 use std::sync::Arc;
 
@@ -18,6 +21,7 @@ use bevy::math::DVec2;
 
 use audio::{AudioCapture, AudioLevels};
 use menu::{MenuPlugin, PointerOverMenu, Settings};
+use recorder::{Recorder, RecorderPlugin};
 use particles::{
     generate_particles, julia_morph_c, reference_orbit, ParticlePlugin, ParticleSeed, RefOrbit,
     SimParams, JULIA_C, JULIA_TYPE, MAX_PARTICLES, REF_ORBIT_CAP,
@@ -135,9 +139,10 @@ const DEFAULT_COUNT: u32 = 2_000_000;
 #[cfg(target_arch = "wasm32")]
 const DEFAULT_COUNT: u32 = 500_000;
 
-/// Wall-clock seconds for the screenshot filename. Wasm has no SystemTime;
-/// session uptime is unique enough there (the browser dedups collisions).
-fn screenshot_stamp(time: &Time) -> u64 {
+/// Wall-clock seconds for output filenames (screenshots, recordings). Wasm
+/// has no SystemTime; session uptime is unique enough there (the browser
+/// dedups collisions).
+pub(crate) fn output_stamp(time: &Time) -> u64 {
     #[cfg(not(target_arch = "wasm32"))]
     {
         let _ = time;
@@ -161,11 +166,7 @@ fn web_screenshot(path: &str) {
     use wasm_bindgen::closure::Closure;
     use wasm_bindgen::JsCast;
 
-    let Some(canvas) = web_sys::window()
-        .and_then(|w| w.document())
-        .and_then(|d| d.get_element_by_id("fractality-canvas"))
-        .and_then(|e| e.dyn_into::<web_sys::HtmlCanvasElement>().ok())
-    else {
+    let Some(canvas) = webutil::canvas() else {
         warn!("screenshot: canvas #fractality-canvas not found");
         return;
     };
@@ -173,22 +174,9 @@ fn web_screenshot(path: &str) {
     // once_into_js: freed after the browser invokes it (leaks only if the
     // browser never calls back, which it does even on encode failure).
     let cb = Closure::once_into_js(move |blob: Option<web_sys::Blob>| {
-        let Some(blob) = blob else {
-            return;
-        };
-        let Ok(url) = web_sys::Url::create_object_url_with_blob(&blob) else {
-            return;
-        };
-        if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
-            if let Ok(link) = doc.create_element("a") {
-                let _ = link.set_attribute("href", &url);
-                let _ = link.set_attribute("download", &name);
-                if let Ok(el) = link.dyn_into::<web_sys::HtmlElement>() {
-                    el.click();
-                }
-            }
+        if let Some(blob) = blob {
+            webutil::download_blob(&blob, &name);
         }
-        let _ = web_sys::Url::revoke_object_url(&url);
     });
     if canvas.to_blob(cb.unchecked_ref()).is_err() {
         warn!("screenshot: canvas.toBlob failed");
@@ -220,6 +208,7 @@ fn main() {
     println!("  K          kaleidoscope (folds / spin sliders in menu)");
     println!("  V          audio reactivity (system output drives the fractal)");
     println!("  P          screenshot (PNG in working dir)");
+    println!("  O          record video (mp4 in working dir; webm download on web)");
     println!("  Shift+1..9 save view, 1..9 fly back to it");
     println!("  R          reset view");
     println!("  M / Esc    settings menu");
@@ -242,6 +231,7 @@ fn main() {
         .add_plugins(FrameTimeDiagnosticsPlugin::default())
         .add_plugins(ParticlePlugin)
         .add_plugins(MenuPlugin)
+        .add_plugins(RecorderPlugin)
         .insert_resource(Settings {
             particle_count: count,
             ..default()
@@ -397,7 +387,7 @@ fn handle_input(
         audio.enabled = !audio.enabled;
     }
     if keys.just_pressed(KeyCode::KeyP) {
-        let stamp = screenshot_stamp(&time);
+        let stamp = output_stamp(&time);
         let path = format!("fractality_{stamp}.png");
         info!("saving screenshot to {path}");
         #[cfg(not(target_arch = "wasm32"))]
@@ -704,6 +694,7 @@ fn update_title(
     time: Res<Time>,
     diagnostics: Res<DiagnosticsStore>,
     settings: Res<Settings>,
+    recorder: Res<Recorder>,
     mut windows: Query<&mut Window>,
     mut timer: Local<f32>,
 ) {
@@ -716,9 +707,10 @@ fn update_title(
         .get(&FrameTimeDiagnosticsPlugin::FPS)
         .and_then(|d| d.smoothed())
         .unwrap_or(0.0);
+    let rec = if recorder.is_active() { " | REC" } else { "" };
     if let Ok(mut window) = windows.single_mut() {
         window.title = format!(
-            "Fractality | {} particles | {:.0} FPS | wheel zoom, WASD pan, M menu",
+            "Fractality | {} particles | {:.0} FPS{rec} | wheel zoom, WASD pan, M menu",
             settings.particle_count, fps
         );
     }
