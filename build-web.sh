@@ -16,7 +16,9 @@ wasm-bindgen \
 
 # Optional size pass if binaryen is installed.
 if command -v wasm-opt >/dev/null; then
-    wasm-opt -O2 -o web/fractality_bg.wasm web/fractality_bg.wasm
+    # rustc enables bulk-memory, nontrapping-fptoint, etc. by default;
+    # older wasm-opt (e.g. ubuntu's binaryen) rejects them without flags.
+    wasm-opt -O2 --all-features -o web/fractality_bg.wasm web/fractality_bg.wasm
 fi
 
 echo "done. serve with e.g.: python3 -m http.server -d web 8080"
