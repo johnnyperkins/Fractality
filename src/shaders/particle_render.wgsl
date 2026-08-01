@@ -46,6 +46,8 @@ struct Params {
     audio_fx: vec4<f32>,
     // 16 log-spaced spectrum bins (bin 0 = lowest), packed 4 per vec4.
     spectrum: array<vec4<f32>, 4>,
+    // Shape/dynamics tuning (compute); layout parity here.
+    shape: vec4<f32>,
 };
 
 @group(0) @binding(0) var<storage, read> particles: array<Particle>;

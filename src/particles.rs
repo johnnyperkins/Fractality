@@ -99,6 +99,10 @@ pub struct ParamsUniform {
     pub audio_fx: Vec4,
     /// 16 log-spaced spectrum bins (bin 0 = lowest), packed 4 per vec4.
     pub spectrum: [Vec4; 4],
+    /// Shape/dynamics tuning: x condensation (how hard particles freeze onto
+    /// the boundary shell; 1 = classic, higher = wider and deader freeze,
+    /// 0 = everything streams), yzw spare.
+    pub shape: Vec4,
 }
 
 impl ParamsUniform {

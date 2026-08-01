@@ -756,6 +756,7 @@ fn update_params(
     for i in 0..4 {
         u.spectrum[i] = Vec4::from_slice(&audio.spectrum[i * 4..i * 4 + 4]);
     }
+    u.shape = Vec4::new(settings.condensation, 0.0, 0.0, 0.0);
 }
 
 fn update_title(

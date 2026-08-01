@@ -44,6 +44,8 @@ struct Params {
     // w kaleidoscope segment count (0 = off).
     audio_fx: vec4<f32>,
     spectrum: array<vec4<f32>, 4>,
+    // Shape/dynamics tuning (compute); layout parity here.
+    shape: vec4<f32>,
 };
 
 @group(0) @binding(0) var trail_tex: texture_2d<f32>;

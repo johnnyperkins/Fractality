@@ -48,6 +48,9 @@ struct Params {
     audio_fx: vec4<f32>,
     // 16 log-spaced spectrum bins (unused here; layout parity).
     spectrum: array<vec4<f32>, 4>,
+    // Shape/dynamics tuning: x condensation (boundary freeze strength and
+    // reach; 1 = classic), yzw spare.
+    shape: vec4<f32>,
 };
 
 @group(0) @binding(0) var<storage, read_write> particles: array<Particle>;
@@ -153,6 +156,20 @@ fn step_der(z_full: vec2<f32>, der: vec2<f32>) -> vec2<f32> {
 // differs from 1. Must match inv_log2_power() on the CPU.
 fn inv_log2_power() -> f32 {
     return select(1.0, 0.6309297535714574, params.fractal_type == 3u);
+}
+
+// Shell calm factor from a field value: 1 = free streaming, near 0 = frozen
+// onto the boundary. Proximity is normalized to the detail-1 iteration ramp
+// (max_iter scales with the detail knob, so dividing by max_iter directly
+// made raising detail reclassify the frozen shell as outer flow - the whole
+// image went fuzzy at high detail). Condensation stretches the proximity and
+// deepens the freeze floor: 1 = classic feel, higher = wider + deader
+// freeze (crisper edges), 0 = everything streams.
+fn calm_of(f: f32) -> f32 {
+    let cond = params.shape.x;
+    let depth = f / f32(params.max_iter) * params.detail;
+    let freeze = min(0.95 * cond, 0.998);
+    return 1.0 - freeze * smoothstep(0.25, 0.75, depth * cond);
 }
 
 // Initial delta: zero except Julia, where dc perturbs the starting point.
@@ -408,8 +425,7 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
     // every frame, and mouse-adjacent particles always update so interactions
     // stay responsive. NaN pos/band fails these compares and falls through to
     // the full path, where the NaN guard at the end catches it.
-    let depth_est = p.band / f32(params.max_iter);
-    let calm_est = 1.0 - 0.95 * smoothstep(0.25, 0.75, depth_est);
+    let calm_est = calm_of(p.band);
     if (calm_est < 0.2 && distn > rn * 2.0 && (idx + params.frame) % 4u != 0u) {
         // Staggered particles still ride a live ring wave (impulse plus
         // integration, a few ALU ops), so the wavefront stays smooth without
@@ -468,12 +484,12 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
         // so those particles slow, lock onto their contour, and trace the fine
         // shape instead of smearing it. Well-seated particles keep full flow.
         let settle = 1.0 / (1.0 + 6.0 * band_err * band_err);
-        // Depth calm: f0 near max_iter means the particle sits on the fractal
-        // shell itself, where the shape lives. Freeze those almost completely
-        // so the boundary renders as a stable filigree; the calm ramps in from
-        // mid-field, leaving the outer haze streaming normally.
-        let depth = f0 / f32(params.max_iter);
-        calm = 1.0 - 0.95 * smoothstep(0.25, 0.75, depth);
+        // Depth calm: f0 near the ramp top means the particle sits on the
+        // fractal shell itself, where the shape lives. Freeze those almost
+        // completely so the boundary renders as a stable filigree; the calm
+        // ramps in from mid-field, leaving the outer haze streaming normally.
+        // Detail-invariant and condensation-scaled - see calm_of.
+        calm = calm_of(f0);
         // The normal velocity correction also rides the noisy gradient, so on
         // the shell it mostly injects thrash; the capped positional pull below
         // holds those particles instead. Keep it strong only for outer flow.
