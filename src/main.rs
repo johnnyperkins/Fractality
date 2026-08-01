@@ -157,13 +157,20 @@ fn depth_iter(height: f64, detail: f32) -> u32 {
 const AFFORDABLE_ITER: f32 = 2047.0;
 
 /// Trade particle count against iteration depth PAST the old cap, holding
-/// per-frame work (~count x max_iter) at its old worst-case value. Shallow and
-/// mid zoom are untouched; only dives beyond height ~2.4e-6 - where the old
-/// build froze and went mushy - thin the swarm (to ~42% at the deepest
-/// reachable view, height 1e-15). Brightness normalization downstream
-/// compensates for the lower density, so the image does not dim.
-fn iter_budget_count(user_count: u32, max_iter: u32) -> u32 {
-    let ratio = (AFFORDABLE_ITER / max_iter as f32).clamp(0.0, 1.0);
+/// per-frame work (~count x max_iter) near its old worst-case value. Shallow
+/// and mid zoom are untouched; only dives beyond height ~2.4e-6 - where the
+/// old build froze and went mushy - thin the swarm (to ~23% at the height
+/// floor of 1e-28). Brightness normalization downstream compensates for the
+/// lower density, so the image does not dim.
+///
+/// The budget scales with `detail`: max_iter is proportional to it, so
+/// without the scaling the slider would trade particles away 1:1 and
+/// raising detail would VISIBLY remove particles. Detail is the user
+/// explicitly buying more per-particle work, so it costs frame rate (as it
+/// always did shallow), never density.
+fn iter_budget_count(user_count: u32, max_iter: u32, detail: f32) -> u32 {
+    let affordable = AFFORDABLE_ITER * detail.max(0.01);
+    let ratio = (affordable / max_iter as f32).clamp(0.0, 1.0);
     ((user_count as f32 * ratio) as u32).clamp(1, user_count)
 }
 
@@ -633,7 +640,7 @@ fn update_params(
     // live count are not simulated, so their stored positions go stale; on
     // zoom-out they come back a trickle at a time and the compute shader's
     // drifted-out recycling absorbs them without a visible pop.
-    let target_count = iter_budget_count(user_count, max_iter) as f32;
+    let target_count = iter_budget_count(user_count, max_iter, settings.detail) as f32;
     if state.smooth_count <= 0.0 {
         state.smooth_count = target_count;
     }
