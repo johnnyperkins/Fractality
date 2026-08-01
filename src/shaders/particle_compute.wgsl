@@ -52,8 +52,20 @@ struct Params {
 
 @group(0) @binding(0) var<storage, read_write> particles: array<Particle>;
 @group(0) @binding(1) var<uniform> params: Params;
-// Reference orbit Z_0..Z_n at the view center, computed in f64 on the CPU.
-@group(0) @binding(2) var<storage, read> ref_orbit: array<vec2<f32>>;
+// Reference orbit Z_0..Z_n at the view center, computed in double-double on
+// the CPU. Each entry is an f32 hi/lo split per component: xy = hi, zw = lo
+// (~48 bits of Z together). The lo limb exists for one reason: the full value
+// z = Z + dz cancels catastrophically in f32 when the orbit close-approaches
+// zero at deep zoom (close-approach size ~sqrt(view height) drops below hi's
+// absolute rounding error past height ~1e-15). ref_add restores the digits.
+@group(0) @binding(2) var<storage, read> ref_orbit: array<vec4<f32>>;
+
+// Compensated z = Z_ref + dz. hi + dz first: when they nearly cancel the
+// subtraction is exact (Sterbenz), and lo then supplies the surviving digits;
+// when they don't cancel, lo is far below rounding and changes nothing.
+fn ref_add(zr: vec4<f32>, dz: vec2<f32>) -> vec2<f32> {
+    return (zr.xy + dz) + zr.zw;
+}
 
 fn cmul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
     return vec2<f32>(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
@@ -160,16 +172,18 @@ fn field(dc: vec2<f32>) -> f32 {
     // Z_0 is known up front (0 for c-plane fractals, the view center for
     // Julia), so each iteration needs only one ref_orbit load (the next
     // entry); the previous load is carried in a register across iterations.
+    // Only the full-value reconstruction (ref_add) and the rebase fold use
+    // the lo limb; step_dz products are cancellation-free, so hi is enough.
     let ref0 = ref_orbit[0];
     var dz = initial_dz(dc);
     var ri: u32 = 0u;
     var z_ref = ref0;
     let last = params.ref_len - 1u;
     for (var n: u32 = 0u; n < params.max_iter; n = n + 1u) {
-        dz = step_dz(z_ref, dz, dc);
+        dz = step_dz(z_ref.xy, dz, dc);
         ri = ri + 1u;
         let z_ref_next = ref_orbit[ri];
-        let z = z_ref_next + dz; // full z_{n+1}
+        let z = ref_add(z_ref_next, dz); // full z_{n+1}
         let m = dot(z, z);
         if (m > 256.0) {
             return f32(n) + 1.0 - log2(0.5 * log2(m)) * inv_log2_power();
@@ -177,7 +191,7 @@ fn field(dc: vec2<f32>) -> f32 {
         // Rebase: fold the full value into the delta and restart the reference
         // when the delta dominates or the reference orbit is exhausted.
         if (m < dot(dz, dz) || ri >= last) {
-            dz = z - ref0;
+            dz = (z - ref0.xy) - ref0.zw;
             ri = 0u;
             z_ref = ref0;
         } else {
@@ -217,12 +231,12 @@ fn field_grad(dc: vec2<f32>) -> FieldGrad {
     let last = params.ref_len - 1u;
     let ilp = inv_log2_power();
     for (var n: u32 = 0u; n < params.max_iter; n = n + 1u) {
-        let z_full = z_ref + dz; // full z_n
+        let z_full = ref_add(z_ref, dz); // full z_n
         der = step_der(z_full, der);
-        dz = step_dz(z_ref, dz, dc);
+        dz = step_dz(z_ref.xy, dz, dc);
         ri = ri + 1u;
         let z_ref_next = ref_orbit[ri];
-        let z = z_ref_next + dz;
+        let z = ref_add(z_ref_next, dz);
         let m = dot(z, z);
         if (m > 256.0) {
             let u = 0.5 * log2(m);
@@ -230,7 +244,7 @@ fn field_grad(dc: vec2<f32>) -> FieldGrad {
             return FieldGrad(f32(n) + 1.0 - log2(u) * ilp, g, z);
         }
         if (m < dot(dz, dz) || ri >= last) {
-            dz = z - ref0;
+            dz = (z - ref0.xy) - ref0.zw;
             ri = 0u;
             z_ref = ref0;
         } else {
@@ -252,9 +266,9 @@ fn wave_live() -> bool {
 }
 
 // A gaussian shell at the radius an `age`-old wavefront has reached, fading
-// as it travels.
-fn ring(r: f32, age: f32, vh: f32) -> f32 {
-    let d = (r - age * WAVE_SPEED * vh) / (vh * 0.08);
+// as it travels. `rn` is the radius in view-height units (see beat_impulse).
+fn ring(rn: f32, age: f32) -> f32 {
+    let d = (rn - age * WAVE_SPEED) / 0.08;
     return exp(-d * d) * exp(-age * 2.5);
 }
 
@@ -268,21 +282,25 @@ fn ring(r: f32, age: f32, vh: f32) -> f32 {
 fn beat_impulse(pos: vec2<f32>, view_height: f32) -> vec2<f32> {
     let beat_age = params.audio2.x;
     let drop_age = params.audio2.y;
-    let r = length(pos);
+    // View-height units: length() of a raw center-relative position squares
+    // it internally, which underflows f32 below height ~1e-19 and collapses
+    // the radius (and the direction division) to garbage at deep zoom.
+    let pn = pos / view_height;
+    let rn = length(pn);
     var dir = vec2<f32>(0.0, 1.0);
-    if (r > view_height * 1e-5) {
-        dir = pos / r;
+    if (rn > 1e-5) {
+        dir = pn / rn;
     }
     var a = 0.0;
     if (beat_age < BEAT_AGE_MAX) {
-        a += ring(r, beat_age, view_height) * 5.0;
+        a += ring(rn, beat_age) * 5.0;
     }
     if (drop_age < DROP_AGE_MAX) {
         // Triple wave, 0.18 s apart, each softer than the last.
         for (var k = 0u; k < 3u; k = k + 1u) {
             let ag = drop_age - 0.18 * f32(k);
             if (ag >= 0.0) {
-                a += ring(r, ag, view_height) * (9.0 - 2.0 * f32(k));
+                a += ring(rn, ag) * (9.0 - 2.0 * f32(k));
             }
         }
     }
@@ -370,12 +388,18 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     // Mouse geometry, needed both by the stagger gate and the impulse below.
-    // The distance floor (division guard for dir) must scale with the view:
-    // radius shrinks with zoom, and any absolute floor eventually exceeds it,
-    // silently killing the blast/vortex at deep zoom.
-    let d = p.pos - params.mouse.xy;
+    // Everything is measured in view-height units: length() of a raw
+    // center-relative offset squares it internally, which underflows f32
+    // below height ~1e-19 - dist collapses to the floor, every particle
+    // counts as "inside the radius", and dir = d/dist comes out orders of
+    // magnitude longer than unit, detonating the cloud on any click. The
+    // distance floor (division guard for dir) stays relative to the radius:
+    // any absolute floor eventually exceeds the shrinking radius and would
+    // silently kill the blast/vortex at deep zoom.
     let radius = params.mouse.w;
-    let dist = max(length(d), radius * 1e-4);
+    let dn = (p.pos - params.mouse.xy) / view_height;
+    let rn = radius / view_height;
+    let distn = max(length(dn), rn * 1e-4);
 
     // Stagger: shell particles (calm ~ 0) are deliberately near-frozen, yet
     // still pay the full field cost every frame. For settled particles band
@@ -386,7 +410,7 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
     // the full path, where the NaN guard at the end catches it.
     let depth_est = p.band / f32(params.max_iter);
     let calm_est = 1.0 - 0.95 * smoothstep(0.25, 0.75, depth_est);
-    if (calm_est < 0.2 && dist > radius * 2.0 && (idx + params.frame) % 4u != 0u) {
+    if (calm_est < 0.2 && distn > rn * 2.0 && (idx + params.frame) % 4u != 0u) {
         // Staggered particles still ride a live ring wave (impulse plus
         // integration, a few ALU ops), so the wavefront stays smooth without
         // paying the full field cost on beat frames. Damp here too: the full
@@ -552,11 +576,13 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
         desired = vec2<f32>(0.0, 0.0);
     }
 
-    // Mouse interaction: hover ripple, left blast, right vortex.
+    // Mouse interaction: hover ripple, left blast, right vortex. Normalized
+    // units for the geometry (dir is unit length by construction); the raw
+    // radius still sets the impulse magnitude so strength tracks the view.
     var impulse = vec2<f32>(0.0, 0.0);
-    if (dist < radius) {
-        let fall = 1.0 - dist / radius;
-        let dir = d / dist;
+    if (distn < rn) {
+        let fall = 1.0 - distn / rn;
+        let dir = dn / distn;
         if (params.mouse.z > 0.5) {
             impulse = dir * fall * fall * radius * 240.0;
         } else if (params.mouse.z < -0.5) {

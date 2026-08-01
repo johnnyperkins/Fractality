@@ -91,7 +91,9 @@ fn vs(
     // same at any zoom - otherwise zoomed-out looks bright/colorful and zoomed-in
     // looks dim and flat. (view_height = 2 / world_to_clip.y.)
     let view_h = 2.0 / params.world_to_clip.y;
-    let speed = length(p.vel) / view_h;
+    // Divide BEFORE length(): squaring a raw ~view_height-sized velocity
+    // underflows f32 below height ~1e-19 and flushes speed to zero.
+    let speed = length(p.vel / view_h);
 
     var color: vec3<f32>;
     switch params.color_mode {

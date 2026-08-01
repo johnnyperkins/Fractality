@@ -5,6 +5,8 @@ use std::sync::Arc;
 
 use bevy::asset::DirectAssetAccessExt;
 use bevy::math::DVec2;
+
+use crate::dd::{Dd, DdVec2};
 use bevy::core_pipeline::core_2d::graph::{Core2d, Node2d};
 use bevy::core_pipeline::fullscreen_vertex_shader::fullscreen_shader_vertex_state;
 use bevy::prelude::*;
@@ -110,8 +112,14 @@ impl ParamsUniform {
     }
 }
 
-/// Max reference-orbit length (also caps max_iter). One vec2<f32> per entry.
-pub const REF_ORBIT_CAP: usize = 2048;
+/// Max reference-orbit length (also caps max_iter). One vec4<f32> per entry
+/// (hi/lo pairs), so the whole buffer is 256 KB - free on the GPU. Sized so
+/// the depth ramp
+/// (~8750 iterations at the height floor of 1e-28) fits with detail-slider
+/// headroom. The real cost of a long orbit is the per-particle iteration
+/// loop, which `iter_budget_count` in main.rs pays for by trading particle
+/// count against depth.
+pub const REF_ORBIT_CAP: usize = 16384;
 
 /// GPU particle buffer capacity. The full buffer is always allocated; the live
 /// `count` uniform caps how many are actually simulated/drawn, so the settings
@@ -124,13 +132,18 @@ pub const MAX_PARTICLES: u32 = 12_000_000;
 #[cfg(target_arch = "wasm32")]
 pub const MAX_PARTICLES: u32 = 4_000_000;
 
-/// CPU-computed f64 reference orbit at the view center, stored as f32 pairs.
-/// Perturbation keeps full f32 precision because particle deltas stay small.
+/// CPU-computed double-double reference orbit at the view center, each entry
+/// stored as an f32 hi/lo pair per component: (hi.x, hi.y, lo.x, lo.y), ~48
+/// bits of the f64 value. Plain f32 entries break past height ~1e-15: the
+/// shader's z = Z_ref + dz cancels catastrophically when the orbit
+/// close-approaches zero, and close-approach size (~sqrt(height)) drops below
+/// f32's absolute rounding error (~6e-8 of |Z|) right around there. The lo
+/// limb restores the cancelled digits (see `field` in the compute shader).
 /// `generation` bumps on every recompute so the render world uploads the
 /// buffer only when the orbit actually changed.
 #[derive(Resource, Clone, Default, ExtractResource)]
 pub struct RefOrbit {
-    pub points: Vec<[f32; 2]>,
+    pub points: Vec<[f32; 4]>,
     pub generation: u32,
 }
 
@@ -189,22 +202,91 @@ fn inv_log2_power(ftype: u32) -> f64 {
     }
 }
 
-/// Iterate the selected map at the reference point in f64, storing Z_0..Z_n as
-/// f32 pairs. Stops at max_iter, REF_ORBIT_CAP, or when the orbit diverges hard.
-pub fn reference_orbit(cx: f64, cy: f64, max_iter: u32, ftype: u32, jc: (f64, f64)) -> Vec<[f32; 2]> {
-    let (mut zx, mut zy, ccx, ccy) = orbit_start(cx, cy, ftype, jc);
+/// `fractal_step` in double-double, for the reference orbit. Must stay in
+/// lockstep with the f64 version and the compute-shader switch.
+fn fractal_step_dd(zx: Dd, zy: Dd, cx: Dd, cy: Dd, ftype: u32) -> (Dd, Dd) {
+    match ftype {
+        1 => {
+            let ax = zx.abs();
+            let ay = zy.abs();
+            (ax * ax - ay * ay + cx, ax * ay * 2.0 + cy)
+        }
+        2 => (zx * zx - zy * zy + cx, cy - zx * zy * 2.0),
+        3 => (
+            zx * (zx * zx - zy * zy * 3.0) + cx,
+            zy * (zx * zx * 3.0 - zy * zy) + cy,
+        ),
+        _ => (zx * zx - zy * zy + cx, zx * zy * 2.0 + cy),
+    }
+}
+
+/// Split an f64 into an f32 hi/lo pair: hi = rounded value, lo = the ~24 bits
+/// of residual, together ~48 bits of the original.
+#[inline]
+fn split_f32(v: f64) -> (f32, f32) {
+    let hi = v as f32;
+    (hi, (v - hi as f64) as f32)
+}
+
+/// Iterate the selected map at the reference point in double-double (~31
+/// digits, so the orbit is exact for views down to height ~1e-28), storing
+/// Z_0..Z_n as f32 hi/lo pairs (see `RefOrbit`) - perturbation needs the c
+/// behind the orbit at full precision, the stored samples only well enough to
+/// survive the close-approach cancellation in the shader. Stops at max_iter,
+/// REF_ORBIT_CAP, or when the orbit diverges hard.
+pub fn reference_orbit(c: DdVec2, max_iter: u32, ftype: u32, jc: (f64, f64)) -> Vec<[f32; 4]> {
+    // Julia iterates the center itself under c = jc; everything else iterates
+    // from 0 with the center as c (the DD mirror of `orbit_start`).
+    let (mut zx, mut zy, ccx, ccy) = if ftype == JULIA_TYPE {
+        (c.x, c.y, Dd::from_f64(jc.0), Dd::from_f64(jc.1))
+    } else {
+        (Dd::ZERO, Dd::ZERO, c.x, c.y)
+    };
     let mut v = Vec::with_capacity((max_iter as usize + 1).min(REF_ORBIT_CAP));
-    v.push([zx as f32, zy as f32]); // Z_0 (0 except Julia, where it's the center)
+    let push = |v: &mut Vec<[f32; 4]>, zx: Dd, zy: Dd| {
+        let (hx, lx) = split_f32(zx.hi);
+        let (hy, ly) = split_f32(zy.hi);
+        v.push([hx, hy, lx, ly]);
+    };
+    push(&mut v, zx, zy); // Z_0 (0 except Julia, where it's the center)
     for _ in 0..max_iter {
-        let (nx, ny) = fractal_step(zx, zy, ccx, ccy, ftype);
+        let (nx, ny) = fractal_step_dd(zx, zy, ccx, ccy, ftype);
         zx = nx;
         zy = ny;
-        v.push([zx as f32, zy as f32]);
-        if zx * zx + zy * zy > 1e10 || v.len() >= REF_ORBIT_CAP {
+        push(&mut v, zx, zy);
+        if zx.hi * zx.hi + zy.hi * zy.hi > 1e10 || v.len() >= REF_ORBIT_CAP {
             break;
         }
     }
     v
+}
+
+#[cfg(test)]
+mod dd_orbit_tests {
+    use super::*;
+
+    /// fractal_step_dd must be the same map as fractal_step: iterate both at
+    /// a non-escaping point and compare. A transcription error (sign, factor)
+    /// would silently render a different fractal at every depth.
+    #[test]
+    fn dd_step_matches_f64_step() {
+        for ftype in 0..=4u32 {
+            let (mut zx, mut zy, cx, cy) = orbit_start(-0.16, 0.65, ftype, JULIA_C);
+            let (mut dzx, mut dzy) = (Dd::from_f64(zx), Dd::from_f64(zy));
+            let (dcx, dcy) = (Dd::from_f64(cx), Dd::from_f64(cy));
+            for i in 0..60 {
+                (zx, zy) = fractal_step(zx, zy, cx, cy, ftype);
+                let (nx, ny) = fractal_step_dd(dzx, dzy, dcx, dcy, ftype);
+                dzx = nx;
+                dzy = ny;
+                if zx * zx + zy * zy > 1e10 {
+                    break;
+                }
+                let err = (zx - dzx.hi).abs().max((zy - dzy.hi).abs());
+                assert!(err < 1e-9, "ftype {ftype} iter {i}: err {err:e}");
+            }
+        }
+    }
 }
 
 /// Per-frame simulation parameters, extracted into the render world.
@@ -310,7 +392,7 @@ impl FromWorld for RefOrbitBuffer {
         let device = world.resource::<RenderDevice>();
         let buffer = device.create_buffer(&BufferDescriptor {
             label: Some("ref_orbit_buffer"),
-            size: (REF_ORBIT_CAP * std::mem::size_of::<[f32; 2]>()) as u64,
+            size: (REF_ORBIT_CAP * std::mem::size_of::<[f32; 4]>()) as u64,
             usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });

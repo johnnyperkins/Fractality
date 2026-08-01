@@ -1,4 +1,5 @@
 mod audio;
+mod dd;
 mod menu;
 mod particles;
 mod recorder;
@@ -18,6 +19,8 @@ use bevy::render::view::Msaa;
 use bevy::window::PresentMode;
 
 use bevy::math::DVec2;
+
+use dd::DdVec2;
 
 use audio::{AudioCapture, AudioLevels};
 use menu::{MenuPlugin, PointerOverMenu, Settings};
@@ -86,7 +89,7 @@ struct AutoZoom(bool);
 
 #[derive(Clone, Copy)]
 struct Bookmark {
-    center: DVec2,
+    center: DdVec2,
     height: f64,
 }
 
@@ -98,14 +101,16 @@ struct Bookmarks([Option<Bookmark>; 9]);
 #[derive(Resource, Default)]
 struct FlyTo(Option<Bookmark>);
 
-/// View transform. center/height are f64 so the reference point keeps ~15
-/// digits of precision, enough for zoom down to ~1e-15 (near-infinite feel).
+/// View transform. The center is double-double (~31 digits) so the
+/// perturbation reference point stays exact down to the height floor of
+/// ~1e-28; plain f64 (~16 digits) capped useful zoom at ~1e-15. Height stays
+/// f64: it is a scale, not a position, so only its exponent range matters.
 #[derive(Resource)]
 struct ViewState {
-    center: DVec2,
+    center: DdVec2,
     height: f64,
     /// Center from the previous frame, for per-frame particle rebasing.
-    prev_center: DVec2,
+    prev_center: DdVec2,
     /// Height from the previous frame, to size the zoom-out reseed burst.
     prev_height: f64,
 }
@@ -113,22 +118,53 @@ struct ViewState {
 impl Default for ViewState {
     fn default() -> Self {
         Self {
-            center: DEFAULT_CENTER,
+            center: DdVec2::from_dvec2(DEFAULT_CENTER),
             height: DEFAULT_HEIGHT,
-            prev_center: DEFAULT_CENTER,
+            prev_center: DdVec2::from_dvec2(DEFAULT_CENTER),
             prev_height: DEFAULT_HEIGHT,
         }
     }
 }
 
+/// Iteration count at base zoom. Deeper views ramp above this, and
+/// `iter_budget_count` gives back particles in proportion.
+const BASE_DEPTH_ITER: f64 = 240.0;
+
 /// Iteration count grows with zoom depth so deep boundary detail resolves.
-/// Capped well below REF_ORBIT_CAP: cost is ~max_iter x particle_count every
-/// frame, so an uncapped ramp tanks the framerate (and makes input feel dead).
+/// Capped at REF_ORBIT_CAP, which the ramp now actually reaches: a dive past
+/// height ~2.4e-6 used to freeze here and the fractal stopped resolving new
+/// structure, going mushy instead of deep. Frame cost is held flat by
+/// `iter_budget_count`, not by pinning the iteration count.
 fn depth_iter(height: f64, detail: f32) -> u32 {
     let zoom = (DEFAULT_HEIGHT / height).max(1.0);
-    let raw = (240.0 + 90.0 * zoom.log2()) * detail as f64;
-    // Cap below REF_ORBIT_CAP: the perturbation reference orbit is that long.
+    let l = zoom.log2();
+    // Depth margin: resolve structure ~2 doublings (180 iterations) before
+    // the zoom reaches its scale. Without it, regions whose escape count sits
+    // just above the ramp render as empty interior, then pop in fully sized
+    // the moment the ramp crosses them - near minibrots escape counts cluster,
+    // so whole filament webs appeared at once. With the margin they seed
+    // while still ~4x smaller on screen and grow in over ~1.5 s of dive.
+    // Tapered over the first 4 doublings so base-zoom cost is unchanged.
+    let margin = 180.0 * (l * 0.25).min(1.0);
+    let raw = (BASE_DEPTH_ITER + 90.0 * l + margin) * detail as f64;
+    // Cap at REF_ORBIT_CAP: the perturbation reference orbit is that long.
     raw.clamp(60.0, (REF_ORBIT_CAP - 1) as f64) as u32
+}
+
+/// Iteration count the sim is known to afford at the user's full particle
+/// count: the old REF_ORBIT_CAP, which ran everywhere at full density before
+/// the cap was raised. Below this depth the count is never reduced.
+const AFFORDABLE_ITER: f32 = 2047.0;
+
+/// Trade particle count against iteration depth PAST the old cap, holding
+/// per-frame work (~count x max_iter) at its old worst-case value. Shallow and
+/// mid zoom are untouched; only dives beyond height ~2.4e-6 - where the old
+/// build froze and went mushy - thin the swarm (to ~42% at the deepest
+/// reachable view, height 1e-15). Brightness normalization downstream
+/// compensates for the lower density, so the image does not dim.
+fn iter_budget_count(user_count: u32, max_iter: u32) -> u32 {
+    let ratio = (AFFORDABLE_ITER / max_iter as f32).clamp(0.0, 1.0);
+    ((user_count as f32 * ratio) as u32).clamp(1, user_count)
 }
 
 /// Startup particle count when no CLI argument overrides it (also the
@@ -306,9 +342,10 @@ fn zoom_anchored(view: &mut ViewState, window: &Window, new_h: f64) {
         let h = window.height().max(1.0) as f64;
         let aspect = w / h;
         let ndc = DVec2::new(cursor.x as f64 / w * 2.0 - 1.0, 1.0 - cursor.y as f64 / h * 2.0);
-        let cursor_fractal =
-            view.center + DVec2::new(ndc.x * old_h * aspect * 0.5, ndc.y * old_h * 0.5);
-        view.center += (cursor_fractal - view.center) * (1.0 - new_h / old_h);
+        // Cursor offset from the center is view-height sized, so f64 carries
+        // it exactly enough; only the accumulation into center needs DD.
+        let cursor_off = DVec2::new(ndc.x * old_h * aspect * 0.5, ndc.y * old_h * 0.5);
+        view.center += cursor_off * (1.0 - new_h / old_h);
     }
     view.height = new_h;
 }
@@ -355,7 +392,7 @@ fn handle_input(
 
     if keys.just_pressed(KeyCode::KeyR) {
         let (center, height) = fractal_default_view(fractal.0);
-        view.center = center;
+        view.center = DdVec2::from_dvec2(center);
         view.height = height;
         auto_zoom.0 = false;
         fly.0 = None;
@@ -440,8 +477,9 @@ fn handle_input(
         return;
     };
     if scroll != 0.0 {
-        // Lower clamp near f64 precision floor for the center; feels infinite.
-        let new_h = (view.height * 0.9f64.powf(scroll)).clamp(1e-15, 40.0);
+        // Lower clamp near the double-double precision floor for the center
+        // (~31 digits; a couple of digits of margin keeps sub-pixel accuracy).
+        let new_h = (view.height * 0.9f64.powf(scroll)).clamp(1e-28, 40.0);
         zoom_anchored(&mut view, window, new_h);
         auto_zoom.0 = false;
         fly.0 = None;
@@ -450,9 +488,9 @@ fn handle_input(
     // Auto-zoom dive: constant exponential rate toward the cursor, so the
     // apparent speed is the same at every depth. Stops at the precision floor.
     if auto_zoom.0 {
-        let new_h = (view.height * (-0.9 * dt).exp()).max(1e-15);
+        let new_h = (view.height * (-0.9 * dt).exp()).max(1e-28);
         zoom_anchored(&mut view, window, new_h);
-        if new_h <= 1e-15 {
+        if new_h <= 1e-28 {
             auto_zoom.0 = false;
         }
     }
@@ -469,10 +507,13 @@ fn handle_input(
         let new_h = (old_h.ln() + (target.height.ln() - old_h.ln()) * k).exp();
         let shrink = (1.0 - new_h / old_h).max(0.0);
         let pull = (shrink + k).min(1.0);
-        let step = (target.center - view.center) * pull;
+        // The remaining gap is computed exactly in DD, then the f64-rounded
+        // step is fine: its error is ~1e-16 of the gap, far sub-pixel. The
+        // final snap assigns the DD target exactly.
+        let step = (target.center - view.center).to_dvec2() * pull;
         view.center += step;
         view.height = new_h;
-        let err = (target.center - view.center).length();
+        let err = (target.center - view.center).to_dvec2().length();
         if (new_h / target.height).ln().abs() < 0.005 && err < target.height * 0.002 {
             view.center = target.center;
             view.height = target.height;
@@ -494,10 +535,21 @@ fn apply_fractal_switch(
         return;
     }
     let (center, height) = fractal_default_view(fractal.0);
-    view.center = center;
+    view.center = DdVec2::from_dvec2(center);
     view.height = height;
     auto_zoom.0 = false;
     fly.0 = None;
+}
+
+/// State `update_params` carries between frames. Bundled into a single `Local`
+/// because the system is at Bevy's 16-parameter limit.
+#[derive(Default)]
+struct ParamState {
+    frame: u32,
+    /// Eased particle count, so the depth-vs-count trade ramps instead of
+    /// snapping. Zero means "not yet initialized".
+    smooth_count: f32,
+    last_orbit_key: Option<(DdVec2, u32, u32, (f64, f64))>,
 }
 
 fn update_params(
@@ -515,8 +567,7 @@ fn update_params(
     audio: Res<AudioLevels>,
     mut params: ResMut<SimParams>,
     mut ref_orbit: ResMut<RefOrbit>,
-    mut frame: Local<u32>,
-    mut last_orbit_key: Local<Option<(DVec2, u32, u32, (f64, f64))>>,
+    mut state: Local<ParamState>,
 ) {
     let Ok(window) = windows.single() else {
         return;
@@ -537,8 +588,8 @@ fn update_params(
         (2.0 / eff_height) as f32,
     );
 
-    // Rebase amount for this frame, computed in f64 so it stays tiny and exact.
-    let center_delta = (view.prev_center - view.center).as_vec2();
+    // Rebase amount for this frame, computed in DD so it stays tiny and exact.
+    let center_delta = (view.prev_center - view.center).to_dvec2().as_vec2();
     view.prev_center = view.center;
 
     // Reseed budget. Two contributions, take the max:
@@ -576,8 +627,18 @@ fn update_params(
 
     let dt = time.delta_secs().min(1.0 / 30.0);
 
-    let count = settings.particle_count.clamp(1, MAX_PARTICLES);
+    let user_count = settings.particle_count.clamp(1, MAX_PARTICLES);
     let max_iter = depth_iter(view.height, settings.detail);
+    // Ease toward the budgeted count instead of snapping. Particles above the
+    // live count are not simulated, so their stored positions go stale; on
+    // zoom-out they come back a trickle at a time and the compute shader's
+    // drifted-out recycling absorbs them without a visible pop.
+    let target_count = iter_budget_count(user_count, max_iter) as f32;
+    if state.smooth_count <= 0.0 {
+        state.smooth_count = target_count;
+    }
+    state.smooth_count += (target_count - state.smooth_count) * (1.0 - (-3.0 * dt).exp());
+    let count = (state.smooth_count as u32).clamp(1, user_count);
     // Julia morph: music orbits the Julia parameter around its home value, so
     // the fractal shape itself dances. The GPU never sees c directly - the
     // reference orbit encodes it - so a changed c just means a fresh orbit
@@ -592,13 +653,13 @@ fn update_params(
     // Only recompute (and re-upload, via the generation bump) when the view
     // center, iteration count, or Julia c actually changed; a static view
     // with no morph pays nothing.
-    if *last_orbit_key != Some((view.center, max_iter, fractal.0, jc)) {
-        ref_orbit.points = reference_orbit(view.center.x, view.center.y, max_iter, fractal.0, jc);
+    if state.last_orbit_key != Some((view.center, max_iter, fractal.0, jc)) {
+        ref_orbit.points = reference_orbit(view.center, max_iter, fractal.0, jc);
         ref_orbit.generation = ref_orbit.generation.wrapping_add(1);
-        *last_orbit_key = Some((view.center, max_iter, fractal.0, jc));
+        state.last_orbit_key = Some((view.center, max_iter, fractal.0, jc));
     }
 
-    *frame = frame.wrapping_add(1);
+    state.frame = state.frame.wrapping_add(1);
 
     let px = settings.dot_px;
     let u = &mut params.0;
@@ -649,7 +710,7 @@ fn update_params(
         u.trail_decay = 0.0;
     }
     u.ref_len = ref_orbit.points.len() as u32;
-    u.frame = *frame;
+    u.frame = state.frame;
     u.reseed_rate = reseed_rate;
     u.detail = settings.detail;
     u.color_mode = color_mode.0;
@@ -694,6 +755,7 @@ fn update_title(
     time: Res<Time>,
     diagnostics: Res<DiagnosticsStore>,
     settings: Res<Settings>,
+    params: Res<SimParams>,
     recorder: Res<Recorder>,
     mut windows: Query<&mut Window>,
     mut timer: Local<f32>,
@@ -708,10 +770,18 @@ fn update_title(
         .and_then(|d| d.smoothed())
         .unwrap_or(0.0);
     let rec = if recorder.is_active() { " | REC" } else { "" };
+    // Live count, not the setting: deep zoom trades particles for iterations,
+    // so the two diverge and the live number is the one that explains the FPS.
+    let live = params.0.count;
+    let depth = if live < settings.particle_count {
+        format!(" of {}", settings.particle_count)
+    } else {
+        String::new()
+    };
     if let Ok(mut window) = windows.single_mut() {
         window.title = format!(
-            "Fractality | {} particles | {:.0} FPS{rec} | wheel zoom, WASD pan, M menu",
-            settings.particle_count, fps
+            "Fractality | {live}{depth} particles | {} iter | {:.0} FPS{rec} | wheel zoom, WASD pan, M menu",
+            params.0.max_iter, fps
         );
     }
 }
