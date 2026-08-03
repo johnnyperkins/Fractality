@@ -162,7 +162,7 @@ impl Setting {
             Setting::Detail => (0.5, 8.0),
             Setting::FlowSpeed => (0.0, 0.4),
             Setting::AlignForce => (0.0, 200.0),
-            Setting::Condensation => (0.0, 2.0),
+            Setting::Condensation => (0.0, 5.0),
             Setting::Brightness => (0.1, 4.0),
             Setting::DotSize => (0.1, 4.0),
             Setting::Bloom => (0.0, 1.0),

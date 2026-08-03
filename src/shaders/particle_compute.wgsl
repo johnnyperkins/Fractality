@@ -168,7 +168,11 @@ fn inv_log2_power() -> f32 {
 fn calm_of(f: f32) -> f32 {
     let cond = params.shape.x;
     let depth = f / f32(params.max_iter) * params.detail;
-    let freeze = min(0.95 * cond, 0.998);
+    // Freeze depth: residual shell speed is 0.05/cond^4 of flow speed, so
+    // every extra slider unit keeps deadening the shell instead of
+    // saturating (1 -> 5%, 2 -> 0.3%, 5 -> 0.008%, solid). cond = 0 kills
+    // the divide via the max() and freezes nothing.
+    let freeze = clamp(1.0 - 0.05 / max(cond * cond * cond * cond, 1e-6), 0.0, 0.9999);
     return 1.0 - freeze * smoothstep(0.25, 0.75, depth * cond);
 }
 
