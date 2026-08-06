@@ -49,7 +49,8 @@ struct Params {
     // 16 log-spaced spectrum bins (unused here; layout parity).
     spectrum: array<vec4<f32>, 4>,
     // Shape/dynamics tuning: x condensation (boundary freeze strength and
-    // reach; 1 = classic), yzw spare.
+    // reach; 1 = classic), y previous flow mode, z flow crossfade blend
+    // (0 = all previous mode, 1 = all current), w spare.
     shape: vec4<f32>,
 };
 
@@ -343,6 +344,114 @@ fn rand01(state: ptr<function, u32>) -> f32 {
     return f32(*state) * (1.0 / 4294967296.0);
 }
 
+// Band-pull weight per flow mode. Gravity/erupt/dynamics are free-flowing:
+// particles cross contours by design, so the band pull (and its
+// normal-velocity bleed, which would project all motion onto the tangent)
+// must not fight them. The recycle trickle respawns drifters back onto the
+// boundary. A weight rather than a bool so a mode crossfade can ramp the
+// pull in or out instead of snapping it.
+fn pull_of(mode: u32) -> f32 {
+    return select(1.0, 0.0, mode == 2u || mode == 3u || mode == 5u);
+}
+
+// Desired flow velocity for one flow mode. Split out of the update loop so a
+// mode switch can evaluate BOTH the outgoing and incoming fields and
+// crossfade them (shape.z ramps 0 to 1) instead of hard-cutting.
+fn flow_desired(
+    mode: u32,
+    gn: vec2<f32>,
+    tangent: vec2<f32>,
+    band: f32,
+    settle: f32,
+    calm: f32,
+    base: f32,
+    correct: vec2<f32>,
+    zesc: vec2<f32>,
+) -> vec2<f32> {
+    var desired: vec2<f32>;
+    switch mode {
+        case 1u: {
+            // Layers: adjacent iso-bands stream in opposite directions,
+            // so neighboring contour ribbons shear past each other.
+            let s = select(1.0, -1.0, fract(band * 0.25) < 0.5);
+            desired = tangent * s * settle * calm * base + correct;
+        }
+        case 2u: {
+            // Gravity: everything rains inward along the gradient and
+            // piles up on the shell (calm freezes it there). The band
+            // pull is disabled below so nothing fights the fall.
+            desired = gn * settle * calm * base * 2.0;
+        }
+        case 3u: {
+            // Erupt: particles boil off the set outward; recycling
+            // reseeds the boundary so the fountain never runs dry.
+            desired = -gn * mix(0.3, 1.0, settle) * base * 2.0;
+        }
+        case 5u: {
+            // Dynamics: steer by the particle's own orbit escape angle.
+            // Iterated squaring doubles the angle every step, so
+            // arg(z_escape) decorrelates at the finest visible filament
+            // scale at ANY zoom depth (the binary-decomposition cells of
+            // the fractal), unlike a fixed map field which flattens to a
+            // constant direction once the view is tiny next to C. The
+            // slow time drift keeps the whole pattern churning. Free
+            // flow (no band pull): particles ride the direction cells
+            // across contours like wind, and the recycle trickle keeps
+            // repainting the boundary behind them. Calm only softens
+            // (not freezes) on the shell so the streams stay alive.
+            let ze = zesc;
+            let m = dot(ze, ze);
+            if (m > 1e-12) {
+                let a0 = atan2(ze.y, ze.x);
+                // u is the fractional-iteration coordinate (escape
+                // overshoot) - it varies ACROSS bands, so any monotonic
+                // use of it paints band-parallel stripes. Keep it only
+                // as a gentle wave phase.
+                let u = 0.5 * log2(max(m, 1.0));
+                // Ray angle tripled: the external-ray pinwheel cells
+                // run perpendicular to the iteration bands, so scaling
+                // a0 (not u) makes transverse structure dominate and
+                // kills the layered look. The sine waves each stream
+                // serpentine over time, phased by both coordinates so
+                // neighboring eddies desync. audio_hue spins the whole
+                // field with music energy, and each detected beat adds
+                // a sharp extra twist that decays with the beat pulse
+                // (both exactly zero when audio is off).
+                let av = a0 * 3.0
+                    + 0.5 * sin(u * 2.4 + a0 + params.time * 0.7)
+                    + params.time * 0.25 + params.audio_hue
+                    + params.audio.w * 1.2;
+                // Geometry-anchored wind: rotate the LOCAL contour
+                // normal by the cell angle instead of using a fixed
+                // screen direction. gn turns with the fractal's shape,
+                // so streams curl around filaments and spiral into
+                // bulbs rather than blowing in straight lines across
+                // them. gn is unit length, so the rotation is too.
+                let dir = vec2<f32>(
+                    gn.x * cos(av) - gn.y * sin(av),
+                    gn.x * sin(av) + gn.y * cos(av),
+                );
+                // Speed lanes: gentle per-cell magnitude variation so
+                // the wind has gusts instead of one uniform pace. The
+                // calm floor stays high - a low floor made deep bands
+                // crawl at 1/3 speed, itself a layering artifact - and
+                // settle gets a floor for the same reason (raw settle
+                // tracks band error, another band-parallel signal).
+                let gust = 0.75 + 0.25 * sin(a0 * 5.0 + u - params.time * 0.5);
+                desired = dir * mix(0.6, 1.0, settle)
+                    * mix(0.55, 1.0, calm) * base * 1.5 * gust;
+            } else {
+                desired = correct;
+            }
+        }
+        default: {
+            // Contour (classic): advect along iso-lines.
+            desired = tangent * settle * calm * base + correct;
+        }
+    }
+    return desired;
+}
+
 @compute @workgroup_size(256)
 fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
@@ -461,12 +570,18 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
     var to_band = 0.0;
     var on_contour = false;
     var calm = 1.0;
-    // Gravity/erupt/dynamics are free-flowing: particles cross contours by
-    // design, so the band pull (and its normal-velocity bleed, which would
-    // project all motion onto the tangent) must not fight them. The recycle
-    // trickle respawns drifters back onto the boundary.
-    let free_flow = params.flow_mode == 2u || params.flow_mode == 3u
-        || params.flow_mode == 5u;
+    // Flow-mode crossfade: on a switch, shape.y holds the outgoing mode and
+    // shape.z ramps 0 to 1 over ~2s. Smoothstep eases both endpoints. All
+    // mode-dependent behavior blends by this weight: the desired field, the
+    // pulse band wave, and the band-pull strength (pull_w, replacing the old
+    // free_flow bool - see pull_of).
+    let prev_mode = u32(params.shape.y + 0.5);
+    let blend = smoothstep(0.0, 1.0, params.shape.z);
+    let morphing = blend < 1.0 && prev_mode != params.flow_mode;
+    var pull_w = pull_of(params.flow_mode);
+    if (morphing) {
+        pull_w = mix(pull_of(prev_mode), pull_w, blend);
+    }
     // Upper bound rejects the rare overflowed derivative (inf gl) so gn stays
     // finite; NaN gl fails the compare and also falls through to the home pull.
     if (gl > 1e-4 && gl < 1e30 && f0 < f32(params.max_iter) - 0.5) {
@@ -477,8 +592,12 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
         // shifted band feeds both the tangential error and the positional
         // pull below, so the whole cloud follows the wave coherently.
         var band = p.band;
-        if (params.flow_mode == 4u) {
-            band += sin(params.time * 1.1 + p.band * 1.7) * 1.5;
+        var pulse_w = select(0.0, 1.0, params.flow_mode == 4u);
+        if (morphing) {
+            pulse_w = mix(select(0.0, 1.0, prev_mode == 4u), pulse_w, blend);
+        }
+        if (pulse_w > 0.0) {
+            band += sin(params.time * 1.1 + p.band * 1.7) * 1.5 * pulse_w;
         }
         let band_err = band - f0;
         let err = clamp(band_err * 0.7, -2.0, 2.0);
@@ -499,89 +618,17 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
         // holds those particles instead. Keep it strong only for outer flow.
         let base = params.flow_speed * view_height;
         let correct = gn * err * mix(0.25, 1.0, calm) * base;
-        switch params.flow_mode {
-            case 1u: {
-                // Layers: adjacent iso-bands stream in opposite directions,
-                // so neighboring contour ribbons shear past each other.
-                let s = select(1.0, -1.0, fract(band * 0.25) < 0.5);
-                desired = tangent * s * settle * calm * base + correct;
-            }
-            case 2u: {
-                // Gravity: everything rains inward along the gradient and
-                // piles up on the shell (calm freezes it there). The band
-                // pull is disabled below so nothing fights the fall.
-                desired = gn * settle * calm * base * 2.0;
-            }
-            case 3u: {
-                // Erupt: particles boil off the set outward; recycling
-                // reseeds the boundary so the fountain never runs dry.
-                desired = -gn * mix(0.3, 1.0, settle) * base * 2.0;
-            }
-            case 5u: {
-                // Dynamics: steer by the particle's own orbit escape angle.
-                // Iterated squaring doubles the angle every step, so
-                // arg(z_escape) decorrelates at the finest visible filament
-                // scale at ANY zoom depth (the binary-decomposition cells of
-                // the fractal), unlike a fixed map field which flattens to a
-                // constant direction once the view is tiny next to C. The
-                // slow time drift keeps the whole pattern churning. Free
-                // flow (no band pull): particles ride the direction cells
-                // across contours like wind, and the recycle trickle keeps
-                // repainting the boundary behind them. Calm only softens
-                // (not freezes) on the shell so the streams stay alive.
-                let ze = fg.zesc;
-                let m = dot(ze, ze);
-                if (m > 1e-12) {
-                    let a0 = atan2(ze.y, ze.x);
-                    // u is the fractional-iteration coordinate (escape
-                    // overshoot) - it varies ACROSS bands, so any monotonic
-                    // use of it paints band-parallel stripes. Keep it only
-                    // as a gentle wave phase.
-                    let u = 0.5 * log2(max(m, 1.0));
-                    // Ray angle tripled: the external-ray pinwheel cells
-                    // run perpendicular to the iteration bands, so scaling
-                    // a0 (not u) makes transverse structure dominate and
-                    // kills the layered look. The sine waves each stream
-                    // serpentine over time, phased by both coordinates so
-                    // neighboring eddies desync. audio_hue spins the whole
-                    // field with music energy, and each detected beat adds
-                    // a sharp extra twist that decays with the beat pulse
-                    // (both exactly zero when audio is off).
-                    let av = a0 * 3.0
-                        + 0.5 * sin(u * 2.4 + a0 + params.time * 0.7)
-                        + params.time * 0.25 + params.audio_hue
-                        + params.audio.w * 1.2;
-                    // Geometry-anchored wind: rotate the LOCAL contour
-                    // normal by the cell angle instead of using a fixed
-                    // screen direction. gn turns with the fractal's shape,
-                    // so streams curl around filaments and spiral into
-                    // bulbs rather than blowing in straight lines across
-                    // them. gn is unit length, so the rotation is too.
-                    let dir = vec2<f32>(
-                        gn.x * cos(av) - gn.y * sin(av),
-                        gn.x * sin(av) + gn.y * cos(av),
-                    );
-                    // Speed lanes: gentle per-cell magnitude variation so
-                    // the wind has gusts instead of one uniform pace. The
-                    // calm floor stays high - a low floor made deep bands
-                    // crawl at 1/3 speed, itself a layering artifact - and
-                    // settle gets a floor for the same reason (raw settle
-                    // tracks band error, another band-parallel signal).
-                    let gust = 0.75 + 0.25 * sin(a0 * 5.0 + u - params.time * 0.5);
-                    desired = dir * mix(0.6, 1.0, settle)
-                        * mix(0.55, 1.0, calm) * base * 1.5 * gust;
-                } else {
-                    desired = correct;
-                }
-            }
-            default: {
-                // Contour (classic): advect along iso-lines.
-                desired = tangent * settle * calm * base + correct;
-            }
+        desired = flow_desired(params.flow_mode, gn, tangent, band,
+            settle, calm, base, correct, fg.zesc);
+        if (morphing) {
+            desired = mix(
+                flow_desired(prev_mode, gn, tangent, band,
+                    settle, calm, base, correct, fg.zesc),
+                desired, blend);
         }
         // Spatial distance from the particle to its home contour along the
         // normal: (band - f0) is the field-unit error, /gl converts to distance.
-        if (!free_flow) {
+        if (pull_w > 0.0) {
             to_band = clamp((band - f0) / gl, -view_height, view_height);
         }
         on_contour = true;
@@ -647,8 +694,10 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
         // normal gives the slow melt off the contours.
         let jitter = (rand01(&seed) * 2.0 - 1.0) * view_height * 0.008;
         p.pos += gn * jitter;
-    } else if (on_contour && dt > 0.0 && !free_flow) {
-        let alpha = clamp(params.band_k * dt, 0.0, 1.0);
+    } else if (on_contour && dt > 0.0 && pull_w > 0.0) {
+        // pull_w scales alpha so a crossfade into or out of a free-flow mode
+        // ramps the pull (step, jitter, and normal-velocity bleed) smoothly.
+        let alpha = clamp(params.band_k * dt, 0.0, 1.0) * pull_w;
         // Cap the per-frame pull step to a small fraction of the view. The
         // field varies violently near the boundary, so even the exact
         // local gradient changes direction step to step; an uncapped snap

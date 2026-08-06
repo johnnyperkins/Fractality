@@ -557,6 +557,13 @@ struct ParamState {
     /// snapping. Zero means "not yet initialized".
     smooth_count: f32,
     last_orbit_key: Option<(DdVec2, u32, u32, (f64, f64))>,
+    /// Flow-mode crossfade: the last mode seen (change detector), the mode
+    /// being faded out, and when the switch happened. Defaults (all zero)
+    /// mean "prev == current, ramp long done", which the shader treats as
+    /// no morph.
+    last_flow: u32,
+    flow_prev: u32,
+    morph_t0: f32,
 }
 
 fn update_params(
@@ -756,7 +763,24 @@ fn update_params(
     for i in 0..4 {
         u.spectrum[i] = Vec4::from_slice(&audio.spectrum[i * 4..i * 4 + 4]);
     }
-    u.shape = Vec4::new(settings.condensation, 0.0, 0.0, 0.0);
+    // Flow-mode crossfade: on a switch (G key or menu), remember the old
+    // mode and restart the 2s ramp. The compute shader evaluates both flow
+    // fields while shape.z < 1 and blends them, so mode changes melt into
+    // each other instead of hard-cutting. Switching again mid-morph fades
+    // from the new mode's start, which the velocity smoothing absorbs.
+    let now = time.elapsed_secs();
+    if flow_mode.0 != state.last_flow {
+        state.flow_prev = state.last_flow;
+        state.morph_t0 = now;
+        state.last_flow = flow_mode.0;
+    }
+    let flow_blend = ((now - state.morph_t0) / 2.0).clamp(0.0, 1.0);
+    u.shape = Vec4::new(
+        settings.condensation,
+        state.flow_prev as f32,
+        flow_blend,
+        0.0,
+    );
 }
 
 fn update_title(
