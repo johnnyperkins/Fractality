@@ -8,7 +8,9 @@ use bevy::ui::RelativeCursorPosition;
 
 use crate::audio::{AudioCapture, AudioLevels};
 use crate::particles::MAX_PARTICLES;
-use crate::{ColorMode, FlowMode, FractalType, Kaleido, COLOR_MODES, FLOW_MODES, FRACTAL_MODES};
+use crate::{
+    Attract, ColorMode, FlowMode, FractalType, Kaleido, COLOR_MODES, FLOW_MODES, FRACTAL_MODES,
+};
 
 /// Live-tunable knobs. Source of truth for the whole app.
 #[derive(Resource)]
@@ -320,6 +322,14 @@ struct KaleidoValue;
 #[derive(Component)]
 struct KaleidoSection;
 
+/// Clickable "Choreographer" row; clicking toggles the autopilot (same as X).
+#[derive(Component)]
+struct AttractRow;
+
+/// The text showing whether attract mode is on.
+#[derive(Component)]
+struct AttractValue;
+
 /// Clickable "Audio react" row; clicking toggles audio reactivity (same as V).
 #[derive(Component)]
 struct AudioRow;
@@ -364,6 +374,8 @@ impl Plugin for MenuPlugin {
                     update_flow_text,
                     click_kaleido,
                     sync_kaleido_ui,
+                    click_attract,
+                    sync_attract_ui,
                     click_audio,
                     sync_audio_ui,
                     apply_bloom,
@@ -385,7 +397,7 @@ fn label_bundle(setting: Setting) -> impl Bundle {
         },
         TextColor(Color::srgb(0.80, 0.85, 0.95)),
         Node {
-            width: Val::Px(110.0),
+            width: Val::Px(116.0),
             ..default()
         },
     )
@@ -477,7 +489,7 @@ fn value_row(
                 },
                 TextColor(Color::srgb(0.80, 0.85, 0.95)),
                 Node {
-                    width: Val::Px(110.0),
+                    width: Val::Px(116.0),
                     ..default()
                 },
             ),
@@ -516,7 +528,7 @@ fn control_bundle(text: &str) -> impl Bundle {
     )
 }
 
-const CONTROLS: [&str; 11] = [
+const CONTROLS: [&str; 12] = [
     "W / A / S / D  pan",
     "Scroll  zoom at cursor",
     "Left hold  blast   Right hold  vortex",
@@ -524,6 +536,7 @@ const CONTROLS: [&str; 11] = [
     "Z  auto-zoom dive   C  color mode",
     "F  fractal type   G  flow mode",
     "K  kaleidoscope   V  audio reactivity",
+    "X  auto-choreographer (idle 30s too)",
     "P  screenshot",
     "Shift+1..9  save view   1..9  fly to it",
     "R  reset view",
@@ -575,7 +588,7 @@ fn build_menu(mut commands: Commands) {
                     row.spawn((
                         Node {
                             position_type: PositionType::Absolute,
-                            left: Val::Px(120.0),
+                            left: Val::Px(126.0),
                             top: Val::Px(22.0),
                             flex_direction: FlexDirection::Column,
                             padding: UiRect::all(Val::Px(4.0)),
@@ -647,6 +660,7 @@ fn build_menu(mut commands: Commands) {
                         col.spawn(row_bundle(setting));
                     }
                 });
+            parent.spawn(value_row("Choreographer", "off", AttractRow, AttractValue));
             parent.spawn(value_row("Audio react", "off", AudioRow, AudioValue));
             parent
                 .spawn((
@@ -900,6 +914,37 @@ fn sync_kaleido_ui(
     }
     for mut node in &mut sections {
         node.display = if kaleido.on { Display::Flex } else { Display::None };
+    }
+}
+
+/// Clicking the row toggles attract mode, same as the X key. The click only
+/// files a request; update_attract does the engage/disengage (it owns the
+/// save/restore of the settings the autopilot touches).
+fn click_attract(
+    mut attract: ResMut<Attract>,
+    rows: Query<&Interaction, (Changed<Interaction>, With<AttractRow>)>,
+) {
+    for interaction in &rows {
+        if *interaction == Interaction::Pressed {
+            attract.want_toggle = true;
+        }
+    }
+}
+
+/// Keep the on/off label in sync however the toggle happens (click, X, idle
+/// engagement, input exit). Attract's timers tick every frame so is_changed
+/// always fires; diff the actual flag through a Local instead.
+fn sync_attract_ui(
+    attract: Res<Attract>,
+    mut texts: Query<&mut Text, With<AttractValue>>,
+    mut last: Local<Option<bool>>,
+) {
+    if *last == Some(attract.on) {
+        return;
+    }
+    *last = Some(attract.on);
+    for mut text in &mut texts {
+        *text = Text::new(if attract.on { "on" } else { "off" });
     }
 }
 

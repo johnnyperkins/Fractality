@@ -304,7 +304,7 @@ pub struct ParticleSeed(pub Arc<Vec<Particle>>);
 /// Smooth escape-time field on the CPU (f64). The formula and the escape
 /// radius (256.0) must be identical to field() in the WGSL shaders so that
 /// CPU band values match GPU field values.
-fn smooth_iter(x: f64, y: f64, max_iter: u32, ftype: u32) -> f32 {
+pub fn smooth_iter(x: f64, y: f64, max_iter: u32, ftype: u32) -> f32 {
     let (mut zx, mut zy, cx, cy) = orbit_start(x, y, ftype, JULIA_C);
     let ilp = inv_log2_power(ftype);
     for i in 0..max_iter {
