@@ -251,8 +251,14 @@ impl Setting {
 }
 
 /// Whether the panel is currently shown.
-#[derive(Resource, Default)]
+#[derive(Resource)]
 pub struct MenuOpen(pub bool);
+
+impl Default for MenuOpen {
+    fn default() -> Self {
+        Self(true)
+    }
+}
 
 /// True while the cursor is over the panel or a slider drag is in progress,
 /// so the sim ignores those clicks (see update_params in main.rs). Clicks on
@@ -537,7 +543,8 @@ fn build_menu(mut commands: Commands) {
                 ..default()
             },
             BackgroundColor(Color::srgba(0.04, 0.05, 0.09, 0.88)),
-            Visibility::Hidden,
+            // Starts visible to match MenuOpen's default.
+            Visibility::Visible,
             // Interaction on the root reports Hovered anywhere over the panel,
             // which track_pointer_over_menu uses to shield the sim from clicks.
             Interaction::default(),

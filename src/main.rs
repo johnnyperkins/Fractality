@@ -310,7 +310,14 @@ fn main() {
         .run();
 }
 
-fn setup(mut commands: Commands, settings: Res<Settings>) {
+fn setup(
+    mut commands: Commands,
+    settings: Res<Settings>,
+    mut windows: Query<&mut Window>,
+) {
+    if let Ok(mut window) = windows.single_mut() {
+        window.set_maximized(true);
+    }
     commands.spawn((
         Camera2d,
         Camera {
