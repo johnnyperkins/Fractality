@@ -515,7 +515,13 @@ impl FromWorld for ParticlePipelines {
                     write_mask: ColorWrites::ALL,
                 })],
             }),
-            primitive: PrimitiveState::default(),
+            // Strip: 4 vertices per particle quad instead of 6 (strips restart
+            // between instances), cutting the heavy per-vertex color work by a
+            // third. Corner derivation in the shader matches strip order.
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleStrip,
+                ..default()
+            },
             depth_stencil: None,
             multisample: MultisampleState::default(),
             zero_initialize_workgroup_memory: false,
@@ -886,7 +892,7 @@ impl ViewNode for ParticleDrawNode {
             }
             pass.set_render_pipeline(pipeline);
             pass.set_bind_group(0, &bind_groups.render, &[]);
-            pass.draw(0..6, 0..count);
+            pass.draw(0..4, 0..count);
         }
         if let Some((trail, _, composite)) = trail {
             let mut pass = render_context.begin_tracked_render_pass(RenderPassDescriptor {

@@ -250,10 +250,17 @@ fn field_grad(dc: vec2<f32>) -> FieldGrad {
     var der = vec2<f32>(select(0.0, 1.0, params.fractal_type == 4u), 0.0);
     var ri: u32 = 0u;
     var z_ref = ref0;
+    // Full z_n, carried across iterations: the z computed at the bottom of
+    // the loop IS the next iteration's full value (bit-exact in the
+    // non-rebase path, since ref_add(z_ref_next, dz) uses the same inputs;
+    // the rebase fold reconstructs the same value to ~1 ulp, and the only
+    // consumer is the approximation-tolerant derivative). Recomputing it
+    // with ref_add at the top of every iteration was pure redundancy in the
+    // hottest loop of the shader.
+    var z_full = ref_add(ref0, dz);
     let last = params.ref_len - 1u;
     let ilp = inv_log2_power();
     for (var n: u32 = 0u; n < params.max_iter; n = n + 1u) {
-        let z_full = ref_add(z_ref, dz); // full z_n
         der = step_der(z_full, der);
         dz = step_dz(z_ref.xy, dz, dc);
         ri = ri + 1u;
@@ -272,6 +279,7 @@ fn field_grad(dc: vec2<f32>) -> FieldGrad {
         } else {
             z_ref = z_ref_next;
         }
+        z_full = z;
     }
     return FieldGrad(f32(params.max_iter), vec2<f32>(0.0, 0.0), vec2<f32>(0.0, 0.0));
 }
@@ -550,6 +558,12 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
             p.vel += beat_impulse(p.pos, view_height) * dt;
             p.vel *= max(0.0, 1.0 - params.damping * dt);
             p.pos += p.vel * dt;
+        } else if (all(params.center_delta == vec2<f32>(0.0))) {
+            // Parked view, no wave: the rebase above added zero and nothing
+            // else touched the particle, so skip the 32-byte writeback. On a
+            // static view this drops the store for 3 of 4 frames of every
+            // calm shell particle - most of the cloud.
+            return;
         }
         particles[idx] = p;
         return;

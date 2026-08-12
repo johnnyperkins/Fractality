@@ -74,4 +74,7 @@ opt-level = 3
 debug = false
 [profile.release]
 lto = "thin"
+# One codegen unit: better inlining/vectorization in the CPU hot paths (DD
+# reference orbit, particle generation, FFT). Costs link time, not runtime.
+codegen-units = 1
 strip = true

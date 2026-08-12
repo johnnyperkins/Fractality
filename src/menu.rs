@@ -735,7 +735,12 @@ fn track_pointer_over_menu(
         Or<(With<MenuRoot>, With<SliderTrack>, With<MenuInteractive>)>,
     >,
 ) {
-    over.0 = widgets.iter().any(|i| *i != Interaction::None);
+    let now = widgets.iter().any(|i| *i != Interaction::None);
+    // Write only on transitions so the resource is not marked changed every
+    // frame.
+    if over.0 != now {
+        over.0 = now;
+    }
 }
 
 /// While a track is pressed, map cursor x to the setting's range. Interaction
@@ -751,16 +756,22 @@ fn drag_sliders(
     )>,
 ) {
     for (interaction, rel, track, mut bg) in &mut tracks {
-        match interaction {
+        // Compare before writing: an unconditional write marks every track's
+        // BackgroundColor changed every frame, re-extracting them all into
+        // the render world.
+        let color = match interaction {
             Interaction::Pressed => {
-                bg.0 = TRACK_HOVER;
                 if let Some(pos) = rel.normalized {
                     let (lo, hi) = track.0.range();
                     track.0.set(&mut settings, lo + pos.x.clamp(0.0, 1.0) * (hi - lo));
                 }
+                TRACK_HOVER
             }
-            Interaction::Hovered => bg.0 = TRACK_HOVER,
-            Interaction::None => bg.0 = TRACK_IDLE,
+            Interaction::Hovered => TRACK_HOVER,
+            Interaction::None => TRACK_IDLE,
+        };
+        if bg.0 != color {
+            bg.0 = color;
         }
     }
 }
@@ -771,7 +782,12 @@ fn update_sliders(
     mut values: Query<(&mut Text, &SettingValue)>,
     mut fills: Query<(&mut Node, &SliderFill)>,
 ) {
-    if !open.0 {
+    // Rewriting the texts and fill widths unconditionally forced a text
+    // reshape and a full UI relayout every frame the menu was open (and it
+    // opens by default). Settings change only via slider drags or the
+    // choreographer's style ticks; refresh only then, plus on reopen so the
+    // panel never shows stale values.
+    if !open.0 || (!settings.is_changed() && !open.is_changed()) {
         return;
     }
     for (mut text, sv) in &mut values {
@@ -982,13 +998,36 @@ fn sync_audio_ui(
 
 /// Bloom follows the slider; with audio reactivity on, bass and beats pump it
 /// every frame. Once the levels have decayed to idle, only a slider change
-/// re-applies.
-fn apply_bloom(settings: Res<Settings>, audio: Res<AudioLevels>, mut bloom: Query<&mut Bloom>) {
+/// re-applies. At zero the component is removed entirely: Bevy's bloom node
+/// only runs for views that carry it, so slider 0 skips the whole
+/// downsample/upsample mip chain instead of computing a no-op blur.
+fn apply_bloom(
+    settings: Res<Settings>,
+    audio: Res<AudioLevels>,
+    mut cameras: Query<(Entity, Option<&mut Bloom>), With<Camera>>,
+    mut commands: Commands,
+) {
     if audio.is_idle() && !settings.is_changed() {
         return;
     }
     let target = settings.bloom * (1.0 + audio.bass * 1.1 + audio.beat * 0.6);
-    for mut b in &mut bloom {
-        b.intensity = target;
+    for (entity, bloom) in &mut cameras {
+        match bloom {
+            Some(mut b) if target > 0.0 => {
+                if b.intensity != target {
+                    b.intensity = target;
+                }
+            }
+            Some(_) => {
+                commands.entity(entity).remove::<Bloom>();
+            }
+            None if target > 0.0 => {
+                commands.entity(entity).insert(Bloom {
+                    intensity: target,
+                    ..Bloom::NATURAL
+                });
+            }
+            None => {}
+        }
     }
 }

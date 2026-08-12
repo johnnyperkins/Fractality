@@ -74,14 +74,14 @@ fn vs(
     @builtin(instance_index) instance_index: u32,
 ) -> VsOut {
     // Quad corner from the vertex index without a runtime-indexed array
-    // (which naga lowers to per-vertex private memory). Vertices 0..5 map to
-    // corner ids 0,1,2 / 2,3,0 - two triangles covering the quad - and corner
-    // id c walks (-1,-1),(1,-1),(1,1),(-1,1) counterclockwise. Culling is off,
-    // so winding is irrelevant.
-    let c = (vertex_index % 3u + (vertex_index / 3u) * 2u) % 4u;
+    // (which naga lowers to per-vertex private memory). Drawn as a 4-vertex
+    // triangle strip per instance (strips restart between instances), so the
+    // per-vertex color work below runs 4x per particle instead of the 6x a
+    // triangle list cost. Vertices 0..3 walk (-1,-1),(1,-1),(-1,1),(1,1).
+    // Culling is off, so winding is irrelevant.
     let corner = vec2<f32>(
-        select(-1.0, 1.0, c == 1u || c == 2u),
-        select(-1.0, 1.0, c >= 2u),
+        select(-1.0, 1.0, (vertex_index & 1u) == 1u),
+        select(-1.0, 1.0, vertex_index >= 2u),
     );
     let p = particles[instance_index];
 
