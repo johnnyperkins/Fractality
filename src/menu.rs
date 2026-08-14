@@ -1,10 +1,13 @@
-// In-app settings menu (native bevy_ui, no extra deps). Toggle with Esc or M.
-// Each row is a label + draggable slider + value readout driven by the Settings
-// resource, which the sim reads live every frame (see update_params in main.rs).
+// In-app settings panel (native bevy_ui, no extra deps). Toggle with Esc or M.
+// Layout is a fixed-width column of cards; each card is a titled group of rows.
+// Rows come in three shapes - slider (label + track + readout), select (label +
+// value chip + dropdown), toggle (label + pill switch) - all driven by the
+// Settings resource and the mode resources, which the sim reads live every
+// frame (see update_params in main.rs).
 
 use bevy::core_pipeline::bloom::Bloom;
 use bevy::prelude::*;
-use bevy::ui::RelativeCursorPosition;
+use bevy::ui::{ComputedNode, RelativeCursorPosition};
 
 use crate::audio::{AudioCapture, AudioLevels};
 use crate::particles::MAX_PARTICLES;
@@ -108,13 +111,17 @@ pub enum Setting {
     KaleidoSpin,
 }
 
-/// Rows, in display order.
-const SETTINGS: [Setting; 9] = [
+/// Sim-shaping rows.
+const SIM_SETTINGS: [Setting; 5] = [
     Setting::ParticleCount,
     Setting::Detail,
     Setting::FlowSpeed,
     Setting::AlignForce,
     Setting::Condensation,
+];
+
+/// Look rows (nothing here changes particle motion).
+const RENDER_SETTINGS: [Setting; 4] = [
     Setting::Brightness,
     Setting::DotSize,
     Setting::Bloom,
@@ -252,6 +259,104 @@ impl Setting {
     }
 }
 
+/// The three list-valued modes. One row shape, one dropdown, one set of
+/// handlers for all of them; the per-mode resource is picked in get/set.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Select {
+    Fractal,
+    Flow,
+    Palette,
+}
+
+const SELECTS: [Select; 3] = [Select::Fractal, Select::Flow, Select::Palette];
+
+impl Select {
+    fn label(self) -> &'static str {
+        match self {
+            Select::Fractal => "Fractal",
+            Select::Flow => "Flow",
+            Select::Palette => "Palette",
+        }
+    }
+
+    /// Key that cycles the same value, shown as a chip on the row.
+    fn key(self) -> &'static str {
+        match self {
+            Select::Fractal => "F",
+            Select::Flow => "G",
+            Select::Palette => "C",
+        }
+    }
+
+    fn options(self) -> &'static [&'static str] {
+        match self {
+            Select::Fractal => &FRACTAL_MODES,
+            Select::Flow => &FLOW_MODES,
+            Select::Palette => &COLOR_MODES,
+        }
+    }
+
+    fn get(self, fractal: &FractalType, flow: &FlowMode, palette: &ColorMode) -> u32 {
+        match self {
+            Select::Fractal => fractal.0,
+            Select::Flow => flow.0,
+            Select::Palette => palette.0,
+        }
+    }
+
+    /// Writes only on a real change: a ResMut deref marks the resource changed
+    /// even when the value is identical, and the sim resets its view on a
+    /// fractal change.
+    fn set(
+        self,
+        index: u32,
+        fractal: &mut ResMut<FractalType>,
+        flow: &mut ResMut<FlowMode>,
+        palette: &mut ResMut<ColorMode>,
+    ) {
+        match self {
+            Select::Fractal if fractal.0 != index => fractal.0 = index,
+            Select::Flow if flow.0 != index => flow.0 = index,
+            Select::Palette if palette.0 != index => palette.0 = index,
+            _ => {}
+        }
+    }
+}
+
+/// The three on/off features, each a pill-switch row.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Toggle {
+    Kaleido,
+    Choreographer,
+    Audio,
+}
+
+impl Toggle {
+    fn label(self) -> &'static str {
+        match self {
+            Toggle::Kaleido => "Kaleidoscope",
+            Toggle::Choreographer => "Choreographer",
+            Toggle::Audio => "Audio react",
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Toggle::Kaleido => "K",
+            Toggle::Choreographer => "X",
+            Toggle::Audio => "V",
+        }
+    }
+
+    fn state(self, kaleido: &Kaleido, attract: &Attract, audio: &AudioCapture) -> bool {
+        match self {
+            Toggle::Kaleido => kaleido.on,
+            Toggle::Choreographer => attract.on,
+            Toggle::Audio => audio.enabled,
+        }
+    }
+}
+
 /// Whether the panel is currently shown.
 #[derive(Resource)]
 pub struct MenuOpen(pub bool);
@@ -277,79 +382,53 @@ struct SettingValue(Setting);
 #[derive(Component)]
 struct SliderTrack(Setting);
 
-/// Clickable "Color mode" row; clicking cycles the palette (same as C).
-#[derive(Component)]
-struct ColorModeRow;
-
-/// The text showing the active palette name.
-#[derive(Component)]
-struct ColorModeValue;
-
-/// Clickable "Fractal" row; clicking cycles the fractal type (same as F).
-#[derive(Component)]
-struct FractalRow;
-
-/// The text showing the active fractal name.
-#[derive(Component)]
-struct FractalValue;
-
-/// Clickable "Flow" row; clicking opens/closes the flow-mode dropdown.
-#[derive(Component)]
-struct FlowRow;
-
-/// The text showing the active flow mode name.
-#[derive(Component)]
-struct FlowValue;
-
-/// The dropdown list itself (hidden until the row is clicked).
-#[derive(Component)]
-struct FlowDropdown;
-
-/// One selectable entry in the flow dropdown.
-#[derive(Component)]
-struct FlowOption(u32);
-
-/// Clickable "Kaleidoscope" row; clicking toggles it (same as K).
-#[derive(Component)]
-struct KaleidoRow;
-
-/// The text showing whether the kaleidoscope is on.
-#[derive(Component)]
-struct KaleidoValue;
-
-/// Container for the kaleidoscope sliders (folds / spin); visible only while
-/// the kaleidoscope is on.
-#[derive(Component)]
-struct KaleidoSection;
-
-/// Clickable "Choreographer" row; clicking toggles the autopilot (same as X).
-#[derive(Component)]
-struct AttractRow;
-
-/// The text showing whether attract mode is on.
-#[derive(Component)]
-struct AttractValue;
-
-/// Clickable "Audio react" row; clicking toggles audio reactivity (same as V).
-#[derive(Component)]
-struct AudioRow;
-
-/// The text showing whether audio reactivity is on.
-#[derive(Component)]
-struct AudioValue;
-
-/// Marker on every clickable menu row, so track_pointer_over_menu shields the
-/// sim from their clicks without enumerating each row type.
-#[derive(Component)]
-struct MenuInteractive;
-
-/// Container for the audio-effect sliders; visible only while audio
-/// reactivity is on.
-#[derive(Component)]
-struct AudioSection;
-
 #[derive(Component)]
 struct SliderFill(Setting);
+
+/// Clickable select row; clicking opens/closes its dropdown.
+#[derive(Component)]
+struct SelectRow(Select);
+
+/// The text showing the active option on a select row.
+#[derive(Component)]
+struct SelectValue(Select);
+
+/// A dropdown overlay (hidden until its row is clicked).
+#[derive(Component)]
+struct SelectDropdown(Select);
+
+/// One selectable entry in a dropdown.
+#[derive(Component)]
+struct SelectOption(Select, u32);
+
+/// Clickable toggle row.
+#[derive(Component)]
+struct ToggleRow(Toggle);
+
+/// The pill switch on a toggle row: background = state, knob side = state.
+#[derive(Component)]
+struct TogglePill(Toggle);
+
+/// Slider group revealed only while its toggle is on (kaleidoscope / audio).
+#[derive(Component)]
+struct ToggleSection(Toggle);
+
+/// Clickable CONTROLS header (collapses the key list).
+#[derive(Component)]
+struct ControlsHeader;
+
+/// The collapsible key list.
+#[derive(Component)]
+struct ControlsBody;
+
+/// Caret glyph on the CONTROLS header, flipped on collapse.
+#[derive(Component)]
+struct ControlsCaret;
+
+/// Marker on every clickable menu widget, so track_pointer_over_menu shields
+/// the sim from their clicks without enumerating each row type.
+#[derive(Component)]
+struct MenuInteractive;
 
 pub struct MenuPlugin;
 
@@ -365,41 +444,132 @@ impl Plugin for MenuPlugin {
                     track_pointer_over_menu,
                     drag_sliders,
                     update_sliders,
-                    click_color_mode,
-                    update_color_mode_text,
-                    click_fractal,
-                    update_fractal_text,
-                    click_flow_row,
-                    click_flow_option,
-                    update_flow_text,
-                    click_kaleido,
-                    sync_kaleido_ui,
-                    click_attract,
-                    sync_attract_ui,
-                    click_audio,
-                    sync_audio_ui,
+                    click_select_row,
+                    click_select_option,
+                    close_dropdowns_on_outside_click,
+                    update_select_ui,
+                    click_toggle,
+                    sync_toggles,
+                    click_controls_header,
                     apply_bloom,
                 ),
             );
     }
 }
 
-const TRACK_IDLE: Color = Color::srgb(0.18, 0.20, 0.28);
-const TRACK_HOVER: Color = Color::srgb(0.24, 0.27, 0.37);
-const FILL_COLOR: Color = Color::srgb(0.45, 0.55, 0.85);
+// Panel chrome.
+const PANEL_BG: Color = Color::srgba(0.030, 0.038, 0.062, 0.92);
+const PANEL_BORDER: Color = Color::srgba(0.42, 0.55, 0.95, 0.22);
+const CARD_BG: Color = Color::srgba(0.075, 0.090, 0.140, 0.55);
+const CARD_BORDER: Color = Color::srgba(0.50, 0.60, 0.90, 0.10);
+const ROW_HOVER: Color = Color::srgba(0.55, 0.65, 1.00, 0.10);
+// Text.
+const TEXT_TITLE: Color = Color::srgb(0.93, 0.95, 1.00);
+const TEXT_LABEL: Color = Color::srgb(0.72, 0.78, 0.90);
+const TEXT_MUTED: Color = Color::srgb(0.46, 0.52, 0.64);
+const TEXT_VALUE: Color = Color::srgb(1.00, 0.86, 0.48);
+// Widgets.
+const TRACK_IDLE: Color = Color::srgb(0.115, 0.135, 0.200);
+const TRACK_HOVER: Color = Color::srgb(0.170, 0.200, 0.290);
+const FILL_COLOR: Color = Color::srgb(0.38, 0.50, 0.86);
+const KNOB_COLOR: Color = Color::srgb(0.80, 0.87, 1.00);
+const ACCENT: Color = Color::srgb(0.42, 0.58, 1.00);
+const PILL_OFF: Color = Color::srgb(0.14, 0.16, 0.23);
+const CHIP_BG: Color = Color::srgba(0.60, 0.70, 1.00, 0.10);
+const DROPDOWN_BG: Color = Color::srgba(0.055, 0.065, 0.105, 0.98);
+const OPTION_ACTIVE: Color = Color::srgba(0.42, 0.58, 1.00, 0.30);
 
-fn label_bundle(setting: Setting) -> impl Bundle {
+// Metrics. One panel width, one label column, one readout column: every row
+// shape lines up because they all use these.
+const PANEL_W: f32 = 376.0;
+const LABEL_W: f32 = 104.0;
+const VALUE_W: f32 = 52.0;
+const ROW_H: f32 = 22.0;
+const FONT_ROW: f32 = 13.0;
+const FONT_SMALL: f32 = 11.0;
+
+/// Concrete return type, not `impl Bundle`: the widget builders below embed
+/// this in their own opaque types, and an opaque type there would drag the
+/// borrowed &str lifetime along with it.
+fn text_bundle(
+    text: impl Into<String>,
+    size: f32,
+    color: Color,
+) -> (Text, TextFont, TextColor, TextLayout) {
     (
-        Text::new(setting.label()),
+        Text::new(text),
         TextFont {
-            font_size: 16.0,
+            font_size: size,
             ..default()
         },
-        TextColor(Color::srgb(0.80, 0.85, 0.95)),
+        TextColor(color),
+        TextLayout::new_with_no_wrap(),
+    )
+}
+
+/// Keyboard-shortcut chip, e.g. the "K" next to the kaleidoscope row.
+fn key_chip(key: &str) -> impl Bundle {
+    (
         Node {
-            width: Val::Px(116.0),
+            padding: UiRect::axes(Val::Px(5.0), Val::Px(1.0)),
+            min_width: Val::Px(20.0),
+            justify_content: JustifyContent::Center,
             ..default()
         },
+        BackgroundColor(CHIP_BG),
+        BorderRadius::all(Val::Px(4.0)),
+        children![text_bundle(key, FONT_SMALL, TEXT_MUTED)],
+    )
+}
+
+/// Card: a bordered, titled group. Rows are appended by the caller.
+fn card_node() -> impl Bundle {
+    (
+        Node {
+            flex_direction: FlexDirection::Column,
+            row_gap: Val::Px(6.0),
+            padding: UiRect::all(Val::Px(10.0)),
+            border: UiRect::all(Val::Px(1.0)),
+            ..default()
+        },
+        BackgroundColor(CARD_BG),
+        BorderColor(CARD_BORDER),
+        BorderRadius::all(Val::Px(9.0)),
+    )
+}
+
+/// Accent tick + small caps title, used at the top of every card.
+fn card_title(title: &str) -> impl Bundle {
+    (
+        Node {
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Center,
+            column_gap: Val::Px(6.0),
+            margin: UiRect::bottom(Val::Px(1.0)),
+            ..default()
+        },
+        children![
+            (
+                Node {
+                    width: Val::Px(3.0),
+                    height: Val::Px(11.0),
+                    ..default()
+                },
+                BackgroundColor(ACCENT),
+                BorderRadius::all(Val::Px(2.0)),
+            ),
+            text_bundle(title, FONT_SMALL, TEXT_MUTED),
+        ],
+    )
+}
+
+fn label_bundle(text: &str) -> impl Bundle {
+    (
+        Node {
+            width: Val::Px(LABEL_W),
+            ..default()
+        },
+        children![text_bundle(text, FONT_ROW, TEXT_LABEL)],
     )
 }
 
@@ -407,140 +577,169 @@ fn value_bundle(setting: Setting) -> impl Bundle {
     (
         Text::new(String::new()),
         TextFont {
-            font_size: 16.0,
+            font_size: FONT_ROW,
             ..default()
         },
-        TextColor(Color::srgb(1.0, 0.88, 0.5)),
+        TextColor(TEXT_VALUE),
+        TextLayout::new_with_justify(JustifyText::Right),
         Node {
-            width: Val::Px(60.0),
-            justify_content: JustifyContent::End,
+            width: Val::Px(VALUE_W),
             ..default()
         },
         SettingValue(setting),
     )
 }
 
+/// Track + fill + knob. The track grows into whatever width the row leaves.
 fn slider_bundle(setting: Setting) -> impl Bundle {
     (
         Button,
         RelativeCursorPosition::default(),
         Node {
-            width: Val::Px(190.0),
-            height: Val::Px(16.0),
-            padding: UiRect::all(Val::Px(2.0)),
+            flex_grow: 1.0,
+            height: Val::Px(14.0),
+            padding: UiRect::all(Val::Px(3.0)),
             ..default()
         },
         BackgroundColor(TRACK_IDLE),
-        BorderRadius::all(Val::Px(4.0)),
+        BorderRadius::all(Val::Px(7.0)),
         SliderTrack(setting),
         children![(
             Node {
                 width: Val::Percent(50.0),
                 height: Val::Percent(100.0),
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::End,
                 ..default()
             },
             BackgroundColor(FILL_COLOR),
-            BorderRadius::all(Val::Px(3.0)),
+            BorderRadius::all(Val::Px(4.0)),
             SliderFill(setting),
+            // Handle rides the fill's leading edge; the negative margin lets it
+            // straddle the boundary instead of sitting inside the fill.
+            children![(
+                Node {
+                    width: Val::Px(12.0),
+                    height: Val::Px(12.0),
+                    margin: UiRect::right(Val::Px(-6.0)),
+                    ..default()
+                },
+                BackgroundColor(KNOB_COLOR),
+                BorderRadius::MAX,
+            )],
         )],
     )
 }
 
-fn row_bundle(setting: Setting) -> impl Bundle {
+fn slider_row(setting: Setting) -> impl Bundle {
     (
         Node {
             flex_direction: FlexDirection::Row,
             align_items: AlignItems::Center,
-            column_gap: Val::Px(10.0),
+            height: Val::Px(ROW_H),
+            column_gap: Val::Px(8.0),
             ..default()
         },
         children![
-            label_bundle(setting),
+            label_bundle(setting.label()),
             slider_bundle(setting),
             value_bundle(setting),
         ],
     )
 }
 
-/// Clickable label + value row (fractal / color mode / audio react). The row
-/// marker drives the click handler, the value marker the label sync.
-fn value_row(
-    label: &'static str,
-    initial: &'static str,
-    row_marker: impl Component,
-    value_marker: impl Component,
-) -> impl Bundle {
+/// Row shell shared by selects and toggles: hover-highlighted button with a
+/// label, a caller-supplied control, and a shortcut chip on the right.
+fn interactive_row(label: &'static str, key: &'static str, control: impl Bundle) -> impl Bundle {
     (
         Button,
         Node {
             flex_direction: FlexDirection::Row,
             align_items: AlignItems::Center,
-            column_gap: Val::Px(10.0),
+            height: Val::Px(ROW_H),
+            column_gap: Val::Px(8.0),
+            padding: UiRect::horizontal(Val::Px(4.0)),
+            margin: UiRect::horizontal(Val::Px(-4.0)),
             ..default()
         },
+        BackgroundColor(Color::NONE),
+        BorderRadius::all(Val::Px(5.0)),
         MenuInteractive,
-        row_marker,
+        children![label_bundle(label), control, key_chip(key)],
+    )
+}
+
+/// Value chip + caret: the closed state of a select.
+fn select_control(select: Select, initial: &'static str) -> impl Bundle {
+    (
+        Node {
+            flex_grow: 1.0,
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Center,
+            justify_content: JustifyContent::SpaceBetween,
+            padding: UiRect::axes(Val::Px(7.0), Val::Px(2.0)),
+            ..default()
+        },
+        BackgroundColor(CHIP_BG),
+        BorderRadius::all(Val::Px(5.0)),
         children![
             (
-                Text::new(label),
-                TextFont {
-                    font_size: 16.0,
-                    ..default()
-                },
-                TextColor(Color::srgb(0.80, 0.85, 0.95)),
-                Node {
-                    width: Val::Px(116.0),
-                    ..default()
-                },
+                text_bundle(initial, FONT_ROW, TEXT_VALUE),
+                SelectValue(select),
             ),
-            (
-                Text::new(initial),
-                TextFont {
-                    font_size: 16.0,
-                    ..default()
-                },
-                TextColor(Color::srgb(1.0, 0.88, 0.5)),
-                value_marker,
-            ),
+            text_bundle("\u{25be}", 10.0, TEXT_MUTED),
         ],
     )
 }
 
-fn heading_bundle(text: &str) -> impl Bundle {
+/// Pill switch: the knob sits left when off, right when on.
+fn toggle_control(toggle: Toggle) -> impl Bundle {
     (
-        Text::new(text),
-        TextFont {
-            font_size: 22.0,
+        Node {
+            width: Val::Px(34.0),
+            height: Val::Px(18.0),
+            padding: UiRect::all(Val::Px(2.0)),
+            align_items: AlignItems::Center,
+            justify_content: JustifyContent::Start,
+            flex_grow: 0.0,
+            margin: UiRect::right(Val::Auto),
             ..default()
         },
-        TextColor(Color::WHITE),
+        BackgroundColor(PILL_OFF),
+        BorderRadius::MAX,
+        TogglePill(toggle),
+        children![(
+            Node {
+                width: Val::Px(14.0),
+                height: Val::Px(14.0),
+                ..default()
+            },
+            BackgroundColor(KNOB_COLOR),
+            BorderRadius::MAX,
+        )],
     )
 }
 
-fn control_bundle(text: &str) -> impl Bundle {
-    (
-        Text::new(text),
-        TextFont {
-            font_size: 13.0,
-            ..default()
-        },
-        TextColor(Color::srgb(0.5, 0.55, 0.65)),
-    )
-}
-
-const CONTROLS: [&str; 12] = [
-    "W / A / S / D  pan",
-    "Scroll  zoom at cursor",
-    "Left hold  blast   Right hold  vortex",
-    "Space  dissolve",
-    "Z  auto-zoom dive   C  color mode",
-    "F  fractal type   G  flow mode",
-    "K  kaleidoscope   V  audio reactivity",
-    "X  auto-choreographer (idle 30s too)",
-    "P  screenshot",
-    "Shift+1..9  save view   1..9  fly to it",
-    "R  reset view",
-    "Esc / M  toggle menu",
+/// Key list, split into two columns of (chip, description).
+const CONTROLS: [(&str, &str); 18] = [
+    ("W A S D", "pan"),
+    ("Scroll", "zoom at cursor"),
+    ("LMB", "blast (hold)"),
+    ("RMB", "vortex (hold)"),
+    ("Space", "dissolve"),
+    ("Z", "auto-zoom dive"),
+    ("R", "reset view"),
+    ("P", "screenshot"),
+    ("O", "record video"),
+    ("F", "fractal"),
+    ("G", "flow mode"),
+    ("C", "palette"),
+    ("K", "kaleidoscope"),
+    ("V", "audio react"),
+    ("X", "choreographer"),
+    ("Shift+1-9", "save view"),
+    ("1-9", "fly to view"),
+    ("Esc / M", "hide menu"),
 ];
 
 fn build_menu(mut commands: Commands) {
@@ -548,171 +747,274 @@ fn build_menu(mut commands: Commands) {
         .spawn((
             Node {
                 position_type: PositionType::Absolute,
-                left: Val::Px(20.0),
-                top: Val::Px(20.0),
+                left: Val::Px(18.0),
+                top: Val::Px(18.0),
+                width: Val::Px(PANEL_W),
                 flex_direction: FlexDirection::Column,
-                padding: UiRect::all(Val::Px(16.0)),
-                row_gap: Val::Px(8.0),
+                padding: UiRect::all(Val::Px(13.0)),
+                border: UiRect::all(Val::Px(1.0)),
+                row_gap: Val::Px(9.0),
                 ..default()
             },
-            BackgroundColor(Color::srgba(0.04, 0.05, 0.09, 0.88)),
+            BackgroundColor(PANEL_BG),
+            BorderColor(PANEL_BORDER),
+            BorderRadius::all(Val::Px(14.0)),
+            BoxShadow::new(
+                Color::srgba(0.0, 0.0, 0.0, 0.55),
+                Val::Px(0.0),
+                Val::Px(8.0),
+                Val::Px(0.0),
+                Val::Px(22.0),
+            ),
             // Starts visible to match MenuOpen's default.
             Visibility::Visible,
-            // Interaction on the root reports Hovered anywhere over the panel,
-            // which track_pointer_over_menu uses to shield the sim from clicks.
-            Interaction::default(),
             MenuRoot,
         ))
         .with_children(|parent| {
-            parent.spawn(heading_bundle("SETTINGS"));
-            for setting in SETTINGS {
-                parent.spawn(row_bundle(setting));
-            }
-            parent.spawn(value_row("Fractal", FRACTAL_MODES[0], FractalRow, FractalValue));
-            // Flow row: click toggles a dropdown of flow modes. The shared
-            // value_row supplies the label/value shell; the caret and the
-            // absolutely positioned dropdown overlay (floats over the rows
-            // below instead of pushing them down) are appended as extra
-            // children.
-            parent
-                .spawn(value_row("Flow", FLOW_MODES[0], FlowRow, FlowValue))
-                .with_children(|row| {
-                    row.spawn((
-                        Text::new("\u{25be}"),
-                        TextFont {
-                            font_size: 12.0,
-                            ..default()
-                        },
-                        TextColor(Color::srgb(0.6, 0.65, 0.75)),
-                    ));
-                    row.spawn((
+            // Header: mark, title, and the key that hides the panel.
+            parent.spawn((
+                Node {
+                    flex_direction: FlexDirection::Row,
+                    align_items: AlignItems::Center,
+                    column_gap: Val::Px(9.0),
+                    padding: UiRect::bottom(Val::Px(9.0)),
+                    border: UiRect::bottom(Val::Px(1.0)),
+                    ..default()
+                },
+                BorderColor(PANEL_BORDER),
+                children![
+                    (
                         Node {
-                            position_type: PositionType::Absolute,
-                            left: Val::Px(126.0),
-                            top: Val::Px(22.0),
-                            flex_direction: FlexDirection::Column,
-                            padding: UiRect::all(Val::Px(4.0)),
-                            row_gap: Val::Px(2.0),
+                            width: Val::Px(9.0),
+                            height: Val::Px(9.0),
                             ..default()
                         },
-                        BackgroundColor(Color::srgba(0.08, 0.09, 0.15, 0.98)),
-                        BorderRadius::all(Val::Px(5.0)),
-                        GlobalZIndex(10),
-                        // Inherited (not Visible) when open, so closing the
-                        // whole menu also hides an open dropdown.
-                        Visibility::Hidden,
-                        Interaction::default(),
-                        MenuInteractive,
-                        FlowDropdown,
+                        BackgroundColor(ACCENT),
+                        BorderRadius::MAX,
+                    ),
+                    (
+                        Node {
+                            flex_grow: 1.0,
+                            flex_direction: FlexDirection::Column,
+                            row_gap: Val::Px(1.0),
+                            ..default()
+                        },
+                        children![
+                            text_bundle("FRACTALITY", 17.0, TEXT_TITLE),
+                            text_bundle("particle fractal explorer", 10.0, TEXT_MUTED),
+                        ],
+                    ),
+                    key_chip("Esc"),
+                ],
+            ));
+
+            // Scene: the three list-valued modes, each with a dropdown.
+            parent.spawn(card_node()).with_children(|card| {
+                card.spawn(card_title("SCENE"));
+                for select in SELECTS {
+                    card.spawn((
+                        interactive_row(
+                            select.label(),
+                            select.key(),
+                            select_control(select, select.options()[0]),
+                        ),
+                        SelectRow(select),
                     ))
-                    .with_children(|dd| {
-                        for (i, name) in FLOW_MODES.iter().enumerate() {
-                            dd.spawn((
-                                Button,
-                                Node {
-                                    padding: UiRect::axes(Val::Px(10.0), Val::Px(3.0)),
-                                    ..default()
-                                },
-                                BackgroundColor(Color::NONE),
-                                BorderRadius::all(Val::Px(3.0)),
-                                MenuInteractive,
-                                FlowOption(i as u32),
-                                children![(
-                                    Text::new(*name),
-                                    TextFont {
-                                        font_size: 15.0,
+                    .with_children(|row| {
+                        // Absolutely positioned so the open list floats over
+                        // the rows below instead of pushing them down.
+                        row.spawn((
+                            Node {
+                                position_type: PositionType::Absolute,
+                                left: Val::Px(LABEL_W + 12.0),
+                                top: Val::Px(ROW_H + 1.0),
+                                flex_direction: FlexDirection::Column,
+                                padding: UiRect::all(Val::Px(4.0)),
+                                border: UiRect::all(Val::Px(1.0)),
+                                row_gap: Val::Px(1.0),
+                                ..default()
+                            },
+                            BackgroundColor(DROPDOWN_BG),
+                            BorderColor(PANEL_BORDER),
+                            BorderRadius::all(Val::Px(8.0)),
+                            BoxShadow::new(
+                                Color::srgba(0.0, 0.0, 0.0, 0.6),
+                                Val::Px(0.0),
+                                Val::Px(6.0),
+                                Val::Px(0.0),
+                                Val::Px(14.0),
+                            ),
+                            GlobalZIndex(10),
+                            // Inherited (not Visible) when open, so closing the
+                            // whole menu also hides an open dropdown.
+                            Visibility::Hidden,
+                            Interaction::default(),
+                            MenuInteractive,
+                            SelectDropdown(select),
+                        ))
+                        .with_children(|dd| {
+                            for (i, name) in select.options().iter().enumerate() {
+                                dd.spawn((
+                                    Button,
+                                    Node {
+                                        padding: UiRect::axes(Val::Px(9.0), Val::Px(3.0)),
+                                        min_width: Val::Px(130.0),
                                         ..default()
                                     },
-                                    TextColor(Color::srgb(0.85, 0.88, 0.95)),
-                                )],
-                            ));
+                                    // Index 0 is every mode's default, so it
+                                    // starts tinted as the active option.
+                                    BackgroundColor(if i == 0 {
+                                        OPTION_ACTIVE
+                                    } else {
+                                        Color::NONE
+                                    }),
+                                    BorderRadius::all(Val::Px(5.0)),
+                                    MenuInteractive,
+                                    SelectOption(select, i as u32),
+                                    children![text_bundle(*name, FONT_ROW, TEXT_LABEL)],
+                                ));
+                            }
+                        });
+                    });
+                }
+            });
+
+            parent.spawn(card_node()).with_children(|card| {
+                card.spawn(card_title("SIMULATION"));
+                for setting in SIM_SETTINGS {
+                    card.spawn(slider_row(setting));
+                }
+            });
+
+            parent.spawn(card_node()).with_children(|card| {
+                card.spawn(card_title("RENDER"));
+                for setting in RENDER_SETTINGS {
+                    card.spawn(slider_row(setting));
+                }
+            });
+
+            // Effects: toggles, each with its own slider group folded away
+            // until the effect is on.
+            parent.spawn(card_node()).with_children(|card| {
+                card.spawn(card_title("EFFECTS"));
+                card.spawn((
+                    interactive_row(
+                        Toggle::Kaleido.label(),
+                        Toggle::Kaleido.key(),
+                        toggle_control(Toggle::Kaleido),
+                    ),
+                    ToggleRow(Toggle::Kaleido),
+                ));
+                card.spawn((section_node(), ToggleSection(Toggle::Kaleido)))
+                    .with_children(|col| {
+                        for setting in KALEIDO_SETTINGS {
+                            col.spawn(slider_row(setting));
                         }
                     });
-                });
-            parent.spawn(value_row(
-                "Color mode",
-                COLOR_MODES[0],
-                ColorModeRow,
-                ColorModeValue,
-            ));
-            parent.spawn(value_row("Kaleidoscope", "off", KaleidoRow, KaleidoValue));
-            parent
-                .spawn((
+                card.spawn((
+                    interactive_row(
+                        Toggle::Choreographer.label(),
+                        Toggle::Choreographer.key(),
+                        toggle_control(Toggle::Choreographer),
+                    ),
+                    ToggleRow(Toggle::Choreographer),
+                ));
+                card.spawn((
+                    interactive_row(
+                        Toggle::Audio.label(),
+                        Toggle::Audio.key(),
+                        toggle_control(Toggle::Audio),
+                    ),
+                    ToggleRow(Toggle::Audio),
+                ));
+                card.spawn((section_node(), ToggleSection(Toggle::Audio)))
+                    .with_children(|col| {
+                        for setting in AUDIO_SETTINGS {
+                            col.spawn(slider_row(setting));
+                        }
+                    });
+            });
+
+            // Controls: clickable title collapses the list.
+            parent.spawn(card_node()).with_children(|card| {
+                card.spawn((
+                    Button,
                     Node {
-                        display: Display::None,
-                        flex_direction: FlexDirection::Column,
-                        row_gap: Val::Px(8.0),
-                        margin: UiRect::top(Val::Px(4.0)),
+                        flex_direction: FlexDirection::Row,
+                        align_items: AlignItems::Center,
+                        column_gap: Val::Px(6.0),
                         ..default()
                     },
-                    KaleidoSection,
-                ))
-                .with_children(|col| {
-                    col.spawn((
-                        Text::new("KALEIDOSCOPE"),
-                        TextFont {
-                            font_size: 14.0,
-                            ..default()
-                        },
-                        TextColor(Color::srgb(0.7, 0.75, 0.85)),
-                    ));
-                    for setting in KALEIDO_SETTINGS {
-                        col.spawn(row_bundle(setting));
-                    }
-                });
-            parent.spawn(value_row("Choreographer", "off", AttractRow, AttractValue));
-            parent.spawn(value_row("Audio react", "off", AudioRow, AudioValue));
-            parent
-                .spawn((
+                    BackgroundColor(Color::NONE),
+                    MenuInteractive,
+                    ControlsHeader,
+                    children![
+                        (
+                            Node {
+                                width: Val::Px(3.0),
+                                height: Val::Px(11.0),
+                                ..default()
+                            },
+                            BackgroundColor(ACCENT),
+                            BorderRadius::all(Val::Px(2.0)),
+                        ),
+                        text_bundle("CONTROLS", FONT_SMALL, TEXT_MUTED),
+                        (text_bundle("\u{25be}", 10.0, TEXT_MUTED), ControlsCaret,),
+                    ],
+                ));
+                card.spawn((
                     Node {
-                        display: Display::None,
-                        flex_direction: FlexDirection::Column,
-                        row_gap: Val::Px(8.0),
-                        margin: UiRect::top(Val::Px(4.0)),
+                        flex_direction: FlexDirection::Row,
+                        column_gap: Val::Px(14.0),
+                        margin: UiRect::top(Val::Px(2.0)),
                         ..default()
                     },
-                    AudioSection,
+                    ControlsBody,
                 ))
-                .with_children(|col| {
-                    col.spawn((
-                        Text::new("AUDIO FX"),
-                        TextFont {
-                            font_size: 14.0,
+                .with_children(|body| {
+                    for column in CONTROLS.chunks(CONTROLS.len() / 2) {
+                        body.spawn(Node {
+                            flex_direction: FlexDirection::Column,
+                            row_gap: Val::Px(3.0),
                             ..default()
-                        },
-                        TextColor(Color::srgb(0.7, 0.75, 0.85)),
-                    ));
-                    for setting in AUDIO_SETTINGS {
-                        col.spawn(row_bundle(setting));
+                        })
+                        .with_children(|col| {
+                            for (key, what) in column {
+                                col.spawn(Node {
+                                    flex_direction: FlexDirection::Row,
+                                    align_items: AlignItems::Center,
+                                    column_gap: Val::Px(6.0),
+                                    ..default()
+                                })
+                                .with_children(|line| {
+                                    line.spawn(key_chip(key));
+                                    line.spawn(text_bundle(*what, FONT_SMALL, TEXT_MUTED));
+                                });
+                            }
+                        });
                     }
                 });
-            parent
-                .spawn(Node {
-                    flex_direction: FlexDirection::Column,
-                    row_gap: Val::Px(2.0),
-                    margin: UiRect::top(Val::Px(10.0)),
-                    ..default()
-                })
-                .with_children(|col| {
-                    col.spawn((
-                        Text::new("CONTROLS"),
-                        TextFont {
-                            font_size: 14.0,
-                            ..default()
-                        },
-                        TextColor(Color::srgb(0.7, 0.75, 0.85)),
-                    ));
-                    for line in CONTROLS {
-                        col.spawn(control_bundle(line));
-                    }
-                });
+            });
         });
+}
+
+/// Slider group inside a card, collapsed to nothing until its effect is on.
+fn section_node() -> Node {
+    Node {
+        display: Display::None,
+        flex_direction: FlexDirection::Column,
+        row_gap: Val::Px(6.0),
+        padding: UiRect::left(Val::Px(6.0)),
+        margin: UiRect::bottom(Val::Px(2.0)),
+        ..default()
+    }
 }
 
 fn toggle_menu(
     keys: Res<ButtonInput<KeyCode>>,
     mut open: ResMut<MenuOpen>,
     mut root: Query<&mut Visibility, With<MenuRoot>>,
+    mut dropdowns: Query<&mut Visibility, (With<SelectDropdown>, Without<MenuRoot>)>,
 ) {
     if keys.just_pressed(KeyCode::Escape) || keys.just_pressed(KeyCode::KeyM) {
         open.0 = !open.0;
@@ -723,19 +1025,38 @@ fn toggle_menu(
                 Visibility::Hidden
             };
         }
+        // Never reopen the panel with a stale dropdown hanging over the rows.
+        for mut vis in &mut dropdowns {
+            *vis = Visibility::Hidden;
+        }
     }
 }
 
-/// Cursor over the panel (root or any slider reports interaction), or a drag
-/// in progress (a track stays Pressed even after the cursor leaves it).
+/// Cursor inside the panel rect, or a drag/hover on one of its widgets (a
+/// track stays Pressed even after the cursor leaves it). The rect test is what
+/// makes this reliable: bevy_ui's focus system stops at the first hovered node,
+/// so an Interaction on the root reports None whenever a label or card sits
+/// under the cursor.
 fn track_pointer_over_menu(
     mut over: ResMut<PointerOverMenu>,
-    widgets: Query<
-        &Interaction,
-        Or<(With<MenuRoot>, With<SliderTrack>, With<MenuInteractive>)>,
-    >,
+    open: Res<MenuOpen>,
+    windows: Query<&Window>,
+    roots: Query<(&ComputedNode, &GlobalTransform), With<MenuRoot>>,
+    widgets: Query<&Interaction, Or<(With<SliderTrack>, With<MenuInteractive>)>>,
 ) {
-    let now = widgets.iter().any(|i| *i != Interaction::None);
+    let busy = widgets.iter().any(|i| *i != Interaction::None);
+    let inside = open.0
+        && windows
+            .single()
+            .ok()
+            .and_then(|w| w.cursor_position().map(|c| c * w.scale_factor()))
+            .is_some_and(|cursor| {
+                roots.iter().any(|(node, transform)| {
+                    Rect::from_center_size(transform.translation().truncate(), node.size())
+                        .contains(cursor)
+                })
+            });
+    let now = busy || inside;
     // Write only on transitions so the resource is not marked changed every
     // frame.
     if over.0 != now {
@@ -763,7 +1084,9 @@ fn drag_sliders(
             Interaction::Pressed => {
                 if let Some(pos) = rel.normalized {
                     let (lo, hi) = track.0.range();
-                    track.0.set(&mut settings, lo + pos.x.clamp(0.0, 1.0) * (hi - lo));
+                    track
+                        .0
+                        .set(&mut settings, lo + pos.x.clamp(0.0, 1.0) * (hi - lo));
                 }
                 TRACK_HOVER
             }
@@ -798,201 +1121,203 @@ fn update_sliders(
     }
 }
 
-/// Clicking the row cycles the palette, same as the C key.
-fn click_color_mode(
-    mut mode: ResMut<ColorMode>,
-    rows: Query<&Interaction, (Changed<Interaction>, With<ColorModeRow>)>,
+/// Clicking a select row opens its dropdown and closes any other. Options are
+/// children of the dropdown overlay and capture their own clicks (focus blocks
+/// the row), so a selection click never re-toggles here.
+fn click_select_row(
+    mut rows: Query<(&Interaction, &SelectRow, &mut BackgroundColor), Changed<Interaction>>,
+    mut dropdowns: Query<(&mut Visibility, &SelectDropdown)>,
 ) {
-    for interaction in &rows {
-        if *interaction == Interaction::Pressed {
-            mode.0 = (mode.0 + 1) % COLOR_MODES.len() as u32;
-        }
-    }
-}
-
-/// Keep the palette name in sync however the mode changes (click or C key).
-fn update_color_mode_text(
-    mode: Res<ColorMode>,
-    mut texts: Query<&mut Text, With<ColorModeValue>>,
-) {
-    if !mode.is_changed() {
-        return;
-    }
-    for mut text in &mut texts {
-        *text = Text::new(COLOR_MODES[mode.0 as usize]);
-    }
-}
-
-/// Clicking the row cycles the fractal type, same as the F key.
-fn click_fractal(
-    mut fractal: ResMut<FractalType>,
-    rows: Query<&Interaction, (Changed<Interaction>, With<FractalRow>)>,
-) {
-    for interaction in &rows {
-        if *interaction == Interaction::Pressed {
-            fractal.0 = (fractal.0 + 1) % FRACTAL_MODES.len() as u32;
-        }
-    }
-}
-
-/// Keep the fractal name in sync however the type changes (click or F key).
-fn update_fractal_text(
-    fractal: Res<FractalType>,
-    mut texts: Query<&mut Text, With<FractalValue>>,
-) {
-    if !fractal.is_changed() {
-        return;
-    }
-    for mut text in &mut texts {
-        *text = Text::new(FRACTAL_MODES[fractal.0 as usize]);
-    }
-}
-
-/// Clicking the Flow row opens/closes the dropdown. Options are children of
-/// the dropdown overlay and capture their own clicks (focus blocks the row),
-/// so a selection click never re-toggles here.
-fn click_flow_row(
-    rows: Query<&Interaction, (Changed<Interaction>, With<FlowRow>)>,
-    mut dropdowns: Query<&mut Visibility, With<FlowDropdown>>,
-) {
-    for interaction in &rows {
-        if *interaction == Interaction::Pressed {
-            for mut vis in &mut dropdowns {
-                *vis = if *vis == Visibility::Hidden {
-                    Visibility::Inherited
-                } else {
-                    Visibility::Hidden
-                };
+    for (interaction, row, mut bg) in &mut rows {
+        let color = match interaction {
+            Interaction::Pressed => {
+                for (mut vis, dd) in &mut dropdowns {
+                    *vis = if dd.0 == row.0 && *vis == Visibility::Hidden {
+                        Visibility::Inherited
+                    } else {
+                        Visibility::Hidden
+                    };
+                }
+                ROW_HOVER
             }
+            Interaction::Hovered => ROW_HOVER,
+            Interaction::None => Color::NONE,
+        };
+        if bg.0 != color {
+            bg.0 = color;
         }
     }
 }
 
 /// Option hover highlight + click-to-select, closing the dropdown.
-fn click_flow_option(
-    mut mode: ResMut<FlowMode>,
-    mut options: Query<
-        (&Interaction, &FlowOption, &mut BackgroundColor),
-        Changed<Interaction>,
-    >,
-    mut dropdowns: Query<&mut Visibility, With<FlowDropdown>>,
+fn click_select_option(
+    mut fractal: ResMut<FractalType>,
+    mut flow: ResMut<FlowMode>,
+    mut palette: ResMut<ColorMode>,
+    mut options: Query<(&Interaction, &SelectOption, &mut BackgroundColor), Changed<Interaction>>,
+    mut dropdowns: Query<&mut Visibility, With<SelectDropdown>>,
 ) {
     for (interaction, option, mut bg) in &mut options {
         match interaction {
             Interaction::Pressed => {
-                mode.0 = option.0;
+                option
+                    .0
+                    .set(option.1, &mut fractal, &mut flow, &mut palette);
                 for mut vis in &mut dropdowns {
                     *vis = Visibility::Hidden;
                 }
             }
-            Interaction::Hovered => bg.0 = TRACK_HOVER,
-            Interaction::None => bg.0 = Color::NONE,
+            Interaction::Hovered => bg.0 = ROW_HOVER,
+            // Restore the active-option tint rather than clearing it.
+            Interaction::None => {
+                let active = option.0.get(&fractal, &flow, &palette) == option.1;
+                bg.0 = if active { OPTION_ACTIVE } else { Color::NONE };
+            }
         }
     }
 }
 
-/// Keep the flow name in sync however the mode changes (dropdown or G key).
-fn update_flow_text(mode: Res<FlowMode>, mut texts: Query<&mut Text, With<FlowValue>>) {
-    if !mode.is_changed() {
+/// A click anywhere else (canvas or another part of the panel) dismisses an
+/// open dropdown, so it never lingers over the rows it covers.
+fn close_dropdowns_on_outside_click(
+    mouse: Res<ButtonInput<MouseButton>>,
+    inside: Query<&Interaction, Or<(With<SelectRow>, With<SelectDropdown>, With<SelectOption>)>>,
+    mut dropdowns: Query<&mut Visibility, With<SelectDropdown>>,
+) {
+    if !mouse.just_pressed(MouseButton::Left) {
         return;
     }
-    for mut text in &mut texts {
-        *text = Text::new(FLOW_MODES[mode.0 as usize]);
+    if inside.iter().any(|i| *i != Interaction::None) {
+        return;
+    }
+    for mut vis in &mut dropdowns {
+        if *vis != Visibility::Hidden {
+            *vis = Visibility::Hidden;
+        }
     }
 }
 
-/// Clicking the row toggles the kaleidoscope, same as the K key.
-fn click_kaleido(
+/// Keep the closed-state text and the active-option tint in sync however a
+/// mode changes (dropdown or the F / G / C keys).
+fn update_select_ui(
+    fractal: Res<FractalType>,
+    flow: Res<FlowMode>,
+    palette: Res<ColorMode>,
+    mut values: Query<(&mut Text, &SelectValue)>,
+    mut options: Query<(&mut BackgroundColor, &SelectOption)>,
+) {
+    if !fractal.is_changed() && !flow.is_changed() && !palette.is_changed() {
+        return;
+    }
+    for (mut text, value) in &mut values {
+        let index = value.0.get(&fractal, &flow, &palette) as usize;
+        *text = Text::new(value.0.options()[index]);
+    }
+    for (mut bg, option) in &mut options {
+        let active = option.0.get(&fractal, &flow, &palette) == option.1;
+        let color = if active { OPTION_ACTIVE } else { Color::NONE };
+        if bg.0 != color {
+            bg.0 = color;
+        }
+    }
+}
+
+/// Clicking a toggle row flips its feature, same as the K / X / V keys. The
+/// choreographer click only files a request; update_attract does the
+/// engage/disengage (it owns the save/restore of the settings it touches).
+fn click_toggle(
     mut kaleido: ResMut<Kaleido>,
-    rows: Query<&Interaction, (Changed<Interaction>, With<KaleidoRow>)>,
-) {
-    for interaction in &rows {
-        if *interaction == Interaction::Pressed {
-            kaleido.on = !kaleido.on;
-        }
-    }
-}
-
-/// Keep the on/off label and the KALEIDOSCOPE section in sync however the
-/// toggle happens (click or K). The per-frame rotation accumulator bypasses
-/// change detection, so only real toggles land here. Display::None collapses
-/// the section entirely (no reserved space), accordion-style.
-fn sync_kaleido_ui(
-    kaleido: Res<Kaleido>,
-    mut texts: Query<&mut Text, With<KaleidoValue>>,
-    mut sections: Query<&mut Node, With<KaleidoSection>>,
-) {
-    if !kaleido.is_changed() {
-        return;
-    }
-    for mut text in &mut texts {
-        *text = Text::new(if kaleido.on { "on" } else { "off" });
-    }
-    for mut node in &mut sections {
-        node.display = if kaleido.on { Display::Flex } else { Display::None };
-    }
-}
-
-/// Clicking the row toggles attract mode, same as the X key. The click only
-/// files a request; update_attract does the engage/disengage (it owns the
-/// save/restore of the settings the autopilot touches).
-fn click_attract(
     mut attract: ResMut<Attract>,
-    rows: Query<&Interaction, (Changed<Interaction>, With<AttractRow>)>,
-) {
-    for interaction in &rows {
-        if *interaction == Interaction::Pressed {
-            attract.want_toggle = true;
-        }
-    }
-}
-
-/// Keep the on/off label in sync however the toggle happens (click, X, idle
-/// engagement, input exit). Attract's timers tick every frame so is_changed
-/// always fires; diff the actual flag through a Local instead.
-fn sync_attract_ui(
-    attract: Res<Attract>,
-    mut texts: Query<&mut Text, With<AttractValue>>,
-    mut last: Local<Option<bool>>,
-) {
-    if *last == Some(attract.on) {
-        return;
-    }
-    *last = Some(attract.on);
-    for mut text in &mut texts {
-        *text = Text::new(if attract.on { "on" } else { "off" });
-    }
-}
-
-/// Clicking the row toggles audio reactivity, same as the V key.
-fn click_audio(
     mut audio: ResMut<AudioCapture>,
-    rows: Query<&Interaction, (Changed<Interaction>, With<AudioRow>)>,
+    mut rows: Query<(&Interaction, &ToggleRow, &mut BackgroundColor), Changed<Interaction>>,
 ) {
-    for interaction in &rows {
-        if *interaction == Interaction::Pressed {
-            audio.enabled = !audio.enabled;
+    for (interaction, row, mut bg) in &mut rows {
+        let color = match interaction {
+            Interaction::Pressed => {
+                match row.0 {
+                    Toggle::Kaleido => kaleido.on = !kaleido.on,
+                    Toggle::Choreographer => attract.want_toggle = true,
+                    Toggle::Audio => audio.enabled = !audio.enabled,
+                }
+                ROW_HOVER
+            }
+            Interaction::Hovered => ROW_HOVER,
+            Interaction::None => Color::NONE,
+        };
+        if bg.0 != color {
+            bg.0 = color;
         }
     }
 }
 
-/// Keep the on/off label and the AUDIO FX section in sync however the toggle
-/// happens (click or V). AudioCapture changes only on real transitions, so
-/// is_changed suffices. Display::None collapses the section entirely (no
+/// Pills and their slider sections follow the real state, however it changed
+/// (click, key, idle engagement, input exit). Kaleido's rotation accumulator
+/// and Attract's timers tick every frame, so is_changed is useless here; diff
+/// the three flags instead. Display::None collapses a section entirely (no
 /// reserved space), accordion-style.
-fn sync_audio_ui(
+fn sync_toggles(
+    kaleido: Res<Kaleido>,
+    attract: Res<Attract>,
     audio: Res<AudioCapture>,
-    mut texts: Query<&mut Text, With<AudioValue>>,
-    mut sections: Query<&mut Node, With<AudioSection>>,
+    // Explicit Without: naming a marker in the query data does not narrow the
+    // Node access, so the two &mut Node queries are otherwise a conflict.
+    mut pills: Query<(&mut BackgroundColor, &mut Node, &TogglePill), Without<ToggleSection>>,
+    mut sections: Query<(&mut Node, &ToggleSection), Without<TogglePill>>,
+    mut last: Local<Option<[bool; 3]>>,
 ) {
-    if !audio.is_changed() {
+    let now = [
+        Toggle::Kaleido.state(&kaleido, &attract, &audio),
+        Toggle::Choreographer.state(&kaleido, &attract, &audio),
+        Toggle::Audio.state(&kaleido, &attract, &audio),
+    ];
+    if *last == Some(now) {
         return;
     }
-    for mut text in &mut texts {
-        *text = Text::new(if audio.enabled { "on" } else { "off" });
+    *last = Some(now);
+    for (mut bg, mut node, pill) in &mut pills {
+        let on = pill.0.state(&kaleido, &attract, &audio);
+        bg.0 = if on { ACCENT } else { PILL_OFF };
+        node.justify_content = if on {
+            JustifyContent::End
+        } else {
+            JustifyContent::Start
+        };
     }
-    for mut node in &mut sections {
-        node.display = if audio.enabled { Display::Flex } else { Display::None };
+    for (mut node, section) in &mut sections {
+        let on = section.0.state(&kaleido, &attract, &audio);
+        node.display = if on { Display::Flex } else { Display::None };
+    }
+}
+
+/// Clicking the CONTROLS title folds the key list away.
+fn click_controls_header(
+    mut header: Query<
+        (&Interaction, &mut BackgroundColor),
+        (Changed<Interaction>, With<ControlsHeader>),
+    >,
+    mut body: Query<&mut Node, With<ControlsBody>>,
+    mut caret: Query<&mut Text, With<ControlsCaret>>,
+    mut open: Local<Option<bool>>,
+) {
+    for (interaction, mut bg) in &mut header {
+        let color = match interaction {
+            Interaction::Pressed => {
+                let shown = !open.unwrap_or(true);
+                *open = Some(shown);
+                for mut node in &mut body {
+                    node.display = if shown { Display::Flex } else { Display::None };
+                }
+                for mut text in &mut caret {
+                    *text = Text::new(if shown { "\u{25be}" } else { "\u{25b8}" });
+                }
+                ROW_HOVER
+            }
+            Interaction::Hovered => ROW_HOVER,
+            Interaction::None => Color::NONE,
+        };
+        if bg.0 != color {
+            bg.0 = color;
+        }
     }
 }
 

@@ -26,11 +26,11 @@ use dd::DdVec2;
 
 use audio::{AudioCapture, AudioLevels};
 use menu::{MenuOpen, MenuPlugin, PointerOverMenu, Settings};
-use recorder::{Recorder, RecorderPlugin};
 use particles::{
     generate_particles, julia_morph_c, reference_orbit, smooth_iter, ParticlePlugin, ParticleSeed,
     RefOrbit, SimParams, JULIA_C, JULIA_TYPE, MAX_PARTICLES, REF_ORBIT_CAP,
 };
+use recorder::{Recorder, RecorderPlugin};
 
 const BASE_ITER: u32 = 240;
 const DEFAULT_CENTER: DVec2 = DVec2::new(-0.55, 0.0);
@@ -52,16 +52,20 @@ pub const COLOR_MODES: [&str; 5] = ["classic", "rings", "electric", "inferno", "
 #[derive(Resource, Default)]
 pub struct FractalType(pub u32);
 
-pub const FRACTAL_MODES: [&str; 5] =
-    ["mandelbrot", "burning ship", "tricorn", "multibrot-3", "julia"];
+pub const FRACTAL_MODES: [&str; 5] = [
+    "mandelbrot",
+    "burning ship",
+    "tricorn",
+    "multibrot-3",
+    "julia",
+];
 
 /// Particle flow style, cycled with G (or picked from the menu dropdown).
 /// Ids must match the flow_mode switch in the compute shader.
 #[derive(Resource, Default)]
 pub struct FlowMode(pub u32);
 
-pub const FLOW_MODES: [&str; 6] =
-    ["contour", "layers", "gravity", "erupt", "pulse", "dynamics"];
+pub const FLOW_MODES: [&str; 6] = ["contour", "layers", "gravity", "erupt", "pulse", "dynamics"];
 
 /// Home view (center, height) per fractal, used on R reset and when switching.
 fn fractal_default_view(ftype: u32) -> (DVec2, f64) {
@@ -253,7 +257,9 @@ fn pick_boundary_target(
         .enumerate()
         .for_each(|(iy, row)| fill_row(iy, row));
     #[cfg(target_arch = "wasm32")]
-    f.iter_mut().enumerate().for_each(|(iy, row)| fill_row(iy, row));
+    f.iter_mut()
+        .enumerate()
+        .for_each(|(iy, row)| fill_row(iy, row));
     let mut scored = Vec::with_capacity((G - 2) * (G - 2));
     for iy in 1..G - 1 {
         for ix in 1..G - 1 {
@@ -439,20 +445,18 @@ fn main() {
     println!("             also self-starts after 30s idle, then any input exits)");
 
     App::new()
-        .add_plugins(
-            DefaultPlugins.set(WindowPlugin {
-                primary_window: Some(Window {
-                    title: "Fractality".into(),
-                    present_mode: PresentMode::AutoNoVsync,
-                    // Web: attach to the page's canvas and track its size.
-                    // Both fields are no-ops on native.
-                    canvas: Some("#fractality-canvas".into()),
-                    fit_canvas_to_parent: true,
-                    ..default()
-                }),
+        .add_plugins(DefaultPlugins.set(WindowPlugin {
+            primary_window: Some(Window {
+                title: "Fractality".into(),
+                present_mode: PresentMode::AutoNoVsync,
+                // Web: attach to the page's canvas and track its size.
+                // Both fields are no-ops on native.
+                canvas: Some("#fractality-canvas".into()),
+                fit_canvas_to_parent: true,
                 ..default()
             }),
-        )
+            ..default()
+        }))
         .add_plugins(FrameTimeDiagnosticsPlugin::default())
         .add_plugins(ParticlePlugin)
         .add_plugins(MenuPlugin)
@@ -494,11 +498,7 @@ fn main() {
         .run();
 }
 
-fn setup(
-    mut commands: Commands,
-    settings: Res<Settings>,
-    mut windows: Query<&mut Window>,
-) {
+fn setup(mut commands: Commands, settings: Res<Settings>, mut windows: Query<&mut Window>) {
     if let Ok(mut window) = windows.single_mut() {
         window.set_maximized(true);
     }
@@ -521,8 +521,12 @@ fn setup(
     // Positions are stored relative to the view center; seed at the default one.
     // Seed only the initial active count (fast startup). The GPU buffer is sized
     // to MAX_PARTICLES; raising the count later fills the tail via recycle.
-    let particles =
-        generate_particles(settings.particle_count as usize, BASE_ITER, DEFAULT_CENTER, 0);
+    let particles = generate_particles(
+        settings.particle_count as usize,
+        BASE_ITER,
+        DEFAULT_CENTER,
+        0,
+    );
     info!(
         "generated {} particles in {:.2?}",
         particles.len(),
@@ -539,7 +543,10 @@ fn zoom_anchored(view: &mut ViewState, window: &Window, new_h: f64) {
         let w = window.width().max(1.0) as f64;
         let h = window.height().max(1.0) as f64;
         let aspect = w / h;
-        let ndc = DVec2::new(cursor.x as f64 / w * 2.0 - 1.0, 1.0 - cursor.y as f64 / h * 2.0);
+        let ndc = DVec2::new(
+            cursor.x as f64 / w * 2.0 - 1.0,
+            1.0 - cursor.y as f64 / h * 2.0,
+        );
         // Cursor offset from the center is view-height sized, so f64 carries
         // it exactly enough; only the accumulation into center needs DD.
         let cursor_off = DVec2::new(ndc.x * old_h * aspect * 0.5, ndc.y * old_h * 0.5);
@@ -853,7 +860,11 @@ fn update_attract(
         attract.palette_t = 18.0 + attract.rng.f32() * 17.0;
         info!(
             "auto-choreographer: on ({})",
-            if toggled { "X / menu exits" } else { "any input exits" }
+            if toggled {
+                "X / menu exits"
+            } else {
+                "any input exits"
+            }
         );
     }
 
@@ -927,7 +938,11 @@ fn update_attract(
     attract.palette_t -= dt;
     if (section && attract.palette_hold <= 0.0) || attract.palette_t <= 0.0 {
         // Audio aurora sits dim silver in silence: skip it when idle.
-        let n = if audio.is_idle() { 4 } else { COLOR_MODES.len() as u32 };
+        let n = if audio.is_idle() {
+            4
+        } else {
+            COLOR_MODES.len() as u32
+        };
         color_mode.0 = rand_cycle(color_mode.0, n, &mut attract.rng);
         attract.palette_hold = 8.0;
         attract.palette_t = 18.0 + attract.rng.f32() * 17.0;
@@ -996,7 +1011,12 @@ fn update_attract(
         attract.aim += chase * (1.0 - (-1.2 * dt as f64).exp());
         let new_h = (view.height * (-0.45 * dt as f64).exp()).max(ATTRACT_FLOOR);
         // The extra decay recentres the aim over ~2 s on top of the anchor.
-        approach_step(&mut view, attract.aim, new_h, 1.0 - (-0.6 * dt as f64).exp());
+        approach_step(
+            &mut view,
+            attract.aim,
+            new_h,
+            1.0 - (-0.6 * dt as f64).exp(),
+        );
     }
 }
 
@@ -1221,7 +1241,11 @@ fn update_params(
         settings.audio_pulse,
         settings.audio_flash,
         settings.audio_glow,
-        if kaleido.on { settings.kaleido_folds } else { 0.0 },
+        if kaleido.on {
+            settings.kaleido_folds
+        } else {
+            0.0
+        },
     );
     for i in 0..4 {
         u.spectrum[i] = Vec4::from_slice(&audio.spectrum[i * 4..i * 4 + 4]);
