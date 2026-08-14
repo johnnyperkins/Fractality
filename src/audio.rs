@@ -311,7 +311,10 @@ impl WindowProcessor {
 
         store_f32(&shared.bass, autogain(&mut self.peaks[0], bass_p.sqrt()));
         store_f32(&shared.mid, autogain(&mut self.peaks[1], mid_p.sqrt()));
-        store_f32(&shared.treble, autogain(&mut self.peaks[2], treble_p.sqrt()));
+        store_f32(
+            &shared.treble,
+            autogain(&mut self.peaks[2], treble_p.sqrt()),
+        );
         store_f32(&shared.level, autogain(&mut self.peaks[3], level_p.sqrt()));
 
         // Per-bin spectrum, each bin auto-gained independently so quiet
@@ -319,7 +322,10 @@ impl WindowProcessor {
         for i in 0..SPECTRUM_BINS {
             let (lo, hi) = (self.edges[i], self.edges[i + 1]);
             let p = band_sum(lo, hi) / (hi - lo) as f32;
-            store_f32(&shared.spectrum[i], autogain(&mut self.spec_peaks[i], p.sqrt()));
+            store_f32(
+                &shared.spectrum[i],
+                autogain(&mut self.spec_peaks[i], p.sqrt()),
+            );
         }
 
         // Beat: bass power spikes well above its recent average.
@@ -518,20 +524,17 @@ mod platform {
         let display = web_sys::DisplayMediaStreamConstraints::new();
         display.set_audio(&JsValue::TRUE);
         display.set_video(&JsValue::TRUE);
-        let stream: MediaStream = match JsFuture::from(
-            devices.get_display_media_with_constraints(&display)?,
-        )
-        .await
-        {
-            Ok(s) => s.unchecked_into(),
-            Err(_) => {
-                let mic = web_sys::MediaStreamConstraints::new();
-                mic.set_audio(&JsValue::TRUE);
-                JsFuture::from(devices.get_user_media_with_constraints(&mic)?)
-                    .await?
-                    .unchecked_into()
-            }
-        };
+        let stream: MediaStream =
+            match JsFuture::from(devices.get_display_media_with_constraints(&display)?).await {
+                Ok(s) => s.unchecked_into(),
+                Err(_) => {
+                    let mic = web_sys::MediaStreamConstraints::new();
+                    mic.set_audio(&JsValue::TRUE);
+                    JsFuture::from(devices.get_user_media_with_constraints(&mic)?)
+                        .await?
+                        .unchecked_into()
+                }
+            };
         stop_tracks(stream.get_video_tracks());
         if stream.get_audio_tracks().length() == 0 {
             stop_tracks(stream.get_tracks());
@@ -557,8 +560,8 @@ mod platform {
         let mut proc = WindowProcessor::new(ctx.sample_rate());
         let mut samples = [0.0f32; N];
         let cb_shared = shared.clone();
-        let on_audio = Closure::<dyn FnMut(AudioProcessingEvent)>::new(
-            move |ev: AudioProcessingEvent| {
+        let on_audio =
+            Closure::<dyn FnMut(AudioProcessingEvent)>::new(move |ev: AudioProcessingEvent| {
                 if !cb_shared.running.load(Ordering::Relaxed) {
                     return;
                 }
@@ -567,8 +570,7 @@ mod platform {
                         proc.process(&samples, &cb_shared);
                     }
                 }
-            },
-        );
+            });
         processor.set_onaudioprocess(Some(on_audio.as_ref().unchecked_ref()));
         source.connect_with_audio_node(&processor)?;
         // A ScriptProcessorNode only fires while wired to the destination.
@@ -644,17 +646,23 @@ pub fn manage_capture(mut audio: ResMut<AudioCapture>) {
 /// Per-frame smoothing of the raw capture levels into AudioLevels: fast
 /// attack, slower release (punchy but not strobing), event ages for the ring
 /// waves, palette hue and Julia morph accumulation.
-pub fn update_audio(
-    time: Res<Time>,
-    capture: Res<AudioCapture>,
-    mut levels: ResMut<AudioLevels>,
-) {
+pub fn update_audio(time: Res<Time>, capture: Res<AudioCapture>, mut levels: ResMut<AudioLevels>) {
     let dt = time.delta_secs();
-    let shared = capture.capture.as_ref().filter(|_| capture.enabled).map(|c| &c.shared);
+    let shared = capture
+        .capture
+        .as_ref()
+        .filter(|_| capture.enabled)
+        .map(|c| &c.shared);
     let raw = shared.map(|s| s.snapshot()).unwrap_or_default();
     // A single non-finite value here poisons brightness/size uniforms and
     // blacks the whole frame; scrub before it enters the smoothing.
-    let clean = |v: f32| if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 };
+    let clean = |v: f32| {
+        if v.is_finite() {
+            v.clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    };
     let env = |cur: f32, target: f32| {
         let k = if target > cur { 30.0 } else { 5.0 };
         snap(cur + (clean(target) - cur) * (k * dt).min(1.0))

@@ -528,29 +528,30 @@ impl FromWorld for ParticlePipelines {
         });
         // Both trail passes are fullscreen-triangle fragments over the HDR
         // target; only entry point, layout, and blend differ.
-        let trail_pass = |label: &'static str,
-                          entry: &'static str,
-                          layout: Vec<BindGroupLayout>,
-                          blend: Option<BlendState>| RenderPipelineDescriptor {
-            label: Some(label.into()),
-            layout,
-            push_constant_ranges: vec![],
-            vertex: fullscreen_shader_vertex_state(),
-            fragment: Some(FragmentState {
-                shader: trail_shader.clone(),
-                shader_defs: vec![],
-                entry_point: entry.into(),
-                targets: vec![Some(ColorTargetState {
-                    format: ViewTarget::TEXTURE_FORMAT_HDR,
-                    blend,
-                    write_mask: ColorWrites::ALL,
-                })],
-            }),
-            primitive: PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: MultisampleState::default(),
-            zero_initialize_workgroup_memory: false,
-        };
+        let trail_pass =
+            |label: &'static str,
+             entry: &'static str,
+             layout: Vec<BindGroupLayout>,
+             blend: Option<BlendState>| RenderPipelineDescriptor {
+                label: Some(label.into()),
+                layout,
+                push_constant_ranges: vec![],
+                vertex: fullscreen_shader_vertex_state(),
+                fragment: Some(FragmentState {
+                    shader: trail_shader.clone(),
+                    shader_defs: vec![],
+                    entry_point: entry.into(),
+                    targets: vec![Some(ColorTargetState {
+                        format: ViewTarget::TEXTURE_FORMAT_HDR,
+                        blend,
+                        write_mask: ColorWrites::ALL,
+                    })],
+                }),
+                primitive: PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: MultisampleState::default(),
+                zero_initialize_workgroup_memory: false,
+            };
         // Fade pass: darken the trail texture in place. The fragment outputs
         // white; src_factor Zero / dst_factor Constant makes the result
         // dst * blend_constant, and the draw node sets the blend constant to

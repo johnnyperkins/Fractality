@@ -208,6 +208,10 @@ mod tests {
         let a = Dd::from_f64(1.0) + 1e-20;
         let sq = a * a;
         let frac = sq - Dd::from_f64(1.0);
-        assert!((frac.to_f64() - 2e-20).abs() < 1e-30, "frac = {:e}", frac.to_f64());
+        assert!(
+            (frac.to_f64() - 2e-20).abs() < 1e-30,
+            "frac = {:e}",
+            frac.to_f64()
+        );
     }
 }
