@@ -11,6 +11,7 @@ use bevy::core_pipeline::core_2d::graph::{Core2d, Node2d};
 use bevy::core_pipeline::fullscreen_vertex_shader::fullscreen_shader_vertex_state;
 use bevy::prelude::*;
 use bevy::render::{
+    extract_component::{ExtractComponent, ExtractComponentPlugin},
     extract_resource::{ExtractResource, ExtractResourcePlugin},
     graph::CameraDriverLabel,
     render_graph::{self, RenderGraph, RenderGraphApp, RenderLabel, ViewNode, ViewNodeRunner},
@@ -24,6 +25,13 @@ use bevy::render::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
+
+/// Marker for the camera the particle pipeline draws on. The draw node and
+/// trail sizing only run for this view: the native present camera (which
+/// composites the offscreen scene under the UI) is a plain sRGB target and
+/// running the HDR-format pipelines on it would fail wgpu validation.
+#[derive(Component, Clone, ExtractComponent)]
+pub struct ParticleCamera;
 
 /// GPU particle, 32 bytes. Layout must match the WGSL Particle struct exactly.
 #[repr(C)]
@@ -707,7 +715,7 @@ fn prepare_trail_texture(
     pipelines: Res<ParticlePipelines>,
     params: Option<Res<SimParams>>,
     uniform: Res<ParticleUniform>,
-    views: Query<&ViewTarget>,
+    views: Query<&ViewTarget, With<ParticleCamera>>,
     existing: Option<ResMut<TrailTexture>>,
     mut was_active: Local<bool>,
 ) {
@@ -815,13 +823,15 @@ impl render_graph::Node for ParticleComputeNode {
 struct ParticleDrawNode;
 
 impl ViewNode for ParticleDrawNode {
-    type ViewQuery = &'static ViewTarget;
+    // The marker reference doubles as the filter: the runner skips views
+    // without it (the native present camera).
+    type ViewQuery = (&'static ViewTarget, &'static ParticleCamera);
 
     fn run<'w>(
         &self,
         _graph: &mut render_graph::RenderGraphContext,
         render_context: &mut RenderContext<'w>,
-        view_target: bevy::ecs::query::QueryItem<'w, Self::ViewQuery>,
+        (view_target, _): bevy::ecs::query::QueryItem<'w, Self::ViewQuery>,
         world: &'w World,
     ) -> Result<(), render_graph::NodeRunError> {
         let (Some(bind_groups), Some(buffers), Some(pipelines)) = (
@@ -921,6 +931,7 @@ impl Plugin for ParticlePlugin {
 
         app.add_plugins(ExtractResourcePlugin::<SimParams>::default());
         app.add_plugins(ExtractResourcePlugin::<RefOrbit>::default());
+        app.add_plugins(ExtractComponentPlugin::<ParticleCamera>::default());
         app.add_systems(Update, drop_particle_seed);
 
         let render_app = app.sub_app_mut(RenderApp);

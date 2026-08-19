@@ -9,13 +9,19 @@ mod webutil;
 use std::sync::Arc;
 
 use bevy::core_pipeline::bloom::Bloom;
+#[cfg(not(target_arch = "wasm32"))]
+use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
 use bevy::render::camera::ClearColorConfig;
 #[cfg(not(target_arch = "wasm32"))]
+use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages};
+#[cfg(not(target_arch = "wasm32"))]
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 use bevy::render::view::Msaa;
+#[cfg(not(target_arch = "wasm32"))]
+use bevy::ui::IsDefaultUiCamera;
 use bevy::window::PresentMode;
 
 use bevy::math::DVec2;
@@ -27,10 +33,19 @@ use dd::DdVec2;
 use audio::{AudioCapture, AudioLevels};
 use menu::{MenuOpen, MenuPlugin, PointerOverMenu, Settings};
 use particles::{
-    generate_particles, julia_morph_c, reference_orbit, smooth_iter, ParticlePlugin, ParticleSeed,
-    RefOrbit, SimParams, JULIA_C, JULIA_TYPE, MAX_PARTICLES, REF_ORBIT_CAP,
+    generate_particles, julia_morph_c, reference_orbit, smooth_iter, ParticleCamera,
+    ParticlePlugin, ParticleSeed, RefOrbit, SimParams, JULIA_C, JULIA_TYPE, MAX_PARTICLES,
+    REF_ORBIT_CAP,
 };
 use recorder::{Recorder, RecorderPlugin};
+
+/// Offscreen render target the scene camera draws into (native only; on web
+/// the camera renders straight to the canvas). The window shows it through a
+/// backdrop node on the UI camera, so captures (P screenshot, O recording)
+/// read this texture and never contain the menu or the REC overlay.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Resource)]
+pub struct SceneTarget(pub Handle<Image>);
 
 const BASE_ITER: u32 = 240;
 const DEFAULT_CENTER: DVec2 = DVec2::new(-0.55, 0.0);
@@ -444,64 +459,178 @@ fn main() {
     println!("  X          auto-choreographer: dives, restyles, bursts on its own (X exits;");
     println!("             also self-starts after 30s idle, then any input exits)");
 
-    App::new()
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                title: "Fractality".into(),
-                present_mode: PresentMode::AutoNoVsync,
-                // Web: attach to the page's canvas and track its size.
-                // Both fields are no-ops on native.
-                canvas: Some("#fractality-canvas".into()),
-                fit_canvas_to_parent: true,
-                ..default()
-            }),
+    let mut app = App::new();
+    app.add_plugins(DefaultPlugins.set(WindowPlugin {
+        primary_window: Some(Window {
+            title: "Fractality".into(),
+            present_mode: PresentMode::AutoNoVsync,
+            // Web: attach to the page's canvas and track its size.
+            // Both fields are no-ops on native.
+            canvas: Some("#fractality-canvas".into()),
+            fit_canvas_to_parent: true,
             ..default()
-        }))
-        .add_plugins(FrameTimeDiagnosticsPlugin::default())
-        .add_plugins(ParticlePlugin)
-        .add_plugins(MenuPlugin)
-        .add_plugins(RecorderPlugin)
-        .insert_resource(Settings {
-            particle_count: count,
-            ..default()
-        })
-        .insert_resource(ViewState::default())
-        .insert_resource(Dissolve(false))
-        .insert_resource(ColorMode::default())
-        .insert_resource(FractalType::default())
-        .insert_resource(FlowMode::default())
-        .insert_resource(Kaleido::default())
-        .insert_resource(AutoZoom::default())
-        .insert_resource(Bookmarks::default())
-        .insert_resource(FlyTo::default())
-        .insert_resource(Attract::default())
-        .insert_resource(SimParams::default())
-        .insert_resource(RefOrbit::default())
-        .insert_resource(AudioCapture::default())
-        .insert_resource(AudioLevels::default())
-        .add_systems(Startup, setup)
-        .add_systems(
-            Update,
+        }),
+        ..default()
+    }))
+    .add_plugins(FrameTimeDiagnosticsPlugin::default())
+    .add_plugins(ParticlePlugin)
+    .add_plugins(MenuPlugin)
+    .add_plugins(RecorderPlugin)
+    .insert_resource(Settings {
+        particle_count: count,
+        ..default()
+    })
+    .insert_resource(ViewState::default())
+    .insert_resource(Dissolve(false))
+    .insert_resource(ColorMode::default())
+    .insert_resource(FractalType::default())
+    .insert_resource(FlowMode::default())
+    .insert_resource(Kaleido::default())
+    .insert_resource(AutoZoom::default())
+    .insert_resource(Bookmarks::default())
+    .insert_resource(FlyTo::default())
+    .insert_resource(Attract::default())
+    .insert_resource(SimParams::default())
+    .insert_resource(RefOrbit::default())
+    .insert_resource(AudioCapture::default())
+    .insert_resource(AudioLevels::default())
+    .add_systems(Startup, setup)
+    .add_systems(
+        Update,
+        (
             (
-                (
-                    handle_input,
-                    apply_fractal_switch,
-                    audio::manage_capture,
-                    audio::update_audio,
-                    update_attract,
-                    update_params,
-                )
-                    .chain(),
-                update_title,
-            ),
-        )
-        .run();
+                handle_input,
+                apply_fractal_switch,
+                audio::manage_capture,
+                audio::update_audio,
+                update_attract,
+                update_params,
+            )
+                .chain(),
+            update_title,
+        ),
+    );
+    #[cfg(not(target_arch = "wasm32"))]
+    app.add_systems(Update, sync_scene_target);
+    app.run();
 }
 
-fn setup(mut commands: Commands, settings: Res<Settings>, mut windows: Query<&mut Window>) {
+/// The offscreen scene texture: window-sized, tonemapped sRGB, readable by
+/// the screenshot/recording paths (COPY_SRC) and sampleable by the backdrop
+/// node (TEXTURE_BINDING).
+#[cfg(not(target_arch = "wasm32"))]
+fn scene_target_image(size: UVec2) -> Image {
+    let mut image = Image::new_fill(
+        Extent3d {
+            width: size.x.max(1),
+            height: size.y.max(1),
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        &[0, 0, 0, 255],
+        TextureFormat::Rgba8UnormSrgb,
+        bevy::asset::RenderAssetUsages::default(),
+    );
+    image.texture_descriptor.usage = TextureUsages::TEXTURE_BINDING
+        | TextureUsages::COPY_DST
+        | TextureUsages::COPY_SRC
+        | TextureUsages::RENDER_ATTACHMENT;
+    image
+}
+
+/// Follow window resizes with the offscreen target. Checked via get() first:
+/// get_mut() flags the asset changed and would re-upload it every frame.
+#[cfg(not(target_arch = "wasm32"))]
+fn sync_scene_target(
+    windows: Query<&Window>,
+    target: Res<SceneTarget>,
+    mut images: ResMut<Assets<Image>>,
+) {
+    let Ok(window) = windows.single() else {
+        return;
+    };
+    let want = Extent3d {
+        width: window.physical_width().max(1),
+        height: window.physical_height().max(1),
+        depth_or_array_layers: 1,
+    };
+    if images
+        .get(&target.0)
+        .is_some_and(|i| i.texture_descriptor.size != want)
+    {
+        if let Some(image) = images.get_mut(&target.0) {
+            image.resize(want);
+        }
+    }
+}
+
+fn setup(
+    mut commands: Commands,
+    settings: Res<Settings>,
+    mut windows: Query<&mut Window>,
+    #[cfg(not(target_arch = "wasm32"))] mut images: ResMut<Assets<Image>>,
+) {
+    #[allow(unused_mut, unused_variables)]
+    let mut size = UVec2::new(1920, 1080);
     if let Ok(mut window) = windows.single_mut() {
         window.set_maximized(true);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            size = UVec2::new(window.physical_width(), window.physical_height());
+        }
     }
+    // Native: the scene camera renders offscreen and a present camera puts
+    // that texture on the window underneath the UI, so captures read the
+    // texture and never contain UI. set_maximized lands later, so the
+    // initial size is provisional; sync_scene_target follows the window.
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let target = images.add(scene_target_image(size));
+        commands.spawn((
+            Camera2d,
+            Camera {
+                hdr: true,
+                clear_color: ClearColorConfig::Custom(Color::BLACK),
+                target: target.clone().into(),
+                ..default()
+            },
+            Bloom {
+                intensity: settings.bloom,
+                ..Bloom::NATURAL
+            },
+            Msaa::Off,
+            ParticleCamera,
+        ));
+        commands.spawn((
+            Camera2d,
+            Camera {
+                order: 1,
+                clear_color: ClearColorConfig::Custom(Color::BLACK),
+                ..default()
+            },
+            // The backdrop image is already tonemapped; mapping it again
+            // would shift the scene's colors on screen vs in captures.
+            Tonemapping::None,
+            Msaa::Off,
+            IsDefaultUiCamera,
+        ));
+        // Scene backdrop: the offscreen target stretched over the window,
+        // behind every other UI node.
+        commands.spawn((
+            ImageNode::new(target.clone()),
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(0.0),
+                top: Val::Px(0.0),
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                ..default()
+            },
+            GlobalZIndex(-1),
+        ));
+        commands.insert_resource(SceneTarget(target));
+    }
+    #[cfg(target_arch = "wasm32")]
     commands.spawn((
         Camera2d,
         Camera {
@@ -514,6 +643,7 @@ fn setup(mut commands: Commands, settings: Res<Settings>, mut windows: Query<&mu
             ..Bloom::NATURAL
         },
         Msaa::Off,
+        ParticleCamera,
     ));
 
     // bevy_platform's Instant works on wasm; std's panics there.
@@ -585,6 +715,7 @@ fn handle_input(
     mut bookmarks: ResMut<Bookmarks>,
     mut fly: ResMut<FlyTo>,
     mut audio: ResMut<AudioCapture>,
+    #[cfg(not(target_arch = "wasm32"))] scene: Res<SceneTarget>,
     mut commands: Commands,
 ) {
     let dt = time.delta_secs() as f64;
@@ -647,9 +778,11 @@ fn handle_input(
         let stamp = output_stamp(&time);
         let path = format!("fractality_{stamp}.png");
         info!("saving screenshot to {path}");
+        // The offscreen scene target, not the window: the window frame has
+        // the UI composited on top.
         #[cfg(not(target_arch = "wasm32"))]
         commands
-            .spawn(Screenshot::primary_window())
+            .spawn(Screenshot::image(scene.0.clone()))
             .observe(save_to_disk(path));
         #[cfg(target_arch = "wasm32")]
         {
