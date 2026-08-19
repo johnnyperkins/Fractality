@@ -20,9 +20,41 @@ pub struct RecorderPlugin;
 
 impl Plugin for RecorderPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<Recorder>().add_systems(Update, toggle);
+        app.init_resource::<Recorder>()
+            .init_resource::<RecordSettings>()
+            .add_systems(Update, toggle);
         #[cfg(not(target_arch = "wasm32"))]
         app.add_systems(Update, native::capture_frames.after(toggle));
+    }
+}
+
+/// Menu option lists for the Recording card (native path only; the web
+/// recorder is the browser's MediaRecorder and takes what it gets).
+pub const REC_RES_MODES: [&str; 2] = ["Native", "Half"];
+pub const REC_FPS_MODES: [&str; 4] = ["24", "30", "60", "120"];
+const REC_FPS_VALUES: [f64; 4] = [24.0, 30.0, 60.0, 120.0];
+
+/// Capture options for the next take, set from the menu's Recording card.
+/// Read once when a take starts; a running take keeps what it started with.
+/// Half res is the escape hatch for big displays: a 4K60 take encodes ~4x
+/// slower than 1080p60 and judders when the encoder cannot keep up.
+#[derive(Resource)]
+pub struct RecordSettings {
+    /// Index into REC_RES_MODES: 0 = native window pixels, 1 = half.
+    pub res: u32,
+    /// Index into REC_FPS_MODES.
+    pub fps: u32,
+}
+
+pub const REC_RES_DEFAULT: u32 = 0;
+pub const REC_FPS_DEFAULT: u32 = 2; // 60 fps
+
+impl Default for RecordSettings {
+    fn default() -> Self {
+        Self {
+            res: REC_RES_DEFAULT,
+            fps: REC_FPS_DEFAULT,
+        }
     }
 }
 
@@ -42,6 +74,7 @@ fn toggle(
     keys: Res<ButtonInput<KeyCode>>,
     time: Res<Time>,
     windows: Query<&Window>,
+    settings: Res<RecordSettings>,
     mut rec: ResMut<Recorder>,
 ) {
     if !keys.just_pressed(KeyCode::KeyO) {
@@ -56,7 +89,7 @@ fn toggle(
     };
     let stamp = crate::output_stamp(&time);
     let path = format!("fractality_{stamp}.{}", platform::EXT);
-    rec.active = platform::start(window, path);
+    rec.active = platform::start(window, path, &settings);
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -73,24 +106,45 @@ mod native {
     use mp4::{
         AvcConfig, Bytes, MediaConfig, Mp4Config, Mp4Sample, Mp4Writer, TrackConfig, TrackType,
     };
-    use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate, FrameType};
+    use openh264::encoder::{
+        BitRate, Complexity, Encoder, EncoderConfig, FrameRate, FrameType, IntraFramePeriod,
+        QpRange, UsageType, VuiConfig,
+    };
     use openh264::formats::YUVSource;
     use openh264::OpenH264API;
 
-    use super::Recorder;
+    use super::{RecordSettings, Recorder, REC_FPS_VALUES};
 
     pub(super) const EXT: &str = "mp4";
 
-    /// Output timeline rate. The app renders vsync-off at whatever rate the
-    /// GPU manages, so capture skips frames rendered faster than this and the
-    /// encoder stretches sample durations over frames rendered slower,
-    /// keeping the video playing back in real time.
-    const FPS: f64 = 60.0;
+    /// High because the content is a full-screen particle field in constant
+    /// motion, near worst-case for an encoder. With the QP range clamped
+    /// below, rate control treats this as a soft ceiling: quality never
+    /// drops past QP_MAX to hit it. In practice the encoder stays content
+    /// limited under this (~57 Mbps at 1080p, ~70 at 4K on the harness
+    /// field). Local disk is the only consumer, so file size loses every
+    /// tradeoff against quality.
+    const BITRATE_BPS: u32 = 100_000_000;
 
-    /// Generous for 1080p60: the content is a full-screen particle field in
-    /// constant motion, which starves at bitrates that would flatter video of
-    /// people. Quality-mode rate control treats this as a ceiling.
-    const BITRATE_BPS: u32 = 20_000_000;
+    /// Rate-control quantizer clamp. The max is the quality floor: without
+    /// it, openh264 runs to QP 51 on motion spikes and the whole frame turns
+    /// to mush. The min just stops calm scenes from wasting bitrate on
+    /// invisible gains.
+    const QP_MIN: u8 = 12;
+    const QP_MAX: u8 = 36;
+
+    /// Keyframe every 2s so players can seek without decoding from the top.
+    const IDR_INTERVAL_SECS: f64 = 2.0;
+
+    /// Slice size cap, which is what actually unlocks openh264's threading:
+    /// with the default single-slice mode the thread count is ignored and one
+    /// core encodes everything (~30 fps at 1080p, measured by the
+    /// quality_harness test below), falling behind the 60 fps capture and
+    /// juddering the output. Multi-slice measured 3-4x faster with slightly
+    /// better PSNR. The size is load-bearing: in screen-content mode at
+    /// 1080p, 30k or 8k slices both collapsed back to ~40 enc fps while 15k
+    /// held ~117, and 4K was indifferent, so 15k it is.
+    const MAX_SLICE_LEN: u32 = 15_000;
 
     /// A live recording. Dropping it closes the channel, which ends the
     /// encoder loop and finalizes the mp4. The join is synchronous: the brief
@@ -107,6 +161,11 @@ mod native {
         join: Option<std::thread::JoinHandle<()>>,
         start: Instant,
         size: UVec2,
+        /// Output timeline rate for this take. The app renders vsync-off at
+        /// whatever rate the GPU manages, so capture skips frames rendered
+        /// faster than this and the encoder stretches sample durations over
+        /// frames rendered slower, keeping playback in real time.
+        fps: f64,
         /// Timeline ticks already covered by a spawned capture, for pacing.
         captured: u64,
     }
@@ -132,7 +191,11 @@ mod native {
         data: Vec<u8>,
     }
 
-    pub(super) fn start(window: &Window, path: String) -> Option<Handle> {
+    pub(super) fn start(
+        window: &Window,
+        path: String,
+        settings: &RecordSettings,
+    ) -> Option<Handle> {
         // Create the file up front so a read-only working dir fails the
         // toggle instead of surfacing minutes later at stop time.
         let file = match File::create(&path) {
@@ -142,18 +205,26 @@ mod native {
                 return None;
             }
         };
+        let fps = REC_FPS_VALUES[(settings.fps as usize).min(REC_FPS_VALUES.len() - 1)];
+        let scale = 1usize << settings.res.min(1);
         // Small bound: at 1080p a frame is ~8 MB, and a deep queue only adds
         // latency. When the encoder falls behind, try_send drops frames and
         // the timeline pacing keeps playback speed correct anyway.
         let (tx, rx) = std::sync::mpsc::sync_channel::<Frame>(4);
         let thread_path = path.clone();
-        let join = std::thread::spawn(move || encode_loop(rx, file, thread_path));
-        info!("recording to {path} (O to stop)");
+        let join = std::thread::spawn(move || encode_loop(rx, file, thread_path, fps, scale));
+        let size = UVec2::new(window.physical_width(), window.physical_height());
+        info!(
+            "recording to {path} at {}x{} {fps} fps (O to stop)",
+            size.x as usize / scale,
+            size.y as usize / scale,
+        );
         Some(Handle {
             tx: Arc::new(Mutex::new(Some(tx))),
             join: Some(join),
             start: Instant::now(),
-            size: UVec2::new(window.physical_width(), window.physical_height()),
+            size,
+            fps,
             captured: 0,
         })
     }
@@ -165,6 +236,7 @@ mod native {
     pub(super) fn capture_frames(
         mut rec: ResMut<Recorder>,
         windows: Query<&Window>,
+        scene: Res<crate::SceneTarget>,
         mut commands: Commands,
     ) {
         let Some(handle) = rec.active.as_mut() else {
@@ -182,16 +254,18 @@ mod native {
             return;
         }
         // Pace at capture time: a frame the encoder would drop anyway is not
-        // worth the GPU copy and readback. Rendering above FPS, most frames
-        // skip here; below FPS, every frame captures.
-        let due = (handle.start.elapsed().as_secs_f64() * FPS) as u64 + 1;
+        // worth the GPU copy and readback. Rendering above the take's fps,
+        // most frames skip here; below it, every frame captures.
+        let due = (handle.start.elapsed().as_secs_f64() * handle.fps) as u64 + 1;
         if due <= handle.captured {
             return;
         }
         handle.captured = due;
         let tx = handle.tx.clone();
         let start = handle.start;
-        commands.spawn(Screenshot::primary_window()).observe(
+        // The offscreen scene target, not the window: the window frame has
+        // the UI composited on top (menu, REC overlay).
+        commands.spawn(Screenshot::image(scene.0.clone())).observe(
             move |mut trigger: Trigger<ScreenshotCaptured>| {
                 let img = &mut trigger.event_mut().0;
                 // Move the multi-MB buffer out instead of cloning it; the
@@ -244,7 +318,7 @@ mod native {
             }
         }
 
-        /// BT.601 limited-range conversion with 2x2 chroma averaging,
+        /// BT.709 limited-range conversion with 2x2 chroma averaging,
         /// cropping the source (row length `src_w`) down to the even
         /// (self.w, self.h). Works row-pair at a time on pre-sliced rows so
         /// the compiler can hoist the bounds checks out of the hot loop. The
@@ -267,15 +341,15 @@ mod native {
                         sr += pr;
                         sg += pg;
                         sb += pb;
-                        (16 + ((66 * pr + 129 * pg + 25 * pb + 128) >> 8)) as u8
+                        (16 + ((47 * pr + 157 * pg + 16 * pb + 128) >> 8)) as u8
                     };
                     y0[bx * 2] = luma(&src0[bx * 8..][..4]);
                     y0[bx * 2 + 1] = luma(&src0[bx * 8 + 4..][..4]);
                     y1[bx * 2] = luma(&src1[bx * 8..][..4]);
                     y1[bx * 2 + 1] = luma(&src1[bx * 8 + 4..][..4]);
                     let (pr, pg, pb) = (sr / 4, sg / 4, sb / 4);
-                    u_row[bx] = (128 + ((-38 * pr - 74 * pg + 112 * pb + 128) >> 8)) as u8;
-                    v_row[bx] = (128 + ((112 * pr - 94 * pg - 18 * pb + 128) >> 8)) as u8;
+                    u_row[bx] = (128 + ((-26 * pr - 86 * pg + 112 * pb + 128) >> 8)) as u8;
+                    v_row[bx] = (128 + ((112 * pr - 102 * pg - 10 * pb + 128) >> 8)) as u8;
                 }
             }
         }
@@ -324,10 +398,41 @@ mod native {
         sample_hint: usize,
     }
 
-    fn init_state(w: usize, h: usize, file: File) -> Result<EncState, String> {
+    /// Encoder thread count: most of the machine, minus headroom for the
+    /// game loop and the capture readback.
+    fn threads() -> u16 {
+        let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+        cores.saturating_sub(2).clamp(2, 8) as u16
+    }
+
+    fn init_state(w: usize, h: usize, fps: f64, file: File) -> Result<EncState, String> {
         let config = EncoderConfig::new()
             .bitrate(BitRate::from_bps(BITRATE_BPS))
-            .max_frame_rate(FrameRate::from_hz(FPS as f32));
+            .max_frame_rate(FrameRate::from_hz(fps as f32))
+            // Never let rate control drop frames wholesale: over-budget
+            // spikes (the default, with this content) turned into skipped
+            // frames and visible stutter. The QP clamp bounds quality
+            // instead, letting bitrate overshoot on chaos.
+            .skip_frames(false)
+            .qp(QpRange::new(QP_MIN, QP_MAX))
+            .intra_frame_period(IntraFramePeriod::from_num_frames(
+                (fps * IDR_INTERVAL_SECS) as u32,
+            ))
+            // Declare the BT.709 limited-range conversion done in fill();
+            // unflagged HD video gets assumed 709 anyway, but players fed
+            // the old unflagged 601 conversion showed shifted colors.
+            .vui(VuiConfig::bt709())
+            // Leave two cores for the render side; the harness measured Low
+            // complexity as fast as it sounds and no worse than Medium on
+            // this content (the QP clamp holds quality, bitrate absorbs it).
+            .num_threads(threads())
+            .max_slice_len(MAX_SLICE_LEN)
+            .complexity(Complexity::Low)
+            // Screen-content mode reads as a misnomer for a particle field,
+            // but the harness measured it +2.5 dB at 1080p and +4 dB at 4K
+            // over camera mode at the same bitrate: its intra tools fit
+            // sharp dots on flat dark background far better.
+            .usage_type(UsageType::ScreenContentRealTime);
         let encoder = Encoder::with_api_config(OpenH264API::from_source(), config)
             .map_err(|e| format!("encoder init failed: {e}"))?;
         let writer = Mp4Writer::write_start(
@@ -356,39 +461,67 @@ mod native {
         })
     }
 
-    fn encode_loop(rx: Receiver<Frame>, file: File, path: String) {
+    /// 2x2 RGBA box average into dst (tw x th), for half-res capture.
+    /// Alpha is skipped: the yuv conversion never reads it.
+    fn downsample2(src: &[u8], src_w: usize, tw: usize, th: usize, dst: &mut Vec<u8>) {
+        dst.resize(tw * th * 4, 0);
+        for y in 0..th {
+            let row0 = &src[(y * 2) * src_w * 4..][..tw * 8];
+            let row1 = &src[(y * 2 + 1) * src_w * 4..][..tw * 8];
+            let out = &mut dst[y * tw * 4..][..tw * 4];
+            for x in 0..tw {
+                let (a, b) = (&row0[x * 8..][..8], &row1[x * 8..][..8]);
+                for c in 0..3 {
+                    let sum = a[c] as u16 + a[c + 4] as u16 + b[c] as u16 + b[c + 4] as u16;
+                    out[x * 4 + c] = ((sum + 2) >> 2) as u8;
+                }
+            }
+        }
+    }
+
+    fn encode_loop(rx: Receiver<Frame>, file: File, path: String, fps: f64, scale: usize) {
         // Delete the eagerly created file if no sample ever reached it
         // (encoder init failure, or a take stopped before the first
         // readback landed): a zero-byte mp4 on disk helps nobody.
-        if encode_frames(rx, file, &path) == 0 {
+        if encode_frames(rx, file, &path, fps, scale) == 0 {
             let _ = std::fs::remove_file(&path);
         }
     }
 
     /// Runs the encode until the channel closes or a fatal error; returns
     /// the number of timeline frames written into the mp4.
-    fn encode_frames(rx: Receiver<Frame>, file: File, path: &str) -> u64 {
+    fn encode_frames(rx: Receiver<Frame>, file: File, path: &str, fps: f64, scale: usize) -> u64 {
         let mut file = Some(file);
         let mut state: Option<EncState> = None;
         let mut written: u64 = 0;
+        // Distinct encoded frames, vs `written` timeline ticks: the ratio is
+        // the effective frame rate, the first thing to check when a take
+        // looks choppy (it means capture or encode fell behind).
+        let mut samples: u64 = 0;
+        // Reused half-res buffer, allocated on first use when scale == 2.
+        let mut half: Vec<u8> = Vec::new();
         while let Ok(frame) = rx.recv() {
             // Sample durations against the fixed timeline: a frame at time t
-            // owes the stream samples up to index t*FPS, so one slow-rendered
+            // owes the stream samples up to index t*fps, so one slow-rendered
             // frame becomes one sample stretched over n ticks. The capture
             // side paces the fast direction; n = 0 only for stragglers that
             // slipped through, and the cap bounds the jump after a stall.
-            let due = (frame.t * FPS) as u64 + 1;
+            let due = (frame.t * fps) as u64 + 1;
             let n = due.saturating_sub(written).min(240) as u32;
             if n == 0 {
                 continue;
             }
-            // yuv420 needs even dimensions; crop a stray odd row/column.
-            let (w, h) = ((frame.w as usize) & !1, (frame.h as usize) & !1);
+            // yuv420 needs even dimensions; crop a stray odd row/column
+            // (after the optional downscale).
+            let (w, h) = (
+                (frame.w as usize / scale) & !1,
+                (frame.h as usize / scale) & !1,
+            );
             if state.is_none() {
                 if w == 0 || h == 0 {
                     continue;
                 }
-                match init_state(w, h, file.take().unwrap()) {
+                match init_state(w, h, fps, file.take().unwrap()) {
                     Ok(s) => state = Some(s),
                     Err(e) => {
                         error!("recording: {e}");
@@ -408,7 +541,12 @@ mod native {
                 error!("recording: unsupported surface format {:?}", frame.format);
                 return written;
             };
-            st.yuv.fill(&frame.data, frame.w as usize, r, b);
+            if scale == 2 {
+                downsample2(&frame.data, frame.w as usize, w, h, &mut half);
+                st.yuv.fill(&half, w, r, b);
+            } else {
+                st.yuv.fill(&frame.data, frame.w as usize, r, b);
+            }
             let bs = match st.encoder.encode(&st.yuv) {
                 Ok(bs) => bs,
                 Err(e) => {
@@ -437,6 +575,13 @@ mod native {
                 }
             }
             st.sample_hint = st.sample_hint.max(sample.len());
+            // A frame the encoder skipped entirely (rate control, despite
+            // skip_frames(false) being asked for) has no slice NALs; a
+            // zero-byte sample corrupts the track, and the timeline pacing
+            // absorbs the gap on the next frame anyway.
+            if sample.is_empty() {
+                continue;
+            }
             if !st.track_added {
                 // The first frame is an IDR carrying SPS+PPS; the track's
                 // avcC header needs them, so it cannot be added any earlier.
@@ -445,7 +590,7 @@ mod native {
                 };
                 let track = TrackConfig {
                     track_type: TrackType::Video,
-                    timescale: FPS as u32,
+                    timescale: fps as u32,
                     language: "und".into(),
                     media_conf: MediaConfig::AvcConfig(AvcConfig {
                         width: w as u16,
@@ -472,14 +617,21 @@ mod native {
                 return written;
             }
             written += n as u64;
+            samples += 1;
         }
         if let Some(mut st) = state {
             if let Err(e) = st.writer.write_end() {
                 error!("recording: mp4 finalize failed: {e}");
                 return written;
             }
-            let secs = written as f64 / FPS;
-            info!("recording saved to {path} ({written} frames, {secs:.1}s)");
+            let secs = written as f64 / fps;
+            let mb = std::fs::metadata(path).map_or(0.0, |m| m.len() as f64 / 1e6);
+            let mbps = mb * 8.0 / secs.max(1e-6);
+            let fps_eff = samples as f64 / secs.max(1e-6);
+            info!(
+                "recording saved to {path}: {secs:.1}s, {samples} frames \
+                 ({fps_eff:.0} fps effective), {mb:.0} MB, {mbps:.0} Mbps"
+            );
         }
         written
     }
@@ -487,6 +639,156 @@ mod native {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// Timeline rate used by every test take.
+        const FPS: f64 = 60.0;
+
+        /// Deterministic stand-in for the real content: bright moving dots
+        /// over a dark drifting gradient, the near-noise motion that makes
+        /// particle fields hard to encode.
+        fn synth_rgba(w: usize, h: usize, frames: usize) -> Vec<Vec<u8>> {
+            const N: usize = 3000;
+            let mut seed = 0x1234_5678_9abc_def0_u64;
+            let mut rand = move || {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (seed >> 40) as u32
+            };
+            let mut pos: Vec<(f32, f32)> = (0..N)
+                .map(|_| ((rand() % w as u32) as f32, (rand() % h as u32) as f32))
+                .collect();
+            let vel: Vec<(f32, f32)> = (0..N)
+                .map(|_| {
+                    (
+                        (rand() % 1024) as f32 / 128.0 - 4.0,
+                        (rand() % 1024) as f32 / 128.0 - 4.0,
+                    )
+                })
+                .collect();
+            let color: Vec<[u8; 3]> = (0..N)
+                .map(|_| {
+                    [
+                        64 + (rand() % 192) as u8,
+                        64 + (rand() % 192) as u8,
+                        64 + (rand() % 192) as u8,
+                    ]
+                })
+                .collect();
+            (0..frames)
+                .map(|t| {
+                    let mut f = vec![0u8; w * h * 4];
+                    // Separable background so it costs w+h trig calls, not w*h.
+                    let sx: Vec<f32> = (0..w)
+                        .map(|x| (x as f32 / 97.0 + t as f32 * 0.05).sin())
+                        .collect();
+                    let cy: Vec<f32> = (0..h)
+                        .map(|y| (y as f32 / 71.0 - t as f32 * 0.03).cos())
+                        .collect();
+                    for (y, cy) in cy.iter().enumerate() {
+                        for (x, sx) in sx.iter().enumerate() {
+                            let v = 12.0 + 10.0 * sx * cy;
+                            let p = (y * w + x) * 4;
+                            f[p] = v as u8;
+                            f[p + 1] = v as u8;
+                            f[p + 2] = (v * 1.5) as u8;
+                            f[p + 3] = 255;
+                        }
+                    }
+                    for i in 0..N {
+                        pos[i].0 = (pos[i].0 + vel[i].0).rem_euclid(w as f32 - 2.0);
+                        pos[i].1 = (pos[i].1 + vel[i].1).rem_euclid(h as f32 - 2.0);
+                        let (px, py) = (pos[i].0 as usize, pos[i].1 as usize);
+                        for dy in 0..2 {
+                            for dx in 0..2 {
+                                let p = ((py + dy) * w + px + dx) * 4;
+                                f[p] = color[i][0];
+                                f[p + 1] = color[i][1];
+                                f[p + 2] = color[i][2];
+                            }
+                        }
+                    }
+                    f
+                })
+                .collect()
+        }
+
+        /// Encoder tuning harness, not a pass/fail test: encodes the
+        /// synthetic field under config variants, decodes it back, and
+        /// prints PSNR, the bitrate actually produced, and encode speed.
+        /// Run: cargo test --release quality_harness -- --ignored --nocapture
+        #[test]
+        #[ignore = "tuning harness, run manually with --ignored --nocapture"]
+        fn quality_harness() {
+            use openh264::decoder::Decoder;
+
+            let (w, h) = match std::env::var("HARNESS_4K") {
+                Ok(_) => (3840usize, 2160usize),
+                Err(_) => (1920usize, 1080usize),
+            };
+            let n_frames = 90usize;
+            let rgba = synth_rgba(w, h, n_frames);
+
+            let base = EncoderConfig::new()
+                .bitrate(BitRate::from_bps(BITRATE_BPS))
+                .max_frame_rate(FrameRate::from_hz(FPS as f32))
+                .skip_frames(false)
+                .qp(QpRange::new(QP_MIN, QP_MAX))
+                .intra_frame_period(IntraFramePeriod::from_num_frames(
+                    (FPS * IDR_INTERVAL_SECS) as u32,
+                ))
+                .vui(VuiConfig::bt709());
+            // "prod" mirrors init_state's production config (fixed thread
+            // count instead of the machine-derived one).
+            let prod = base
+                .num_threads(6)
+                .max_slice_len(MAX_SLICE_LEN)
+                .complexity(Complexity::Low)
+                .usage_type(UsageType::ScreenContentRealTime);
+            let variants: Vec<(&str, EncoderConfig)> = vec![
+                ("prod", prod),
+                (
+                    "prod camera",
+                    prod.usage_type(UsageType::CameraVideoRealTime),
+                ),
+                ("prod 50M", prod.bitrate(BitRate::from_bps(50_000_000))),
+                ("prod 150M", prod.bitrate(BitRate::from_bps(150_000_000))),
+                ("prod medium", prod.complexity(Complexity::Medium)),
+            ];
+
+            for (name, cfg) in variants {
+                let mut enc = Encoder::with_api_config(OpenH264API::from_source(), cfg).unwrap();
+                let mut dec = Decoder::new().unwrap();
+                let mut yuv = I420::new(w, h);
+                let (mut bytes, mut se, mut px) = (0usize, 0u64, 0u64);
+                let mut enc_time = std::time::Duration::ZERO;
+                for f in &rgba {
+                    yuv.fill(f, w, 0, 2);
+                    let t0 = std::time::Instant::now();
+                    let bs = enc.encode(&yuv).unwrap();
+                    let packet = bs.to_vec();
+                    enc_time += t0.elapsed();
+                    bytes += packet.len();
+                    if let Some(dy) = dec.decode(&packet).ok().flatten() {
+                        let ys = dy.strides().0;
+                        let (dec_y, src_y) = (dy.y(), yuv.y());
+                        for row in 0..h {
+                            let a = &src_y[row * w..][..w];
+                            let b = &dec_y[row * ys..][..w];
+                            for i in 0..w {
+                                let d = a[i] as i64 - b[i] as i64;
+                                se += (d * d) as u64;
+                            }
+                        }
+                        px += (w * h) as u64;
+                    }
+                }
+                let psnr = 10.0 * (255.0f64 * 255.0 / (se as f64 / px as f64)).log10();
+                let mbps = (bytes * 8) as f64 * FPS / n_frames as f64 / 1e6;
+                let enc_fps = n_frames as f64 / enc_time.as_secs_f64();
+                println!("{name:>18}: {psnr:5.2} dB  {mbps:7.2} Mbps  {enc_fps:5.1} enc fps");
+            }
+        }
 
         /// Full pipeline on synthetic frames: convert, encode, mux, then
         /// reparse the mp4 and check the track holds the expected samples.
@@ -521,7 +823,7 @@ mod native {
                 .unwrap();
             }
             drop(tx);
-            encode_loop(rx, file, path.to_string_lossy().into_owned());
+            encode_loop(rx, file, path.to_string_lossy().into_owned(), FPS, 1);
 
             let bytes = std::fs::read(&path).unwrap();
             assert_eq!(&bytes[4..8], b"ftyp");
@@ -532,6 +834,58 @@ mod native {
             assert_eq!(track.sample_count(), 30);
             assert_eq!(track.width(), w as u16);
             assert_eq!(track.height(), h as u16);
+        }
+
+        /// Half-res path: same pipeline at scale 2 muxes a track at half the
+        /// source dimensions, and the box filter averages exact 2x2 blocks.
+        #[test]
+        fn encodes_half_res() {
+            let dir = std::env::temp_dir().join("fractality_rec_test");
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("half.mp4");
+            let file = File::create(&path).unwrap();
+
+            let (w, h) = (320u32, 240u32);
+            let (tx, rx) = std::sync::mpsc::sync_channel::<Frame>(64);
+            for i in 0..10u32 {
+                let mut data = vec![0u8; (w * h * 4) as usize];
+                for y in 0..h {
+                    for x in 0..w {
+                        let p = ((y * w + x) * 4) as usize;
+                        data[p] = (x + i * 4) as u8;
+                        data[p + 1] = (y + i * 2) as u8;
+                        data[p + 2] = 128;
+                        data[p + 3] = 255;
+                    }
+                }
+                tx.send(Frame {
+                    t: i as f64 / FPS,
+                    w,
+                    h,
+                    format: TextureFormat::Bgra8UnormSrgb,
+                    data,
+                })
+                .unwrap();
+            }
+            drop(tx);
+            encode_loop(rx, file, path.to_string_lossy().into_owned(), FPS, 2);
+
+            let bytes = std::fs::read(&path).unwrap();
+            let size = bytes.len() as u64;
+            let mp4 = mp4::Mp4Reader::read_header(std::io::Cursor::new(bytes), size).unwrap();
+            let track = mp4.tracks().values().next().unwrap();
+            assert_eq!(track.sample_count(), 10);
+            assert_eq!(track.width(), (w / 2) as u16);
+            assert_eq!(track.height(), (h / 2) as u16);
+
+            // Box filter itself: a 2x2 block averages to one pixel, rounded.
+            let src = [
+                10, 20, 30, 255, 20, 30, 40, 255, //
+                30, 40, 50, 255, 40, 50, 60, 255,
+            ];
+            let mut dst = Vec::new();
+            downsample2(&src, 2, 1, 1, &mut dst);
+            assert_eq!(&dst[..3], &[25, 35, 45]);
         }
     }
 }
@@ -570,7 +924,13 @@ mod web {
         }
     }
 
-    pub(super) fn start(_window: &Window, name: String) -> Option<Handle> {
+    /// Settings are ignored here: MediaRecorder encodes whatever the canvas
+    /// stream provides at the browser's chosen rate.
+    pub(super) fn start(
+        _window: &Window,
+        name: String,
+        _settings: &super::RecordSettings,
+    ) -> Option<Handle> {
         let Some(canvas) = webutil::canvas() else {
             warn!("recording: canvas not found");
             return None;
