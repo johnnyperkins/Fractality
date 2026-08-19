@@ -64,6 +64,7 @@ mod native {
     use std::fs::File;
     use std::io::BufWriter;
     use std::sync::mpsc::{Receiver, SyncSender};
+    use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
     use bevy::prelude::*;
@@ -97,7 +98,12 @@ mod native {
     /// disk even when the drop is the app quitting (a detached joiner would
     /// be killed at process exit, truncating the file mid-finalize).
     pub(super) struct Handle {
-        tx: Option<SyncSender<Frame>>,
+        /// The channel's only sender, in a slot shared with the in-flight
+        /// screenshot observers. Observers must not own sender clones: a
+        /// readback still pending at stop time would hold the channel open
+        /// while the join below blocks the schedule that would deliver it,
+        /// deadlocking the app.
+        tx: Arc<Mutex<Option<SyncSender<Frame>>>>,
         join: Option<std::thread::JoinHandle<()>>,
         start: Instant,
         size: UVec2,
@@ -108,7 +114,7 @@ mod native {
     impl Drop for Handle {
         fn drop(&mut self) {
             info!("recording stopped, finalizing");
-            drop(self.tx.take());
+            *self.tx.lock().unwrap() = None;
             if let Some(join) = self.join.take() {
                 let _ = join.join();
             }
@@ -144,7 +150,7 @@ mod native {
         let join = std::thread::spawn(move || encode_loop(rx, file, thread_path));
         info!("recording to {path} (O to stop)");
         Some(Handle {
-            tx: Some(tx),
+            tx: Arc::new(Mutex::new(Some(tx))),
             join: Some(join),
             start: Instant::now(),
             size: UVec2::new(window.physical_width(), window.physical_height()),
@@ -183,7 +189,7 @@ mod native {
             return;
         }
         handle.captured = due;
-        let tx = handle.tx.clone().unwrap();
+        let tx = handle.tx.clone();
         let start = handle.start;
         commands.spawn(Screenshot::primary_window()).observe(
             move |mut trigger: Trigger<ScreenshotCaptured>| {
@@ -200,8 +206,11 @@ mod native {
                     format: img.texture_descriptor.format,
                     data,
                 };
-                // Full channel means the encoder is behind; drop the frame.
-                let _ = tx.try_send(frame);
+                // Slot empty means the take already stopped; full channel
+                // means the encoder is behind. Drop the frame either way.
+                if let Some(tx) = tx.lock().unwrap().as_ref() {
+                    let _ = tx.try_send(frame);
+                }
             },
         );
     }
