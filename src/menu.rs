@@ -10,7 +10,10 @@ use bevy::prelude::*;
 use bevy::ui::{ComputedNode, RelativeCursorPosition};
 
 use crate::audio::{AudioCapture, AudioLevels};
-use crate::particles::MAX_PARTICLES;
+use crate::particles::{ParticleCamera, MAX_PARTICLES};
+use crate::recorder::{
+    RecordSettings, REC_FPS_DEFAULT, REC_FPS_MODES, REC_RES_DEFAULT, REC_RES_MODES,
+};
 use crate::{
     Attract, ColorMode, FlowMode, FractalType, Kaleido, COLOR_MODES, FLOW_MODES, FRACTAL_MODES,
 };
@@ -259,16 +262,22 @@ impl Setting {
     }
 }
 
-/// The three list-valued modes. One row shape, one dropdown, one set of
+/// The list-valued modes. One row shape, one dropdown, one set of
 /// handlers for all of them; the per-mode resource is picked in get/set.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Select {
     Fractal,
     Flow,
     Palette,
+    RecRes,
+    RecFps,
 }
 
 const SELECTS: [Select; 3] = [Select::Fractal, Select::Flow, Select::Palette];
+
+/// Recording card rows (native builds only; the web recorder has no knobs).
+#[cfg(not(target_arch = "wasm32"))]
+const REC_SELECTS: [Select; 2] = [Select::RecRes, Select::RecFps];
 
 impl Select {
     fn label(self) -> &'static str {
@@ -276,15 +285,19 @@ impl Select {
             Select::Fractal => "Fractal",
             Select::Flow => "Flow",
             Select::Palette => "Palette",
+            Select::RecRes => "Res",
+            Select::RecFps => "FPS",
         }
     }
 
     /// Key that cycles the same value, shown as a chip on the row.
+    /// Empty = no shortcut, the chip is hidden.
     fn key(self) -> &'static str {
         match self {
             Select::Fractal => "F",
             Select::Flow => "G",
             Select::Palette => "C",
+            Select::RecRes | Select::RecFps => "",
         }
     }
 
@@ -293,14 +306,34 @@ impl Select {
             Select::Fractal => &FRACTAL_MODES,
             Select::Flow => &FLOW_MODES,
             Select::Palette => &COLOR_MODES,
+            Select::RecRes => &REC_RES_MODES,
+            Select::RecFps => &REC_FPS_MODES,
         }
     }
 
-    fn get(self, fractal: &FractalType, flow: &FlowMode, palette: &ColorMode) -> u32 {
+    /// Index shown before the user touches anything; must match the owning
+    /// resource's Default.
+    fn initial(self) -> u32 {
+        match self {
+            Select::RecRes => REC_RES_DEFAULT,
+            Select::RecFps => REC_FPS_DEFAULT,
+            _ => 0,
+        }
+    }
+
+    fn get(
+        self,
+        fractal: &FractalType,
+        flow: &FlowMode,
+        palette: &ColorMode,
+        rec: &RecordSettings,
+    ) -> u32 {
         match self {
             Select::Fractal => fractal.0,
             Select::Flow => flow.0,
             Select::Palette => palette.0,
+            Select::RecRes => rec.res,
+            Select::RecFps => rec.fps,
         }
     }
 
@@ -313,11 +346,14 @@ impl Select {
         fractal: &mut ResMut<FractalType>,
         flow: &mut ResMut<FlowMode>,
         palette: &mut ResMut<ColorMode>,
+        rec: &mut ResMut<RecordSettings>,
     ) {
         match self {
             Select::Fractal if fractal.0 != index => fractal.0 = index,
             Select::Flow if flow.0 != index => flow.0 = index,
             Select::Palette if palette.0 != index => palette.0 = index,
+            Select::RecRes if rec.res != index => rec.res = index,
+            Select::RecFps if rec.fps != index => rec.fps = index,
             _ => {}
         }
     }
@@ -413,17 +449,40 @@ struct TogglePill(Toggle);
 #[derive(Component)]
 struct ToggleSection(Toggle);
 
-/// Clickable CONTROLS header (collapses the key list).
-#[derive(Component)]
-struct ControlsHeader;
+/// The collapsible cards; each pairs a clickable header with a foldable body.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CollapseSection {
+    Recording,
+    Controls,
+}
 
-/// The collapsible key list.
+/// Clickable card header that folds its section's body away. Open state
+/// lives here, so each section keeps its own.
 #[derive(Component)]
-struct ControlsBody;
+struct CollapseHeader {
+    section: CollapseSection,
+    open: bool,
+}
 
-/// Caret glyph on the CONTROLS header, flipped on collapse.
+/// The foldable part of a collapsible card.
 #[derive(Component)]
-struct ControlsCaret;
+struct CollapseBody(CollapseSection);
+
+/// Caret glyph on a collapsible header, flipped on collapse.
+#[derive(Component)]
+struct CollapseCaret(CollapseSection);
+
+/// REC chip in the panel header, hidden unless a take is running.
+#[derive(Component)]
+struct RecChip;
+
+/// The pulsing dot inside the REC chip.
+#[derive(Component)]
+struct RecDot;
+
+/// The elapsed-time text inside the REC chip.
+#[derive(Component)]
+struct RecTime;
 
 /// Marker on every clickable menu widget, so track_pointer_over_menu shields
 /// the sim from their clicks without enumerating each row type.
@@ -450,7 +509,8 @@ impl Plugin for MenuPlugin {
                     update_select_ui,
                     click_toggle,
                     sync_toggles,
-                    click_controls_header,
+                    click_collapse_header,
+                    update_rec_chip,
                     apply_bloom,
                 ),
             );
@@ -474,6 +534,7 @@ const TRACK_HOVER: Color = Color::srgb(0.170, 0.200, 0.290);
 const FILL_COLOR: Color = Color::srgb(0.38, 0.50, 0.86);
 const KNOB_COLOR: Color = Color::srgb(0.80, 0.87, 1.00);
 const ACCENT: Color = Color::srgb(0.42, 0.58, 1.00);
+const REC_RED: Color = Color::srgb(0.96, 0.30, 0.30);
 const PILL_OFF: Color = Color::srgb(0.14, 0.16, 0.23);
 const CHIP_BG: Color = Color::srgba(0.60, 0.70, 1.00, 0.10);
 const DROPDOWN_BG: Color = Color::srgba(0.055, 0.065, 0.105, 0.98);
@@ -508,9 +569,15 @@ fn text_bundle(
 }
 
 /// Keyboard-shortcut chip, e.g. the "K" next to the kaleidoscope row.
+/// An empty key collapses the chip so keyless rows keep the same shell.
 fn key_chip(key: &str) -> impl Bundle {
     (
         Node {
+            display: if key.is_empty() {
+                Display::None
+            } else {
+                Display::Flex
+            },
             padding: UiRect::axes(Val::Px(5.0), Val::Px(1.0)),
             min_width: Val::Px(20.0),
             justify_content: JustifyContent::Center,
@@ -742,7 +809,111 @@ const CONTROLS: [(&str, &str); 18] = [
     ("Esc / M", "hide menu"),
 ];
 
+/// Select row plus its floating dropdown, the shape shared by the scene and
+/// recording cards.
+fn spawn_select_row(card: &mut ChildSpawnerCommands, select: Select) {
+    card.spawn((
+        interactive_row(
+            select.label(),
+            select.key(),
+            select_control(select, select.options()[select.initial() as usize]),
+        ),
+        SelectRow(select),
+    ))
+    .with_children(|row| {
+        // Absolutely positioned so the open list floats over
+        // the rows below instead of pushing them down.
+        row.spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(LABEL_W + 12.0),
+                top: Val::Px(ROW_H + 1.0),
+                flex_direction: FlexDirection::Column,
+                padding: UiRect::all(Val::Px(4.0)),
+                border: UiRect::all(Val::Px(1.0)),
+                row_gap: Val::Px(1.0),
+                ..default()
+            },
+            BackgroundColor(DROPDOWN_BG),
+            BorderColor(PANEL_BORDER),
+            BorderRadius::all(Val::Px(8.0)),
+            BoxShadow::new(
+                Color::srgba(0.0, 0.0, 0.0, 0.6),
+                Val::Px(0.0),
+                Val::Px(6.0),
+                Val::Px(0.0),
+                Val::Px(14.0),
+            ),
+            GlobalZIndex(10),
+            // Inherited (not Visible) when open, so closing the
+            // whole menu also hides an open dropdown.
+            Visibility::Hidden,
+            Interaction::default(),
+            MenuInteractive,
+            SelectDropdown(select),
+        ))
+        .with_children(|dd| {
+            for (i, name) in select.options().iter().enumerate() {
+                dd.spawn((
+                    Button,
+                    Node {
+                        padding: UiRect::axes(Val::Px(9.0), Val::Px(3.0)),
+                        min_width: Val::Px(130.0),
+                        ..default()
+                    },
+                    // The default starts tinted as the active option.
+                    BackgroundColor(if i as u32 == select.initial() {
+                        OPTION_ACTIVE
+                    } else {
+                        Color::NONE
+                    }),
+                    BorderRadius::all(Val::Px(5.0)),
+                    MenuInteractive,
+                    SelectOption(select, i as u32),
+                    children![text_bundle(*name, FONT_ROW, TEXT_LABEL)],
+                ));
+            }
+        });
+    });
+}
+
 fn build_menu(mut commands: Commands) {
+    // Floating REC indicator, top-right, outside the panel so it shows with
+    // the menu closed too. Never in captures: on native the UI only exists
+    // on the present camera while captures read the offscreen scene target.
+    commands.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            right: Val::Px(18.0),
+            top: Val::Px(18.0),
+            display: Display::None,
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Center,
+            column_gap: Val::Px(6.0),
+            padding: UiRect::axes(Val::Px(9.0), Val::Px(4.0)),
+            border: UiRect::all(Val::Px(1.0)),
+            ..default()
+        },
+        BackgroundColor(PANEL_BG),
+        BorderColor(Color::srgba(0.96, 0.30, 0.30, 0.35)),
+        BorderRadius::all(Val::Px(8.0)),
+        RecChip,
+        children![
+            (
+                Node {
+                    width: Val::Px(8.0),
+                    height: Val::Px(8.0),
+                    ..default()
+                },
+                BackgroundColor(REC_RED),
+                BorderRadius::MAX,
+                RecDot,
+            ),
+            text_bundle("REC", FONT_SMALL, TEXT_LABEL),
+            (text_bundle("0:00", FONT_ROW, REC_RED), RecTime),
+        ],
+    ));
+
     commands
         .spawn((
             Node {
@@ -812,70 +983,7 @@ fn build_menu(mut commands: Commands) {
             parent.spawn(card_node()).with_children(|card| {
                 card.spawn(card_title("SCENE"));
                 for select in SELECTS {
-                    card.spawn((
-                        interactive_row(
-                            select.label(),
-                            select.key(),
-                            select_control(select, select.options()[0]),
-                        ),
-                        SelectRow(select),
-                    ))
-                    .with_children(|row| {
-                        // Absolutely positioned so the open list floats over
-                        // the rows below instead of pushing them down.
-                        row.spawn((
-                            Node {
-                                position_type: PositionType::Absolute,
-                                left: Val::Px(LABEL_W + 12.0),
-                                top: Val::Px(ROW_H + 1.0),
-                                flex_direction: FlexDirection::Column,
-                                padding: UiRect::all(Val::Px(4.0)),
-                                border: UiRect::all(Val::Px(1.0)),
-                                row_gap: Val::Px(1.0),
-                                ..default()
-                            },
-                            BackgroundColor(DROPDOWN_BG),
-                            BorderColor(PANEL_BORDER),
-                            BorderRadius::all(Val::Px(8.0)),
-                            BoxShadow::new(
-                                Color::srgba(0.0, 0.0, 0.0, 0.6),
-                                Val::Px(0.0),
-                                Val::Px(6.0),
-                                Val::Px(0.0),
-                                Val::Px(14.0),
-                            ),
-                            GlobalZIndex(10),
-                            // Inherited (not Visible) when open, so closing the
-                            // whole menu also hides an open dropdown.
-                            Visibility::Hidden,
-                            Interaction::default(),
-                            MenuInteractive,
-                            SelectDropdown(select),
-                        ))
-                        .with_children(|dd| {
-                            for (i, name) in select.options().iter().enumerate() {
-                                dd.spawn((
-                                    Button,
-                                    Node {
-                                        padding: UiRect::axes(Val::Px(9.0), Val::Px(3.0)),
-                                        min_width: Val::Px(130.0),
-                                        ..default()
-                                    },
-                                    // Index 0 is every mode's default, so it
-                                    // starts tinted as the active option.
-                                    BackgroundColor(if i == 0 {
-                                        OPTION_ACTIVE
-                                    } else {
-                                        Color::NONE
-                                    }),
-                                    BorderRadius::all(Val::Px(5.0)),
-                                    MenuInteractive,
-                                    SelectOption(select, i as u32),
-                                    children![text_bundle(*name, FONT_ROW, TEXT_LABEL)],
-                                ));
-                            }
-                        });
-                    });
+                    spawn_select_row(card, select);
                 }
             });
 
@@ -935,6 +1043,65 @@ fn build_menu(mut commands: Commands) {
                     });
             });
 
+            // Recording: capture options applied to the next O take,
+            // collapsed until its title is clicked. Native only; the web
+            // path records via MediaRecorder with no knobs.
+            #[cfg(not(target_arch = "wasm32"))]
+            parent.spawn(card_node()).with_children(|card| {
+                // card_title plus a caret, with the O chip on the right edge.
+                card.spawn((
+                    Button,
+                    Node {
+                        flex_direction: FlexDirection::Row,
+                        align_items: AlignItems::Center,
+                        column_gap: Val::Px(6.0),
+                        ..default()
+                    },
+                    BackgroundColor(Color::NONE),
+                    MenuInteractive,
+                    CollapseHeader {
+                        section: CollapseSection::Recording,
+                        open: false,
+                    },
+                    children![
+                        (
+                            Node {
+                                width: Val::Px(3.0),
+                                height: Val::Px(11.0),
+                                ..default()
+                            },
+                            BackgroundColor(ACCENT),
+                            BorderRadius::all(Val::Px(2.0)),
+                        ),
+                        text_bundle("RECORDING", FONT_SMALL, TEXT_MUTED),
+                        (
+                            text_bundle("\u{25b8}", 10.0, TEXT_MUTED),
+                            CollapseCaret(CollapseSection::Recording),
+                        ),
+                        Node {
+                            flex_grow: 1.0,
+                            ..default()
+                        },
+                        key_chip("O"),
+                    ],
+                ));
+                card.spawn((
+                    Node {
+                        display: Display::None,
+                        flex_direction: FlexDirection::Column,
+                        row_gap: Val::Px(6.0),
+                        margin: UiRect::top(Val::Px(2.0)),
+                        ..default()
+                    },
+                    CollapseBody(CollapseSection::Recording),
+                ))
+                .with_children(|body| {
+                    for select in REC_SELECTS {
+                        spawn_select_row(body, select);
+                    }
+                });
+            });
+
             // Controls: clickable title collapses the list.
             parent.spawn(card_node()).with_children(|card| {
                 card.spawn((
@@ -947,7 +1114,10 @@ fn build_menu(mut commands: Commands) {
                     },
                     BackgroundColor(Color::NONE),
                     MenuInteractive,
-                    ControlsHeader,
+                    CollapseHeader {
+                        section: CollapseSection::Controls,
+                        open: true,
+                    },
                     children![
                         (
                             Node {
@@ -959,7 +1129,10 @@ fn build_menu(mut commands: Commands) {
                             BorderRadius::all(Val::Px(2.0)),
                         ),
                         text_bundle("CONTROLS", FONT_SMALL, TEXT_MUTED),
-                        (text_bundle("\u{25be}", 10.0, TEXT_MUTED), ControlsCaret,),
+                        (
+                            text_bundle("\u{25be}", 10.0, TEXT_MUTED),
+                            CollapseCaret(CollapseSection::Controls),
+                        ),
                     ],
                 ));
                 card.spawn((
@@ -969,7 +1142,7 @@ fn build_menu(mut commands: Commands) {
                         margin: UiRect::top(Val::Px(2.0)),
                         ..default()
                     },
-                    ControlsBody,
+                    CollapseBody(CollapseSection::Controls),
                 ))
                 .with_children(|body| {
                     for column in CONTROLS.chunks(CONTROLS.len() / 2) {
@@ -1154,6 +1327,7 @@ fn click_select_option(
     mut fractal: ResMut<FractalType>,
     mut flow: ResMut<FlowMode>,
     mut palette: ResMut<ColorMode>,
+    mut rec: ResMut<RecordSettings>,
     mut options: Query<(&Interaction, &SelectOption, &mut BackgroundColor), Changed<Interaction>>,
     mut dropdowns: Query<&mut Visibility, With<SelectDropdown>>,
 ) {
@@ -1162,7 +1336,7 @@ fn click_select_option(
             Interaction::Pressed => {
                 option
                     .0
-                    .set(option.1, &mut fractal, &mut flow, &mut palette);
+                    .set(option.1, &mut fractal, &mut flow, &mut palette, &mut rec);
                 for mut vis in &mut dropdowns {
                     *vis = Visibility::Hidden;
                 }
@@ -1170,7 +1344,7 @@ fn click_select_option(
             Interaction::Hovered => bg.0 = ROW_HOVER,
             // Restore the active-option tint rather than clearing it.
             Interaction::None => {
-                let active = option.0.get(&fractal, &flow, &palette) == option.1;
+                let active = option.0.get(&fractal, &flow, &palette, &rec) == option.1;
                 bg.0 = if active { OPTION_ACTIVE } else { Color::NONE };
             }
         }
@@ -1203,18 +1377,19 @@ fn update_select_ui(
     fractal: Res<FractalType>,
     flow: Res<FlowMode>,
     palette: Res<ColorMode>,
+    rec: Res<RecordSettings>,
     mut values: Query<(&mut Text, &SelectValue)>,
     mut options: Query<(&mut BackgroundColor, &SelectOption)>,
 ) {
-    if !fractal.is_changed() && !flow.is_changed() && !palette.is_changed() {
+    if !fractal.is_changed() && !flow.is_changed() && !palette.is_changed() && !rec.is_changed() {
         return;
     }
     for (mut text, value) in &mut values {
-        let index = value.0.get(&fractal, &flow, &palette) as usize;
+        let index = value.0.get(&fractal, &flow, &palette, &rec) as usize;
         *text = Text::new(value.0.options()[index]);
     }
     for (mut bg, option) in &mut options {
-        let active = option.0.get(&fractal, &flow, &palette) == option.1;
+        let active = option.0.get(&fractal, &flow, &palette, &rec) == option.1;
         let color = if active { OPTION_ACTIVE } else { Color::NONE };
         if bg.0 != color {
             bg.0 = color;
@@ -1289,26 +1464,33 @@ fn sync_toggles(
     }
 }
 
-/// Clicking the CONTROLS title folds the key list away.
-fn click_controls_header(
-    mut header: Query<
-        (&Interaction, &mut BackgroundColor),
-        (Changed<Interaction>, With<ControlsHeader>),
+/// Clicking a collapsible card's title (CONTROLS, RECORDING) folds its body
+/// away and flips its caret.
+fn click_collapse_header(
+    mut headers: Query<
+        (&Interaction, &mut CollapseHeader, &mut BackgroundColor),
+        Changed<Interaction>,
     >,
-    mut body: Query<&mut Node, With<ControlsBody>>,
-    mut caret: Query<&mut Text, With<ControlsCaret>>,
-    mut open: Local<Option<bool>>,
+    mut bodies: Query<(&mut Node, &CollapseBody)>,
+    mut carets: Query<(&mut Text, &CollapseCaret)>,
 ) {
-    for (interaction, mut bg) in &mut header {
+    for (interaction, mut header, mut bg) in &mut headers {
         let color = match interaction {
             Interaction::Pressed => {
-                let shown = !open.unwrap_or(true);
-                *open = Some(shown);
-                for mut node in &mut body {
-                    node.display = if shown { Display::Flex } else { Display::None };
+                header.open = !header.open;
+                for (mut node, body) in &mut bodies {
+                    if body.0 == header.section {
+                        node.display = if header.open {
+                            Display::Flex
+                        } else {
+                            Display::None
+                        };
+                    }
                 }
-                for mut text in &mut caret {
-                    *text = Text::new(if shown { "\u{25be}" } else { "\u{25b8}" });
+                for (mut text, caret) in &mut carets {
+                    if caret.0 == header.section {
+                        *text = Text::new(if header.open { "\u{25be}" } else { "\u{25b8}" });
+                    }
                 }
                 ROW_HOVER
             }
@@ -1321,6 +1503,43 @@ fn click_controls_header(
     }
 }
 
+/// The floating REC indicator: shown while a take runs, dot pulsing,
+/// elapsed time ticking.
+fn update_rec_chip(
+    recorder: Res<crate::recorder::Recorder>,
+    time: Res<Time>,
+    mut chip: Query<&mut Node, With<RecChip>>,
+    mut dot: Query<&mut BackgroundColor, With<RecDot>>,
+    mut label: Query<&mut Text, With<RecTime>>,
+    mut state: Local<(f32, u32)>,
+) {
+    let active = recorder.is_active();
+    let display = if active { Display::Flex } else { Display::None };
+    for mut node in &mut chip {
+        if node.display != display {
+            node.display = display;
+        }
+    }
+    let (elapsed, last_sec) = &mut *state;
+    if !active {
+        (*elapsed, *last_sec) = (0.0, u32::MAX);
+        return;
+    }
+    *elapsed += time.delta_secs();
+    // ~1 Hz breathe so the dot reads as live rather than static decoration.
+    let pulse = 0.55 + 0.45 * (*elapsed * std::f32::consts::TAU).sin();
+    for mut bg in &mut dot {
+        bg.0 = Color::srgba(0.96, 0.30, 0.30, pulse);
+    }
+    let sec = *elapsed as u32;
+    if *last_sec != sec {
+        *last_sec = sec;
+        for mut text in &mut label {
+            *text = Text::new(format!("{}:{:02}", sec / 60, sec % 60));
+        }
+    }
+}
+
 /// Bloom follows the slider; with audio reactivity on, bass and beats pump it
 /// every frame. Once the levels have decayed to idle, only a slider change
 /// re-applies. At zero the component is removed entirely: Bevy's bloom node
@@ -1329,7 +1548,9 @@ fn click_controls_header(
 fn apply_bloom(
     settings: Res<Settings>,
     audio: Res<AudioLevels>,
-    mut cameras: Query<(Entity, Option<&mut Bloom>), With<Camera>>,
+    // ParticleCamera keeps this off the native present camera, which only
+    // composites the finished scene under the UI.
+    mut cameras: Query<(Entity, Option<&mut Bloom>), (With<Camera>, With<ParticleCamera>)>,
     mut commands: Commands,
 ) {
     if audio.is_idle() && !settings.is_changed() {
