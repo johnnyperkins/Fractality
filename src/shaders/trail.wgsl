@@ -59,7 +59,6 @@ fn fs_fade() -> @location(0) vec4<f32> {
 @fragment
 fn fs_composite(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let dims = vec2<f32>(textureDimensions(trail_tex));
-    let hi = vec2<i32>(dims) - vec2<i32>(1);
 
     // Kaleidoscope (K): fold the screen N-fold around its center before
     // sampling. The pixel's angle is rotated (music-driven spin), wrapped
@@ -87,7 +86,9 @@ fn fs_composite(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     }
     // Radial split: zero at screen center, growing toward the edges, so the
     // bloom reads as the whole frame flaring outward. R samples outward,
-    // B inward, G anchors.
+    // B inward, G anchors. The clamp bound is computed here, past the early
+    // return: off-beat frames are every frame of a silent session.
+    let hi = vec2<i32>(dims) - vec2<i32>(1);
     let dir = (pos.xy - dims * 0.5) / max(dims.y, 1.0);
     let off = dir * beat * beat * 5.0;
     let r = textureLoad(trail_tex, clamp(vec2<i32>(sp + off), vec2<i32>(0), hi), 0).r;

@@ -1274,7 +1274,8 @@ fn update_params(
     // center, iteration count, or Julia c actually changed; a static view
     // with no morph pays nothing.
     if state.last_orbit_key != Some((view.center, max_iter, fractal.0, jc)) {
-        ref_orbit.points = reference_orbit(view.center, max_iter, fractal.0, jc);
+        ref_orbit.points =
+            std::sync::Arc::new(reference_orbit(view.center, max_iter, fractal.0, jc));
         ref_orbit.generation = ref_orbit.generation.wrapping_add(1);
         state.last_orbit_key = Some((view.center, max_iter, fractal.0, jc));
     }

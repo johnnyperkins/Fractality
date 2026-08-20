@@ -1904,6 +1904,7 @@ dependencies = [
  "fastrand",
  "js-sys",
  "mp4",
+ "naga_oil",
  "openh264",
  "rayon",
  "wasm-bindgen",

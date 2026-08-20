@@ -28,6 +28,8 @@ struct Params {
     detail: f32,
     dissolve: f32,
     color_mode: u32,
+    // Unused in this shader (the formula is a compile-time FRACTAL_* def,
+    // one pipeline per type); present for layout parity with ParamsUniform.
     fractal_type: u32,
     // Flow style: 0 contour, 1 layers, 2 gravity, 3 erupt, 4 pulse,
     // 5 dynamics.
@@ -95,37 +97,41 @@ fn diffabs(x: f32, d: f32) -> f32 {
 
 // One perturbation step of the selected fractal: dz_{n+1} from the reference
 // value Z_n, the delta dz_n, and the point's offset dc from the view center.
-// Types match FRACTAL_MODES on the Rust side.
+//
+// The formula is a compile-time choice, not a runtime switch: the Rust side
+// queues one compute pipeline per fractal type, each with exactly one
+// FRACTAL_* def set (see FRACTAL_DEFS in particles.rs, whose order must match
+// FRACTAL_MODES). This function and step_der run twice per iteration of the
+// hottest loop in the app, so folding the 5-way branch into the pipeline
+// keeps the loop body straight-line.
 fn step_dz(z_ref: vec2<f32>, dz: vec2<f32>, dc: vec2<f32>) -> vec2<f32> {
-    switch params.fractal_type {
-        case 1u: {
-            // Burning Ship: z' = (|x| + i|y|)^2 + c. With w = |Z+dz| and
-            // wr = |Z| (componentwise), dz' = w^2 - wr^2 = (w-wr)(w+wr);
-            // diffabs gives w-wr exactly, avoiding the cancellation that
-            // would erase a tiny delta at deep zoom.
-            let wr = abs(z_ref);
-            let d = vec2<f32>(diffabs(z_ref.x, dz.x), diffabs(z_ref.y, dz.y));
-            return cmul(d, 2.0 * wr + d) + dc;
-        }
-        case 2u: {
-            // Tricorn: z' = conj(z)^2 + c, and conj(z)^2 - conj(Z)^2
-            // = conj(z^2 - Z^2), so conjugate the Mandelbrot delta.
-            return conj(cmul(2.0 * z_ref + dz, dz)) + dc;
-        }
-        case 3u: {
-            // Multibrot-3: (Z+dz)^3 - Z^3 = dz*(3Z^2 + 3Z*dz + dz^2).
-            return cmul(dz, 3.0 * cmul(z_ref, z_ref) + 3.0 * cmul(z_ref, dz) + cmul(dz, dz)) + dc;
-        }
-        case 4u: {
-            // Julia: same map as Mandelbrot but c is a global constant, so
-            // there is no dc term; dc instead seeds dz_0 (offset of z_0).
-            return cmul(2.0 * z_ref + dz, dz);
-        }
-        default: {
-            // Mandelbrot: 2*Z*dz + dz^2 + dc.
-            return cmul(2.0 * z_ref + dz, dz) + dc;
-        }
-    }
+#ifdef FRACTAL_SHIP
+    // Burning Ship: z' = (|x| + i|y|)^2 + c. With w = |Z+dz| and
+    // wr = |Z| (componentwise), dz' = w^2 - wr^2 = (w-wr)(w+wr);
+    // diffabs gives w-wr exactly, avoiding the cancellation that
+    // would erase a tiny delta at deep zoom.
+    let wr = abs(z_ref);
+    let d = vec2<f32>(diffabs(z_ref.x, dz.x), diffabs(z_ref.y, dz.y));
+    return cmul(d, 2.0 * wr + d) + dc;
+#endif
+#ifdef FRACTAL_TRICORN
+    // Tricorn: z' = conj(z)^2 + c, and conj(z)^2 - conj(Z)^2
+    // = conj(z^2 - Z^2), so conjugate the Mandelbrot delta.
+    return conj(cmul(2.0 * z_ref + dz, dz)) + dc;
+#endif
+#ifdef FRACTAL_MULTIBROT3
+    // Multibrot-3: (Z+dz)^3 - Z^3 = dz*(3Z^2 + 3Z*dz + dz^2).
+    return cmul(dz, 3.0 * cmul(z_ref, z_ref) + 3.0 * cmul(z_ref, dz) + cmul(dz, dz)) + dc;
+#endif
+#ifdef FRACTAL_JULIA
+    // Julia: same map as Mandelbrot but c is a global constant, so
+    // there is no dc term; dc instead seeds dz_0 (offset of z_0).
+    return cmul(2.0 * z_ref + dz, dz);
+#endif
+#ifdef FRACTAL_MANDELBROT
+    // Mandelbrot: 2*Z*dz + dz^2 + dc.
+    return cmul(2.0 * z_ref + dz, dz) + dc;
+#endif
 }
 
 // d(z_{n+1})/dc iteration for the selected fractal, using the full z_n.
@@ -133,30 +139,33 @@ fn step_dz(z_ref: vec2<f32>, dz: vec2<f32>, dc: vec2<f32>) -> vec2<f32> {
 // holomorphic, so their rules are the standard distance-estimate
 // approximations - plenty for steering the flow field.
 fn step_der(z_full: vec2<f32>, der: vec2<f32>) -> vec2<f32> {
-    switch params.fractal_type {
-        case 1u: {
-            return 2.0 * cmul(abs(z_full), der) + vec2<f32>(1.0, 0.0);
-        }
-        case 2u: {
-            return 2.0 * cmul(conj(z_full), conj(der)) + vec2<f32>(1.0, 0.0);
-        }
-        case 3u: {
-            return 3.0 * cmul(cmul(z_full, z_full), der) + vec2<f32>(1.0, 0.0);
-        }
-        case 4u: {
-            // dz_0/dc = 1 (dc perturbs z_0), no additive term after that.
-            return 2.0 * cmul(z_full, der);
-        }
-        default: {
-            return 2.0 * cmul(z_full, der) + vec2<f32>(1.0, 0.0);
-        }
-    }
+#ifdef FRACTAL_SHIP
+    return 2.0 * cmul(abs(z_full), der) + vec2<f32>(1.0, 0.0);
+#endif
+#ifdef FRACTAL_TRICORN
+    return 2.0 * cmul(conj(z_full), conj(der)) + vec2<f32>(1.0, 0.0);
+#endif
+#ifdef FRACTAL_MULTIBROT3
+    return 3.0 * cmul(cmul(z_full, z_full), der) + vec2<f32>(1.0, 0.0);
+#endif
+#ifdef FRACTAL_JULIA
+    // dz_0/dc = 1 (dc perturbs z_0), no additive term after that.
+    return 2.0 * cmul(z_full, der);
+#endif
+#ifdef FRACTAL_MANDELBROT
+    return 2.0 * cmul(z_full, der) + vec2<f32>(1.0, 0.0);
+#endif
 }
 
 // 1/log2(power) for the smooth-iteration formula; only Multibrot-3 (power 3)
-// differs from 1. Must match inv_log2_power() on the CPU.
+// differs from 1. Must match inv_log2_power() on the CPU - a test pins this
+// literal to the CPU-computed value.
 fn inv_log2_power() -> f32 {
-    return select(1.0, 0.6309297535714574, params.fractal_type == 3u);
+#ifdef FRACTAL_MULTIBROT3
+    return 0.6309297535714575;
+#else
+    return 1.0;
+#endif
 }
 
 // Shell calm factor from a field value: 1 = free streaming, near 0 = frozen
@@ -166,23 +175,38 @@ fn inv_log2_power() -> f32 {
 // image went fuzzy at high detail). Condensation stretches the proximity and
 // deepens the freeze floor: 1 = classic feel, higher = wider + deader
 // freeze (crisper edges), 0 = everything streams.
-fn calm_of(f: f32) -> f32 {
+//
+// Every input except the field value is uniform, so the per-invocation cost
+// (two divides among it) is hoisted into Calm, built once per particle and
+// reused by both calls.
+struct Calm {
+    // 1 - 0.05/cond^4, the depth of the freeze.
+    freeze: f32,
+    // detail/max_iter*cond: turns a raw field value into freeze proximity.
+    scale: f32,
+};
+
+fn calm_const() -> Calm {
     let cond = params.shape.x;
-    let depth = f / f32(params.max_iter) * params.detail;
     // Freeze depth: residual shell speed is 0.05/cond^4 of flow speed, so
     // every extra slider unit keeps deadening the shell instead of
     // saturating (1 -> 5%, 2 -> 0.3%, 5 -> 0.008%, solid). cond = 0 kills
     // the divide via the max() and freezes nothing.
     let freeze = clamp(1.0 - 0.05 / max(cond * cond * cond * cond, 1e-6), 0.0, 0.9999);
-    return 1.0 - freeze * smoothstep(0.25, 0.75, depth * cond);
+    return Calm(freeze, params.detail / f32(params.max_iter) * cond);
+}
+
+fn calm_of(cc: Calm, f: f32) -> f32 {
+    return 1.0 - cc.freeze * smoothstep(0.25, 0.75, f * cc.scale);
 }
 
 // Initial delta: zero except Julia, where dc perturbs the starting point.
 fn initial_dz(dc: vec2<f32>) -> vec2<f32> {
-    if (params.fractal_type == 4u) {
-        return dc;
-    }
+#ifdef FRACTAL_JULIA
+    return dc;
+#else
     return vec2<f32>(0.0, 0.0);
+#endif
 }
 
 // Smooth escape-time field via perturbation. dc is the point's offset from the
@@ -195,14 +219,17 @@ fn field(dc: vec2<f32>) -> f32 {
     // Julia), so each iteration needs only one ref_orbit load (the next
     // entry); the previous load is carried in a register across iterations.
     // Only the full-value reconstruction (ref_add) and the rebase fold use
-    // the lo limb; step_dz products are cancellation-free, so hi is enough.
+    // the lo limb; step_dz products are cancellation-free, so the carried
+    // reference is the hi limb alone (two fewer live registers per lane in
+    // the loop, which is what occupancy is bought with here).
     let ref0 = ref_orbit[0];
     var dz = initial_dz(dc);
     var ri: u32 = 0u;
-    var z_ref = ref0;
+    var z_ref_hi = ref0.xy;
     let last = params.ref_len - 1u;
-    for (var n: u32 = 0u; n < params.max_iter; n = n + 1u) {
-        dz = step_dz(z_ref.xy, dz, dc);
+    let max_it = params.max_iter;
+    for (var n: u32 = 0u; n < max_it; n = n + 1u) {
+        dz = step_dz(z_ref_hi, dz, dc);
         ri = ri + 1u;
         let z_ref_next = ref_orbit[ri];
         let z = ref_add(z_ref_next, dz); // full z_{n+1}
@@ -215,12 +242,12 @@ fn field(dc: vec2<f32>) -> f32 {
         if (m < dot(dz, dz) || ri >= last) {
             dz = (z - ref0.xy) - ref0.zw;
             ri = 0u;
-            z_ref = ref0;
+            z_ref_hi = ref0.xy;
         } else {
-            z_ref = z_ref_next;
+            z_ref_hi = z_ref_next.xy;
         }
     }
-    return f32(params.max_iter);
+    return f32(max_it);
 }
 
 struct FieldGrad {
@@ -247,9 +274,14 @@ fn field_grad(dc: vec2<f32>) -> FieldGrad {
     let ref0 = ref_orbit[0];
     var dz = initial_dz(dc);
     // Julia: dc perturbs z_0, so d(z_0)/dc = 1; c-plane fractals start at 0.
-    var der = vec2<f32>(select(0.0, 1.0, params.fractal_type == 4u), 0.0);
+#ifdef FRACTAL_JULIA
+    var der = vec2<f32>(1.0, 0.0);
+#else
+    var der = vec2<f32>(0.0, 0.0);
+#endif
     var ri: u32 = 0u;
-    var z_ref = ref0;
+    // Hi limb only, same as field(): step_dz never reads the lo limb.
+    var z_ref_hi = ref0.xy;
     // Full z_n, carried across iterations: the z computed at the bottom of
     // the loop IS the next iteration's full value (bit-exact in the
     // non-rebase path, since ref_add(z_ref_next, dz) uses the same inputs;
@@ -260,9 +292,10 @@ fn field_grad(dc: vec2<f32>) -> FieldGrad {
     var z_full = ref_add(ref0, dz);
     let last = params.ref_len - 1u;
     let ilp = inv_log2_power();
-    for (var n: u32 = 0u; n < params.max_iter; n = n + 1u) {
+    let max_it = params.max_iter;
+    for (var n: u32 = 0u; n < max_it; n = n + 1u) {
         der = step_der(z_full, der);
-        dz = step_dz(z_ref.xy, dz, dc);
+        dz = step_dz(z_ref_hi, dz, dc);
         ri = ri + 1u;
         let z_ref_next = ref_orbit[ri];
         let z = ref_add(z_ref_next, dz);
@@ -275,13 +308,13 @@ fn field_grad(dc: vec2<f32>) -> FieldGrad {
         if (m < dot(dz, dz) || ri >= last) {
             dz = (z - ref0.xy) - ref0.zw;
             ri = 0u;
-            z_ref = ref0;
+            z_ref_hi = ref0.xy;
         } else {
-            z_ref = z_ref_next;
+            z_ref_hi = z_ref_next.xy;
         }
         z_full = z;
     }
-    return FieldGrad(f32(params.max_iter), vec2<f32>(0.0, 0.0), vec2<f32>(0.0, 0.0));
+    return FieldGrad(f32(max_it), vec2<f32>(0.0, 0.0), vec2<f32>(0.0, 0.0));
 }
 
 // Ring waves die past these ages; one definition keeps beat_impulse and the
@@ -460,6 +493,13 @@ fn flow_desired(
     return desired;
 }
 
+// Particles are handled in blocks of 2^BLOCK_SHIFT = 64 (idx >> BLOCK_SHIFT)
+// wherever a per-particle random decision would split a SIMD wave: the
+// trickle roll and the stagger phase below. Both sites must share the same
+// block size for the wave-coherence argument to hold, so the shift is named
+// once here.
+const BLOCK_SHIFT: u32 = 6u;
+
 @compute @workgroup_size(256)
 fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
@@ -486,8 +526,23 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
     // few seconds the trickle refreshes the entire set at the current scale.
     var seed = hash_u32(idx ^ (params.frame * 2654435761u));
     let out_of_view = abs(p.pos.x) > ext.x * 2.5 || abs(p.pos.y) > ext.y * 2.5;
-    let trickle = rand01(&seed) < params.reseed_rate;
+    // The trickle is rolled once per BLOCK of 64 particles, so a whole SIMD
+    // wave enters the candidate search together or skips it together. Rolled
+    // per particle, a single straggler lane dragged its entire wave through up
+    // to eight field() calls while the other 63 idled: at rate 0.006 that hit
+    // ~17% of waves (1 - 0.994^32) instead of 0.6%, and on a zoom-out spike
+    // (rate 0.4) essentially all of them instead of 40%. Per-particle refresh
+    // probability is unchanged, and a particle index carries no spatial
+    // meaning - the CPU seed hashes each index independently and recycling
+    // re-samples per index - so a random block of 64 indices is the same
+    // random sample of the cloud that 64 scattered ones were. out_of_view
+    // stays per particle: that one is correctness, not sampling.
+    var block_seed = hash_u32((idx >> BLOCK_SHIFT) ^ (params.frame * 0x9e3779b9u));
+    let trickle = rand01(&block_seed) < params.reseed_rate;
     if (out_of_view || trickle) {
+        // Uniform, so hoist them out of the candidate loop.
+        let bias_exp = 4.0 * max(params.detail, 0.1);
+        let iter_f = f32(params.max_iter);
         for (var k: u32 = 0u; k < 8u; k = k + 1u) {
             // Feathered sampling extent: mostly ~screen size (flat, uniform
             // density across the whole visible rect incl. corners), with a soft
@@ -508,9 +563,9 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
             // detail=1, higher pushes the accept threshold up toward max_iter so
             // particles cluster into a thinner, finer boundary shell.
             let t = rand01(&seed);
-            let bias = pow(t, 4.0 * max(params.detail, 0.1));
-            let threshold = 3.0 + (f32(params.max_iter) - 12.0) * bias;
-            if (f > 3.0 && f >= threshold && f < f32(params.max_iter) - 1.0) {
+            let bias = pow(t, bias_exp);
+            let threshold = 3.0 + (iter_f - 12.0) * bias;
+            if (f > 3.0 && f >= threshold && f < iter_f - 1.0) {
                 p.home = cand;
                 p.pos = cand;
                 p.band = f;
@@ -546,8 +601,16 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
     // every frame, and mouse-adjacent particles always update so interactions
     // stay responsive. NaN pos/band fails these compares and falls through to
     // the full path, where the NaN guard at the end catches it.
-    let calm_est = calm_of(p.band);
-    if (calm_est < 0.2 && distn > rn * 2.0 && (idx + params.frame) % 4u != 0u) {
+    let cc = calm_const();
+    let calm_est = calm_of(cc, p.band);
+    // Stagger phase per 64-particle block, for the same wave-coherence reason
+    // as the trickle above: with a per-particle phase, one in four calm lanes
+    // stayed active in every wave and the loop still ran to the deepest band
+    // present, so the skip saved ALU but almost no wall time. Per block the
+    // whole wave drops its deep lanes together on 3 frames in 4. Index order
+    // is spatially random, so the set of particles updating on a given frame
+    // is the same random quarter it always was.
+    if (calm_est < 0.2 && distn > rn * 2.0 && ((idx >> BLOCK_SHIFT) + params.frame) % 4u != 0u) {
         // Staggered particles still ride a live ring wave (impulse plus
         // integration, a few ALU ops), so the wavefront stays smooth without
         // paying the full field cost on beat frames. Damp here too: the full
@@ -626,7 +689,7 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
         // completely so the boundary renders as a stable filigree; the calm
         // ramps in from mid-field, leaving the outer haze streaming normally.
         // Detail-invariant and condensation-scaled - see calm_of.
-        calm = calm_of(f0);
+        calm = calm_of(cc, f0);
         // The normal velocity correction also rides the noisy gradient, so on
         // the shell it mostly injects thrash; the capped positional pull below
         // holds those particles instead. Keep it strong only for outer flow.

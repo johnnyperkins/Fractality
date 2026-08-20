@@ -153,14 +153,40 @@ pub const MAX_PARTICLES: u32 = 4_000_000;
 /// limb restores the cancelled digits (see `field` in the compute shader).
 /// `generation` bumps on every recompute so the render world uploads the
 /// buffer only when the orbit actually changed.
+///
+/// The points sit behind an Arc because ExtractResource clones this into the
+/// render world every frame: a dive at the iteration cap would otherwise
+/// memcpy (and allocate, and free) 256 KB per frame for a buffer the render
+/// world only reads, and usually only reads when `generation` moved.
 #[derive(Resource, Clone, Default, ExtractResource)]
 pub struct RefOrbit {
-    pub points: Vec<[f32; 4]>,
+    pub points: Arc<Vec<[f32; 4]>>,
     pub generation: u32,
 }
 
 /// Fractal type id of the Julia set in FRACTAL_MODES and the shader switches.
 pub const JULIA_TYPE: u32 = 4;
+
+/// One shader def per fractal type, indexed by the type id (so the order must
+/// match FRACTAL_MODES, `fractal_step`, and the CPU orbit code). The compute
+/// shader compiles the perturbation step and its derivative from whichever def
+/// is set, and the render graph picks the matching pipeline: those two
+/// functions run twice per iteration of the deepest loop in the app, so the
+/// formula is chosen once at pipeline-build time instead of re-branching a
+/// uniform on every one of the billions of iterations a frame does. All five
+/// are queued at startup, so pressing F never waits on a shader compile.
+const FRACTAL_DEFS: [&str; 5] = [
+    "FRACTAL_MANDELBROT",
+    "FRACTAL_SHIP",
+    "FRACTAL_TRICORN",
+    "FRACTAL_MULTIBROT3",
+    "FRACTAL_JULIA",
+];
+
+// Adding a fractal to the UI list without a matching def (or vice versa)
+// must fail the build, not silently dispatch the wrong formula. Order is
+// checked by shader_validation::julia_def_matches_julia_type.
+const _: () = assert!(FRACTAL_DEFS.len() == crate::FRACTAL_MODES.len());
 
 /// Home Julia parameter. Only the CPU needs it: the GPU delta iteration for
 /// Julia has no c term (dc seeds dz_0 instead), so c reaches the GPU only
@@ -423,7 +449,8 @@ struct ParticlePipelines {
     compute_layout: BindGroupLayout,
     render_layout: BindGroupLayout,
     composite_layout: BindGroupLayout,
-    compute_pipeline: CachedComputePipelineId,
+    /// One per fractal type, indexed by `ParamsUniform::fractal_type`.
+    compute_pipelines: [CachedComputePipelineId; FRACTAL_DEFS.len()],
     render_pipeline: CachedRenderPipelineId,
     fade_pipeline: CachedRenderPipelineId,
     composite_pipeline: CachedRenderPipelineId,
@@ -483,14 +510,16 @@ impl FromWorld for ParticlePipelines {
         let trail_shader: Handle<Shader> =
             world.load_asset("embedded://fractality/shaders/trail.wgsl");
         let cache = world.resource::<PipelineCache>();
-        let compute_pipeline = cache.queue_compute_pipeline(ComputePipelineDescriptor {
-            label: Some("particle_compute_pipeline".into()),
-            layout: vec![compute_layout.clone()],
-            push_constant_ranges: vec![],
-            shader: compute_shader,
-            shader_defs: vec![],
-            entry_point: "update".into(),
-            zero_initialize_workgroup_memory: false,
+        let compute_pipelines = FRACTAL_DEFS.map(|def| {
+            cache.queue_compute_pipeline(ComputePipelineDescriptor {
+                label: Some(format!("particle_compute_pipeline_{def}").into()),
+                layout: vec![compute_layout.clone()],
+                push_constant_ranges: vec![],
+                shader: compute_shader.clone(),
+                shader_defs: vec![ShaderDefVal::Bool(def.into(), true)],
+                entry_point: "update".into(),
+                zero_initialize_workgroup_memory: false,
+            })
         });
         let render_pipeline = cache.queue_render_pipeline(RenderPipelineDescriptor {
             label: Some("particle_render_pipeline".into()),
@@ -589,7 +618,7 @@ impl FromWorld for ParticlePipelines {
             compute_layout,
             render_layout,
             composite_layout,
-            compute_pipeline,
+            compute_pipelines,
             render_pipeline,
             fade_pipeline,
             composite_pipeline,
@@ -781,7 +810,17 @@ fn prepare_trail_texture(
     *was_active = active;
 }
 
-struct ParticleComputeNode;
+#[derive(Default)]
+struct ParticleComputeNode {
+    /// Index of the fractal whose pipeline last dispatched. Pipeline compiles
+    /// are async: a fractal switch in the first seconds of a session (or on a
+    /// slow driver) can land before the new variant is ready, and skipping the
+    /// dispatch would freeze the simulation while the render, fade, and
+    /// composite passes keep running. Those frames dispatch this pipeline
+    /// instead: a brief blend of old formula and new reference orbit that the
+    /// recycler resamples away, rather than a visible stall.
+    last_ready: std::sync::atomic::AtomicUsize,
+}
 
 impl render_graph::Node for ParticleComputeNode {
     fn run(
@@ -798,14 +837,32 @@ impl render_graph::Node for ParticleComputeNode {
             return Ok(());
         };
         let cache = world.resource::<PipelineCache>();
-        let Some(pipeline) = cache.get_compute_pipeline(pipelines.compute_pipeline) else {
-            return Ok(());
+        let params = world.get_resource::<SimParams>();
+        // Each fractal has its own pipeline with its perturbation step
+        // compiled in; an out-of-range id falls back to Mandelbrot, matching
+        // the `_ =>` arms of the CPU orbit code so both halves of the
+        // perturbation pipeline iterate the same map.
+        let ftype = params.map_or(0, |p| p.0.fractal_type) as usize;
+        let wanted = if ftype < FRACTAL_DEFS.len() { ftype } else { 0 };
+        use std::sync::atomic::Ordering;
+        let id = pipelines.compute_pipelines[wanted];
+        let pipeline = match cache.get_compute_pipeline(id) {
+            Some(pipeline) => {
+                self.last_ready.store(wanted, Ordering::Relaxed);
+                pipeline
+            }
+            // Still compiling: run the previous fractal's pipeline this frame
+            // (see `last_ready`) rather than freezing the cloud.
+            None => {
+                let prev = self.last_ready.load(Ordering::Relaxed);
+                match cache.get_compute_pipeline(pipelines.compute_pipelines[prev]) {
+                    Some(pipeline) => pipeline,
+                    None => return Ok(()),
+                }
+            }
         };
         // Simulate only the active count (buffer holds up to MAX_PARTICLES).
-        let count = world
-            .get_resource::<SimParams>()
-            .map_or(0, |p| p.0.count)
-            .min(buffers.count);
+        let count = params.map_or(0, |p| p.0.count).min(buffers.count);
         if count == 0 {
             return Ok(());
         }
@@ -949,7 +1006,7 @@ impl Plugin for ParticlePlugin {
             (Node2d::EndMainPass, ParticleDrawLabel, Node2d::Bloom),
         );
         let mut graph = render_app.world_mut().resource_mut::<RenderGraph>();
-        graph.add_node(ParticleComputeLabel, ParticleComputeNode);
+        graph.add_node(ParticleComputeLabel, ParticleComputeNode::default());
         graph.add_node_edge(ParticleComputeLabel, CameraDriverLabel);
     }
 
@@ -958,5 +1015,107 @@ impl Plugin for ParticlePlugin {
         render_app.init_resource::<ParticlePipelines>();
         render_app.init_resource::<ParticleUniform>();
         render_app.init_resource::<RefOrbitBuffer>();
+    }
+}
+
+/// The machine that builds this may have no GPU, and a broken shader only
+/// surfaces at pipeline creation - potentially only for one fractal type, only
+/// once someone presses F. These run naga through the same preprocessor Bevy
+/// uses, once per specialization, so a bad `#ifdef` or a typo in one fractal's
+/// step fails the test run instead of the show.
+#[cfg(test)]
+mod shader_validation {
+    use super::{FRACTAL_DEFS, JULIA_TYPE};
+    use naga_oil::compose::{Composer, NagaModuleDescriptor, ShaderDefValue, ShaderType};
+    use std::collections::HashMap;
+
+    /// One preprocessor+validate pass, shared by the positive and negative
+    /// tests so both always exercise the exact descriptor the pipelines use.
+    fn try_compile(source: &str, file_path: &str, defs: &[&str]) -> Result<(), String> {
+        let shader_defs = defs
+            .iter()
+            .map(|d| (d.to_string(), ShaderDefValue::Bool(true)))
+            .collect::<HashMap<_, _>>();
+        let mut composer = Composer::default();
+        composer
+            .make_naga_module(NagaModuleDescriptor {
+                source,
+                file_path,
+                shader_type: ShaderType::Wgsl,
+                shader_defs,
+                additional_imports: &[],
+            })
+            .map(|_| ())
+            .map_err(|e| e.emit_to_string(&composer))
+    }
+
+    fn compile(source: &str, file_path: &str, defs: &[&str]) {
+        if let Err(e) = try_compile(source, file_path, defs) {
+            panic!("{file_path} {defs:?} failed to compile:\n{e}");
+        }
+    }
+
+    #[test]
+    fn compute_shader_compiles_for_every_fractal() {
+        let src = include_str!("shaders/particle_compute.wgsl");
+        for def in FRACTAL_DEFS {
+            compile(src, "particle_compute.wgsl", &[def]);
+        }
+    }
+
+    /// Without a FRACTAL_* def the specialized functions have no return path,
+    /// so this must NOT compile - otherwise a missing def would silently ship
+    /// a pipeline that never queued one.
+    #[test]
+    fn compute_shader_needs_a_fractal_def() {
+        let src = include_str!("shaders/particle_compute.wgsl");
+        assert!(
+            try_compile(src, "particle_compute.wgsl", &[]).is_err(),
+            "compute shader compiled with no fractal selected"
+        );
+    }
+
+    #[test]
+    fn render_and_trail_shaders_compile() {
+        compile(
+            include_str!("shaders/particle_render.wgsl"),
+            "particle_render.wgsl",
+            &[],
+        );
+        compile(include_str!("shaders/trail.wgsl"), "trail.wgsl", &[]);
+    }
+
+    /// FRACTAL_DEFS is order-coupled to FRACTAL_MODES (lengths are tied by a
+    /// const assert next to the array); pin the one id other code keys on.
+    #[test]
+    fn julia_def_matches_julia_type() {
+        assert_eq!(FRACTAL_DEFS[JULIA_TYPE as usize], "FRACTAL_JULIA");
+    }
+
+    /// The compute shader hardcodes 1/log2(3) for Multibrot-3 smooth
+    /// iteration (WGSL has no f64 math); a drift from the CPU value in
+    /// inv_log2_power() silently skews GPU bands against CPU smooth_iter.
+    #[test]
+    fn multibrot_inv_log2_power_matches_cpu() {
+        let src = include_str!("shaders/particle_compute.wgsl");
+        let expected = format!("return {};", 1.0 / 3.0f64.log2());
+        assert!(
+            src.contains(&expected),
+            "particle_compute.wgsl inv_log2_power() drifted from the CPU value: expected `{expected}`"
+        );
+    }
+
+    /// These tests pin naga_oil independently of Bevy. If Cargo ever resolves
+    /// two copies, the tests validate with a different preprocessor than the
+    /// runtime pipelines and prove nothing - and this build machine has no
+    /// GPU to catch it at pipeline creation.
+    #[test]
+    fn naga_oil_resolves_to_one_version() {
+        let lock = include_str!("../Cargo.lock");
+        let copies = lock.matches("name = \"naga_oil\"").count();
+        assert_eq!(
+            copies, 1,
+            "naga_oil resolved {copies} times; re-pin the dev-dependency to bevy's version"
+        );
     }
 }

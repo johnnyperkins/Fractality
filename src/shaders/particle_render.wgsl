@@ -56,8 +56,26 @@ struct Params {
 struct VsOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) uv: vec2<f32>,
-    @location(1) color: vec3<f32>,
+    // Flat: the color is a per-particle value, identical at all four corners
+    // of the quad, so interpolating it across every covered fragment is pure
+    // rasterizer work for a result that cannot change. Bit-identical output.
+    @location(1) @interpolate(flat) color: vec3<f32>,
 };
+
+// Spectrum energy for a particle: iteration depth maps to one of the 16
+// log-spaced bins (deep shell = bass, outer haze = treble). The one mapping
+// is shared by the aurora palette and the spectrum-glow multiplier so both
+// effects always light the same shells. The obvious spectrum[i / 4u][i % 4u]
+// indexes a vec4 with a dynamic component, which naga lowers to a private
+// scratch array round trip on several backends; this runs per vertex, four
+// times per particle, so pick the lane with selects instead.
+fn spectrum_for_band(band: f32, iter_f: f32) -> f32 {
+    let d = clamp(band / iter_f, 0.0, 1.0);
+    let i = u32(clamp((1.0 - d) * 15.99, 0.0, 15.0));
+    let v = params.spectrum[i >> 2u];
+    let j = i & 3u;
+    return select(select(v.x, v.y, j == 1u), select(v.z, v.w, j == 3u), j >= 2u);
+}
 
 // Sinebow palette, then saturate: subtract the valley floor and rescale so
 // the off-hue channels go to true 0. Without this the palette's ~0.25 valleys
@@ -83,10 +101,39 @@ fn vs(
         select(-1.0, 1.0, (vertex_index & 1u) == 1u),
         select(-1.0, 1.0, vertex_index >= 2u),
     );
-    let p = particles[instance_index];
+    // Field-wise loads: this shader never reads `home`, and pulling the whole
+    // 32-byte struct made each of the four vertices per particle fetch 8
+    // bytes it throws away.
+    let p_pos = particles[instance_index].pos;
+    let center_clip = p_pos * params.world_to_clip.xy + params.world_to_clip.zw;
 
-    let clip_xy = p.pos * params.world_to_clip.xy + params.world_to_clip.zw
-        + corner * params.particle_size;
+    // Off-screen instances leave before the palette math. Recycling only
+    // reclaims a particle once it has drifted 2.5 view-extents out, and a
+    // dive pushes the whole cloud outward, so a large slice of the draw is
+    // instances whose color is computed purely for the rasterizer to throw
+    // away. The test uses the quad CENTER plus its half-extent, so all four
+    // vertices of an instance decide identically (a per-corner test would
+    // fold only some vertices of a quad and tear the geometry), and it is
+    // exact: a quad overlaps the viewport iff its center is within
+    // 1 + particle_size. All four vertices collapse onto the same
+    // off-viewport point, so the triangles are zero-area and raster nothing.
+    // NaN positions fail every compare and fall through to the normal path,
+    // where they produce a NaN clip position the rasterizer drops anyway.
+    let bound = vec2<f32>(1.0) + params.particle_size;
+    if (abs(center_clip.x) > bound.x || abs(center_clip.y) > bound.y) {
+        // Only clip matters: the collapsed quad rasterizes nothing, so uv and
+        // color are never read (var zero-initializes them).
+        var culled: VsOut;
+        culled.clip = vec4<f32>(2.0, 2.0, 0.0, 1.0);
+        return culled;
+    }
+
+    let p_vel = particles[instance_index].vel;
+    let p_band = particles[instance_index].band;
+    let p_hue = particles[instance_index].hue;
+    let iter_f = f32(params.max_iter);
+
+    let clip_xy = center_clip + corner * params.particle_size;
 
     // Screen-relative speed: world velocity scales with view_height (flow is a
     // fraction of view height), so normalize by it to keep color/brightness the
@@ -95,7 +142,15 @@ fn vs(
     let view_h = 2.0 / params.world_to_clip.y;
     // Divide BEFORE length(): squaring a raw ~view_height-sized velocity
     // underflows f32 below height ~1e-19 and flushes speed to zero.
-    let speed = length(p.vel / view_h);
+    let speed = length(p_vel / view_h);
+
+    // Computed once for the two consumers below (aurora palette, spectrum
+    // glow); the gate is the union of theirs, so other modes with audio off
+    // still skip the bin math entirely.
+    var spec = 0.0;
+    if (params.color_mode == 4u || params.audio2.w > 0.01) {
+        spec = spectrum_for_band(p_band, iter_f);
+    }
 
     var color: vec3<f32>;
     switch params.color_mode {
@@ -111,10 +166,10 @@ fn vs(
             // Bass tightens/loosens the ring spacing subtly so the topography
             // pumps with the music; hue rides the audio palette spin.
             let stripe = pow(
-                0.5 + 0.5 * cos(p.band * (2.2 + params.audio.x * 0.5) - params.time * 0.8),
+                0.5 + 0.5 * cos(p_band * (2.2 + params.audio.x * 0.5) - params.time * 0.8),
                 3.0,
             );
-            let hue = fract(p.band * 0.013 + params.time * 0.012 + params.audio_hue);
+            let hue = fract(p_band * 0.013 + params.time * 0.012 + params.audio_hue);
             color = sinebow(hue) * (0.08 + 1.5 * stripe) * (0.35 + speed * 3.5);
         }
         case 2u: {
@@ -127,7 +182,7 @@ fn vs(
             // pow(speed, 0.75) spreads the crowded low end of the speed
             // distribution across the ramp.
             let t = clamp(pow(speed * 2.4, 0.75), 0.0, 1.0);
-            let ang = atan2(p.vel.y, p.vel.x) / 6.2831853;
+            let ang = atan2(p_vel.y, p_vel.x) / 6.2831853;
             let hue = 0.55 + 0.18 * cos(6.2831853 * (ang + params.time * 0.02))
                 + params.audio_hue * 0.25;
             var tint = sinebow(hue);
@@ -146,14 +201,14 @@ fn vs(
             // fine ember striations across it (drifting with time like
             // coals breathing), and speed adds up to full white so the
             // streams run visibly hotter than the still shell.
-            let d = clamp(p.band / f32(params.max_iter), 0.0, 1.0);
+            let d = clamp(p_band / iter_f, 0.0, 1.0);
             let base = pow(d, 0.45) * 0.72;
             // Two striation frequencies (fine coals + broad waves) plus a
-            // per-particle flicker with p.hue as a random phase, so nearby
+            // per-particle flicker with p_hue as a random phase, so nearby
             // particles on the same band don't pulse in lockstep.
-            let ripple = 0.16 * cos(p.band * 1.7 - params.time * 0.7)
-                + 0.08 * cos(p.band * 0.23 + params.time * 0.15);
-            let flicker = 0.06 * cos(params.time * 2.5 + p.hue * 80.0);
+            let ripple = 0.16 * cos(p_band * 1.7 - params.time * 0.7)
+                + 0.08 * cos(p_band * 0.23 + params.time * 0.15);
+            let flicker = 0.06 * cos(params.time * 2.5 + p_hue * 80.0);
             let t = clamp(base + ripple + flicker + speed * 1.2, 0.0, 1.0);
             let ramp = vec3<f32>(
                 pow(t, 0.55),
@@ -175,15 +230,12 @@ fn vs(
             // Mid energy sends hue waves traveling inward across the depth
             // rings, and a beat kicks every hue a step around the wheel, so
             // the whole swarm visibly reacts to hits, not just brightens.
-            let d = clamp(p.band / f32(params.max_iter), 0.0, 1.0);
-            let bi = u32(clamp((1.0 - d) * 15.99, 0.0, 15.0));
-            let s = params.spectrum[bi / 4u][bi % 4u];
             let hue_a = params.audio.x * 0.5 + params.audio_hue;
             let hue_b = 0.5 + params.audio.z * 0.5 + params.audio_hue;
             let t = smoothstep(0.02, 0.3, speed);
             var hue = mix(hue_a, hue_b, t)
-                + s * 0.15
-                + params.audio.y * 0.15 * sin(p.band * 0.35 - params.time * 3.0)
+                + spec * 0.15
+                + params.audio.y * 0.15 * sin(p_band * 0.35 - params.time * 3.0)
                 + params.audio.w * 0.1;
             // Silence stays dim near-mono silver; sound saturates and the
             // particle's own spectrum bin drives most of its glow, so quiet
@@ -192,14 +244,14 @@ fn vs(
             let sat = clamp(level * 2.0, 0.0, 1.0);
             let tone = mix(vec3<f32>(0.4, 0.45, 0.6), sinebow(fract(hue)), sat);
             color = tone
-                * (0.2 + speed * 3.5 + s * s * (0.5 + level * 2.5)
+                * (0.2 + speed * 3.5 + spec * spec * (0.5 + level * 2.5)
                     + params.audio.w * 1.5);
         }
         default: {
             // Classic: band hue shifted by speed plus a slow global drift.
             // Flat floor at 0.25 keeps the slow particles on the boundary (the
             // fractal shape itself) visible; speed lifts the streams on top.
-            let h = p.hue + speed * 0.95 + params.time * 0.015 + params.audio_hue;
+            let h = p_hue + speed * 0.95 + params.time * 0.015 + params.audio_hue;
             color = sinebow(h) * (0.25 + speed * 5.5);
         }
     }
@@ -214,17 +266,14 @@ fn vs(
     }
     let tr = params.audio.z * params.audio_fx.y;
     if (tr > 0.02) {
-        let glitter = max(0.0, cos(params.time * 40.0 + p.hue * 300.0));
+        let glitter = max(0.0, cos(params.time * 40.0 + p_hue * 300.0));
         color *= 1.0 + tr * glitter * glitter * 0.8;
     }
     // Spectrum glow: each particle's iteration depth maps to a frequency
     // band - bass lights the deep shell filaments, treble the outer haze -
     // so the fractal becomes an equalizer shaped like itself.
     if (params.audio2.w > 0.01) {
-        let d = clamp(p.band / f32(params.max_iter), 0.0, 1.0);
-        let bi = u32(clamp((1.0 - d) * 15.99, 0.0, 15.0));
-        let s = params.spectrum[bi / 4u][bi % 4u];
-        color *= 1.0 + s * s * 1.6 * params.audio_fx.z;
+        color *= 1.0 + spec * spec * 1.6 * params.audio_fx.z;
     }
 
     var out: VsOut;

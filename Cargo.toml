@@ -63,6 +63,13 @@ web-sys = { version = "0.3", features = [
     "Window",
 ] }
 
+# Offline shader validation only (see the shader_validation tests in
+# particles.rs). Already in the tree via bevy, so this pulls in no extra
+# compilation - it just makes it nameable from the test. Must resolve to
+# bevy's copy (a test asserts Cargo.lock holds exactly one version).
+[dev-dependencies]
+naga_oil = "0.17"
+
 [profile.dev]
 opt-level = 1
 # Full DWARF over Bevy's monomorphized generics cost ~13G of target/debug.
