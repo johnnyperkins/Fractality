@@ -1,14 +1,10 @@
-// The ShaderType derive generates per-field check fns that trip dead_code.
-#![allow(dead_code)]
-
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use bevy::asset::DirectAssetAccessExt;
-use bevy::math::DVec2;
-
-use crate::dd::{Dd, DdVec2};
 use bevy::core_pipeline::core_2d::graph::{Core2d, Node2d};
 use bevy::core_pipeline::fullscreen_vertex_shader::fullscreen_shader_vertex_state;
+use bevy::math::DVec2;
 use bevy::prelude::*;
 use bevy::render::{
     extract_component::{ExtractComponent, ExtractComponentPlugin},
@@ -25,6 +21,8 @@ use bevy::render::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
+
+use crate::fractal::{smooth_iter, Fractal, REF_ORBIT_CAP};
 
 /// Marker for the camera the particle pipeline draws on. The draw node and
 /// trail sizing only run for this view: the native present camera (which
@@ -44,94 +42,96 @@ pub struct Particle {
     pub hue: f32,
 }
 
-/// Uniform parameters. Field order must match the WGSL Params struct exactly.
-#[derive(Clone, Copy, ShaderType, Default)]
-pub struct ParamsUniform {
-    /// xy scale, zw offset: clip = pos * scale + offset. Positions are stored
-    /// relative to the view center, so offset (zw) is always zero.
-    pub world_to_clip: Vec4,
-    /// xy pos (center-relative), z button (1 left / -1 right / 0 none), w radius
-    pub mouse: Vec4,
-    /// clip-space half extents of the particle quad
-    pub particle_size: Vec2,
-    /// (prev_center - cur_center) in world units. Added to every particle each
-    /// frame to keep positions relative to the moving view center.
-    pub center_delta: Vec2,
-    pub time: f32,
-    pub dt: f32,
-    pub count: u32,
-    pub max_iter: u32,
-    pub flow_speed: f32,
-    pub band_k: f32,
-    pub damping: f32,
-    pub brightness: f32,
-    /// Number of valid entries in the reference orbit buffer.
-    pub ref_len: u32,
-    /// Frame counter, seeds particle-recycle RNG.
-    pub frame: u32,
-    /// Per-frame probability a particle is recycled. Rises with zoom-out speed
-    /// so fill keeps pace with the newly revealed area; floors at a small trickle.
-    pub reseed_rate: f32,
-    /// Boundary-tightness exponent driver. Higher = particles pack closer to the
-    /// set edge on recycle (finer, sharper boundary). Also the detail knob.
-    pub detail: f32,
-    /// 1.0 = dissolve mode (Space): flow field inert, particles melt off their
-    /// contours via diffusion; mouse impulses still apply. 0.0 = normal flow.
-    pub dissolve: f32,
-    /// Palette selector for the render shader (C cycles): 0 classic, 1 rings,
-    /// 2 electric, 3 inferno, 4 audio aurora.
-    pub color_mode: u32,
-    /// Fractal formula (F cycles): 0 Mandelbrot, 1 Burning Ship, 2 Tricorn,
-    /// 3 Multibrot-3, 4 Julia. Must match the switch in the compute shader.
-    pub fractal_type: u32,
-    /// Particle flow style (G cycles / menu dropdown): 0 contour, 1 layers,
-    /// 2 gravity, 3 erupt, 4 pulse, 5 dynamics. Must match the switch in the
-    /// compute shader.
-    pub flow_mode: u32,
-    /// Per-frame trail keep factor, frame-rate corrected (settings.trail at a
-    /// 60 FPS reference). 0 = trails off: particles draw straight to the view
-    /// target and the trail texture path is skipped entirely.
-    pub trail_decay: f32,
-    /// Audio reactivity levels: x bass, y mid, z treble, w beat pulse (1 on a
-    /// detected beat, exponential decay). All zero while disabled, so every
-    /// consumer is a natural no-op with no enable flag.
-    pub audio: Vec4,
-    /// Palette hue offset accumulated from music energy.
-    pub audio_hue: f32,
-    /// x seconds since last beat, y seconds since last drop (both saturate
-    /// high, so waves die out), z kaleidoscope rotation angle (radians,
-    /// music-driven), w overall level.
-    pub audio2: Vec4,
-    /// Effect gains from the audio settings sliders: x ring pulse, y flash /
-    /// glitter, z spectrum glow, w kaleidoscope segment count (0 = off).
-    pub audio_fx: Vec4,
-    /// 16 log-spaced spectrum bins (bin 0 = lowest), packed 4 per vec4.
-    pub spectrum: [Vec4; 4],
-    /// Shape/dynamics tuning: x condensation (how hard particles freeze onto
-    /// the boundary shell; 1 = classic, higher = wider and deader freeze,
-    /// 0 = everything streams), yzw spare.
-    pub shape: Vec4,
-}
+pub use uniform::ParamsUniform;
 
-impl ParamsUniform {
-    /// Whether this frame renders through the offscreen trail texture plus
-    /// composite pass (vs particles drawn straight to the view target):
-    /// trails on, or kaleidoscope on (the fold happens in the composite
-    /// shader; with decay 0 the fade pass wipes the texture each frame so no
-    /// trails appear). Must match the `n >= 2.0` enable check in trail.wgsl.
-    pub fn needs_composite(&self) -> bool {
-        self.trail_decay > 0.0 || self.audio_fx.w >= 2.0
+// ShaderType's derive emits a never-called `check` fn per field, and only a
+// module-level allow reaches them - hence a module of its own, so the rest of
+// this file keeps its dead-code lint.
+#[allow(dead_code)]
+mod uniform {
+    use bevy::prelude::*;
+    use bevy::render::render_resource::ShaderType;
+
+    /// Uniform parameters. Mirrors Params in common.wgsl field for field.
+    #[derive(Clone, Copy, ShaderType, Default)]
+    pub struct ParamsUniform {
+        /// xy scale, zw offset: clip = pos * scale + offset. Positions are stored
+        /// relative to the view center, so offset (zw) is always zero.
+        pub world_to_clip: Vec4,
+        /// xy pos (center-relative), z button (1 left / -1 right / 0 none), w radius
+        pub mouse: Vec4,
+        /// clip-space half extents of the particle quad
+        pub particle_size: Vec2,
+        /// (prev_center - cur_center) in world units. Added to every particle each
+        /// frame to keep positions relative to the moving view center.
+        pub center_delta: Vec2,
+        pub time: f32,
+        pub dt: f32,
+        pub count: u32,
+        pub max_iter: u32,
+        pub flow_speed: f32,
+        pub band_k: f32,
+        pub damping: f32,
+        pub brightness: f32,
+        /// Number of valid entries in the reference orbit buffer.
+        pub ref_len: u32,
+        /// Frame counter, seeds particle-recycle RNG.
+        pub frame: u32,
+        /// Per-frame probability a particle is recycled. Rises with zoom-out speed
+        /// so fill keeps pace with the newly revealed area; floors at a small trickle.
+        pub reseed_rate: f32,
+        /// Boundary-tightness exponent driver. Higher = particles pack closer to the
+        /// set edge on recycle (finer, sharper boundary). Also the detail knob.
+        pub detail: f32,
+        /// 1.0 = dissolve mode (Space): flow field inert, particles melt off their
+        /// contours via diffusion; mouse impulses still apply. 0.0 = normal flow.
+        pub dissolve: f32,
+        /// Palette selector for the render shader (C cycles): 0 classic, 1 rings,
+        /// 2 electric, 3 inferno, 4 audio aurora.
+        pub color_mode: u32,
+        /// `Fractal` id (F cycles). The shaders never read it: the compute node
+        /// uses it to pick that fractal's pipeline.
+        pub fractal_type: u32,
+        /// Particle flow style (G cycles / menu dropdown): 0 contour, 1 layers,
+        /// 2 gravity, 3 erupt, 4 pulse, 5 dynamics. Must match the switch in the
+        /// compute shader.
+        pub flow_mode: u32,
+        /// Per-frame trail keep factor, frame-rate corrected (settings.trail at a
+        /// 60 FPS reference). 0 = trails off: particles draw straight to the view
+        /// target and the trail texture path is skipped entirely.
+        pub trail_decay: f32,
+        /// Audio reactivity levels: x bass, y mid, z treble, w beat pulse (1 on a
+        /// detected beat, exponential decay). All zero while disabled, so every
+        /// consumer is a natural no-op with no enable flag.
+        pub audio: Vec4,
+        /// Palette hue offset accumulated from music energy.
+        pub audio_hue: f32,
+        /// x seconds since last beat, y seconds since last drop (both saturate
+        /// high, so waves die out), z kaleidoscope rotation angle (radians,
+        /// music-driven), w overall level.
+        pub audio_aux: Vec4,
+        /// Effect gains from the audio settings sliders: x ring pulse, y flash /
+        /// glitter, z spectrum glow, w kaleidoscope segment count (0 = off).
+        pub audio_fx: Vec4,
+        /// 16 log-spaced spectrum bins (bin 0 = lowest), packed 4 per vec4.
+        pub spectrum: [Vec4; 4],
+        /// Shape/dynamics tuning: x condensation (how hard particles freeze onto
+        /// the boundary shell; 1 = classic, higher = wider and deader freeze,
+        /// 0 = everything streams), yzw spare.
+        pub shape: Vec4,
+    }
+
+    impl ParamsUniform {
+        /// Whether this frame renders through the offscreen trail texture plus
+        /// composite pass (vs particles drawn straight to the view target):
+        /// trails on, or kaleidoscope on (the fold happens in the composite
+        /// shader; with decay 0 the fade pass wipes the texture each frame so no
+        /// trails appear). Must match the `n >= 2.0` enable check in trail.wgsl.
+        pub fn needs_composite(&self) -> bool {
+            self.trail_decay > 0.0 || self.audio_fx.w >= 2.0
+        }
     }
 }
-
-/// Max reference-orbit length (also caps max_iter). One vec4<f32> per entry
-/// (hi/lo pairs), so the whole buffer is 256 KB - free on the GPU. Sized so
-/// the depth ramp
-/// (~8750 iterations at the height floor of 1e-28) fits with detail-slider
-/// headroom. The real cost of a long orbit is the per-particle iteration
-/// loop, which `iter_budget_count` in main.rs pays for by trading particle
-/// count against depth.
-pub const REF_ORBIT_CAP: usize = 16384;
 
 /// GPU particle buffer capacity. The full buffer is always allocated; the live
 /// `count` uniform caps how many are actually simulated/drawn, so the settings
@@ -164,169 +164,6 @@ pub struct RefOrbit {
     pub generation: u32,
 }
 
-/// Fractal type id of the Julia set in FRACTAL_MODES and the shader switches.
-pub const JULIA_TYPE: u32 = 4;
-
-/// One shader def per fractal type, indexed by the type id (so the order must
-/// match FRACTAL_MODES, `fractal_step`, and the CPU orbit code). The compute
-/// shader compiles the perturbation step and its derivative from whichever def
-/// is set, and the render graph picks the matching pipeline: those two
-/// functions run twice per iteration of the deepest loop in the app, so the
-/// formula is chosen once at pipeline-build time instead of re-branching a
-/// uniform on every one of the billions of iterations a frame does. All five
-/// are queued at startup, so pressing F never waits on a shader compile.
-const FRACTAL_DEFS: [&str; 5] = [
-    "FRACTAL_MANDELBROT",
-    "FRACTAL_SHIP",
-    "FRACTAL_TRICORN",
-    "FRACTAL_MULTIBROT3",
-    "FRACTAL_JULIA",
-];
-
-// Adding a fractal to the UI list without a matching def (or vice versa)
-// must fail the build, not silently dispatch the wrong formula. Order is
-// checked by shader_validation::julia_def_matches_julia_type.
-const _: () = assert!(FRACTAL_DEFS.len() == crate::FRACTAL_MODES.len());
-
-/// Home Julia parameter. Only the CPU needs it: the GPU delta iteration for
-/// Julia has no c term (dc seeds dz_0 instead), so c reaches the GPU only
-/// through the reference orbit.
-pub const JULIA_C: (f64, f64) = (-0.7269, 0.1889);
-
-/// Julia parameter for the audio morph: orbits JULIA_C at the given phase
-/// (0..1) and radius.
-pub fn julia_morph_c(phase: f64, radius: f64) -> (f64, f64) {
-    let th = phase * std::f64::consts::TAU;
-    (JULIA_C.0 + radius * th.cos(), JULIA_C.1 + radius * th.sin())
-}
-
-/// One iteration of the selected fractal map in f64. Types must match the
-/// switch in the compute shader: 0 Mandelbrot (also Julia's map), 1 Burning
-/// Ship, 2 Tricorn, 3 Multibrot-3.
-fn fractal_step(zx: f64, zy: f64, cx: f64, cy: f64, ftype: u32) -> (f64, f64) {
-    match ftype {
-        1 => {
-            let ax = zx.abs();
-            let ay = zy.abs();
-            (ax * ax - ay * ay + cx, 2.0 * ax * ay + cy)
-        }
-        2 => (zx * zx - zy * zy + cx, -2.0 * zx * zy + cy),
-        3 => (
-            zx * (zx * zx - 3.0 * zy * zy) + cx,
-            zy * (3.0 * zx * zx - zy * zy) + cy,
-        ),
-        _ => (zx * zx - zy * zy + cx, 2.0 * zx * zy + cy),
-    }
-}
-
-/// Initial z and effective c for a point of the given fractal. Julia iterates
-/// the point itself under the given c (the audio morph orbits it around
-/// JULIA_C); everything else iterates from 0 with the point as c.
-fn orbit_start(x: f64, y: f64, ftype: u32, jc: (f64, f64)) -> (f64, f64, f64, f64) {
-    if ftype == JULIA_TYPE {
-        (x, y, jc.0, jc.1)
-    } else {
-        (0.0, 0.0, x, y)
-    }
-}
-
-/// 1/log2(power): smooth-iteration scale so fractional bands stay continuous
-/// for maps of power != 2 (only Multibrot-3 here).
-fn inv_log2_power(ftype: u32) -> f64 {
-    if ftype == 3 {
-        1.0 / 3.0f64.log2()
-    } else {
-        1.0
-    }
-}
-
-/// `fractal_step` in double-double, for the reference orbit. Must stay in
-/// lockstep with the f64 version and the compute-shader switch.
-fn fractal_step_dd(zx: Dd, zy: Dd, cx: Dd, cy: Dd, ftype: u32) -> (Dd, Dd) {
-    match ftype {
-        1 => {
-            let ax = zx.abs();
-            let ay = zy.abs();
-            (ax * ax - ay * ay + cx, ax * ay * 2.0 + cy)
-        }
-        2 => (zx * zx - zy * zy + cx, cy - zx * zy * 2.0),
-        3 => (
-            zx * (zx * zx - zy * zy * 3.0) + cx,
-            zy * (zx * zx * 3.0 - zy * zy) + cy,
-        ),
-        _ => (zx * zx - zy * zy + cx, zx * zy * 2.0 + cy),
-    }
-}
-
-/// Split an f64 into an f32 hi/lo pair: hi = rounded value, lo = the ~24 bits
-/// of residual, together ~48 bits of the original.
-#[inline]
-fn split_f32(v: f64) -> (f32, f32) {
-    let hi = v as f32;
-    (hi, (v - hi as f64) as f32)
-}
-
-/// Iterate the selected map at the reference point in double-double (~31
-/// digits, so the orbit is exact for views down to height ~1e-28), storing
-/// Z_0..Z_n as f32 hi/lo pairs (see `RefOrbit`) - perturbation needs the c
-/// behind the orbit at full precision, the stored samples only well enough to
-/// survive the close-approach cancellation in the shader. Stops at max_iter,
-/// REF_ORBIT_CAP, or when the orbit diverges hard.
-pub fn reference_orbit(c: DdVec2, max_iter: u32, ftype: u32, jc: (f64, f64)) -> Vec<[f32; 4]> {
-    // Julia iterates the center itself under c = jc; everything else iterates
-    // from 0 with the center as c (the DD mirror of `orbit_start`).
-    let (mut zx, mut zy, ccx, ccy) = if ftype == JULIA_TYPE {
-        (c.x, c.y, Dd::from_f64(jc.0), Dd::from_f64(jc.1))
-    } else {
-        (Dd::ZERO, Dd::ZERO, c.x, c.y)
-    };
-    let mut v = Vec::with_capacity((max_iter as usize + 1).min(REF_ORBIT_CAP));
-    let push = |v: &mut Vec<[f32; 4]>, zx: Dd, zy: Dd| {
-        let (hx, lx) = split_f32(zx.hi);
-        let (hy, ly) = split_f32(zy.hi);
-        v.push([hx, hy, lx, ly]);
-    };
-    push(&mut v, zx, zy); // Z_0 (0 except Julia, where it's the center)
-    for _ in 0..max_iter {
-        let (nx, ny) = fractal_step_dd(zx, zy, ccx, ccy, ftype);
-        zx = nx;
-        zy = ny;
-        push(&mut v, zx, zy);
-        if zx.hi * zx.hi + zy.hi * zy.hi > 1e10 || v.len() >= REF_ORBIT_CAP {
-            break;
-        }
-    }
-    v
-}
-
-#[cfg(test)]
-mod dd_orbit_tests {
-    use super::*;
-
-    /// fractal_step_dd must be the same map as fractal_step: iterate both at
-    /// a non-escaping point and compare. A transcription error (sign, factor)
-    /// would silently render a different fractal at every depth.
-    #[test]
-    fn dd_step_matches_f64_step() {
-        for ftype in 0..=4u32 {
-            let (mut zx, mut zy, cx, cy) = orbit_start(-0.16, 0.65, ftype, JULIA_C);
-            let (mut dzx, mut dzy) = (Dd::from_f64(zx), Dd::from_f64(zy));
-            let (dcx, dcy) = (Dd::from_f64(cx), Dd::from_f64(cy));
-            for i in 0..60 {
-                (zx, zy) = fractal_step(zx, zy, cx, cy, ftype);
-                let (nx, ny) = fractal_step_dd(dzx, dzy, dcx, dcy, ftype);
-                dzx = nx;
-                dzy = ny;
-                if zx * zx + zy * zy > 1e10 {
-                    break;
-                }
-                let err = (zx - dzx.hi).abs().max((zy - dzy.hi).abs());
-                assert!(err < 1e-9, "ftype {ftype} iter {i}: err {err:e}");
-            }
-        }
-    }
-}
-
 /// Per-frame simulation parameters, extracted into the render world.
 #[derive(Resource, Clone, Default, ExtractResource)]
 pub struct SimParams(pub ParamsUniform);
@@ -335,39 +172,16 @@ pub struct SimParams(pub ParamsUniform);
 #[derive(Resource)]
 pub struct ParticleSeed(pub Arc<Vec<Particle>>);
 
-/// Smooth escape-time field on the CPU (f64). The formula and the escape
-/// radius (256.0) must be identical to field() in the WGSL shaders so that
-/// CPU band values match GPU field values.
-pub fn smooth_iter(x: f64, y: f64, max_iter: u32, ftype: u32) -> f32 {
-    let (mut zx, mut zy, cx, cy) = orbit_start(x, y, ftype, JULIA_C);
-    let ilp = inv_log2_power(ftype);
-    for i in 0..max_iter {
-        let (nx, ny) = fractal_step(zx, zy, cx, cy, ftype);
-        zx = nx;
-        zy = ny;
-        let m = zx * zx + zy * zy;
-        if m > 256.0 {
-            return i as f32 + 1.0 - ((0.5 * m.log2()).log2() * ilp) as f32;
-        }
-    }
-    max_iter as f32
-}
-
-/// Seed-sampling rectangle (x0, x1, y0, y1) covering the fractal's exterior
-/// boundary region. Coarse is fine: rejection keeps only boundary points and
-/// the GPU recycle resamples the live view within seconds anyway.
-fn spawn_rect(ftype: u32) -> (f64, f64, f64, f64) {
-    match ftype {
-        1 => (-2.5, 1.6, -2.0, 1.0),
-        2 => (-2.4, 1.6, -2.0, 2.0),
-        3 => (-1.6, 1.6, -1.6, 1.6),
-        4 => (-1.8, 1.8, -1.3, 1.3),
-        _ => (-2.3, 0.85, -1.3, 1.3),
-    }
-}
-
-pub fn generate_particles(count: usize, max_iter: u32, center: DVec2, ftype: u32) -> Vec<Particle> {
-    let (x0, x1, y0, y1) = spawn_rect(ftype);
+/// Boundary-biased initial cloud, positions relative to `center`. Same
+/// accept rule as the GPU recycle: reject the interior, then prefer high
+/// escape times so the cloud starts on the fractal's edge.
+pub fn generate_particles(
+    count: usize,
+    max_iter: u32,
+    center: DVec2,
+    fractal: Fractal,
+) -> Vec<Particle> {
+    let (x0, x1, y0, y1) = fractal.spawn_rect();
     // rayon has no plain wasm story (needs SharedArrayBuffer plumbing), so the
     // web build generates sequentially; the smaller default count keeps
     // startup tolerable.
@@ -382,7 +196,7 @@ pub fn generate_particles(count: usize, max_iter: u32, center: DVec2, ftype: u32
             loop {
                 let x = x0 + rng.f64() * (x1 - x0);
                 let y = y0 + rng.f64() * (y1 - y0);
-                let f = smooth_iter(x, y, max_iter, ftype);
+                let f = smooth_iter(x, y, max_iter, fractal);
                 // Inside the set: reject.
                 if f >= max_iter as f32 - 1.0 {
                     continue;
@@ -449,11 +263,15 @@ struct ParticlePipelines {
     compute_layout: BindGroupLayout,
     render_layout: BindGroupLayout,
     composite_layout: BindGroupLayout,
-    /// One per fractal type, indexed by `ParamsUniform::fractal_type`.
-    compute_pipelines: [CachedComputePipelineId; FRACTAL_DEFS.len()],
+    /// One per fractal, indexed by `Fractal::id`.
+    compute_pipelines: [CachedComputePipelineId; Fractal::ALL.len()],
     render_pipeline: CachedRenderPipelineId,
     fade_pipeline: CachedRenderPipelineId,
     composite_pipeline: CachedRenderPipelineId,
+    /// The shared struct module every shader imports. Held only to keep the
+    /// asset alive: the pipeline cache drops an import when its shader
+    /// unloads, and would then never finish compiling the others.
+    _common_shader: Handle<Shader>,
 }
 
 /// Persistent screen-sized HDR texture the particles accumulate into when
@@ -503,6 +321,8 @@ impl FromWorld for ParticlePipelines {
                 ),
             ),
         );
+        let common_shader: Handle<Shader> =
+            world.load_asset("embedded://fractality/shaders/common.wgsl");
         let compute_shader: Handle<Shader> =
             world.load_asset("embedded://fractality/shaders/particle_compute.wgsl");
         let render_shader: Handle<Shader> =
@@ -510,7 +330,9 @@ impl FromWorld for ParticlePipelines {
         let trail_shader: Handle<Shader> =
             world.load_asset("embedded://fractality/shaders/trail.wgsl");
         let cache = world.resource::<PipelineCache>();
-        let compute_pipelines = FRACTAL_DEFS.map(|def| {
+        // All queued up front, so pressing F never waits on a shader compile.
+        let compute_pipelines = Fractal::ALL.map(|fractal| {
+            let def = fractal.shader_def();
             cache.queue_compute_pipeline(ComputePipelineDescriptor {
                 label: Some(format!("particle_compute_pipeline_{def}").into()),
                 layout: vec![compute_layout.clone()],
@@ -622,6 +444,7 @@ impl FromWorld for ParticlePipelines {
             render_pipeline,
             fade_pipeline,
             composite_pipeline,
+            _common_shader: common_shader,
         }
     }
 }
@@ -664,14 +487,7 @@ fn extract_particle_buffers(
 /// Free the CPU-side seed once the render world has copied it into the GPU
 /// buffer. Extraction happens at the end of the frame the seed appears in, so
 /// by this system's second run the tens-of-MB Vec is dead weight.
-fn drop_particle_seed(
-    mut commands: Commands,
-    seed: Option<Res<ParticleSeed>>,
-    mut frames: Local<u32>,
-) {
-    if seed.is_none() {
-        return;
-    }
+fn drop_particle_seed(mut commands: Commands, mut frames: Local<u32>) {
     *frames += 1;
     if *frames >= 2 {
         commands.remove_resource::<ParticleSeed>();
@@ -748,7 +564,7 @@ fn prepare_trail_texture(
     existing: Option<ResMut<TrailTexture>>,
     mut was_active: Local<bool>,
 ) {
-    let active = params.map_or(false, |p| p.0.needs_composite());
+    let active = params.is_some_and(|p| p.0.needs_composite());
     // Trails never used this session: nothing to size-track or invalidate.
     if !active && existing.is_none() {
         *was_active = false;
@@ -761,7 +577,7 @@ fn prepare_trail_texture(
     let extent = view_target.main_texture().size();
     let size = (extent.width, extent.height);
 
-    let recreate = existing.as_ref().map_or(true, |t| t.size != size);
+    let recreate = existing.as_ref().is_none_or(|t| t.size != size);
     if recreate {
         if !active {
             *was_active = false;
@@ -819,7 +635,7 @@ struct ParticleComputeNode {
     /// composite passes keep running. Those frames dispatch this pipeline
     /// instead: a brief blend of old formula and new reference orbit that the
     /// recycler resamples away, rather than a visible stall.
-    last_ready: std::sync::atomic::AtomicUsize,
+    last_ready: AtomicUsize,
 }
 
 impl render_graph::Node for ParticleComputeNode {
@@ -839,12 +655,10 @@ impl render_graph::Node for ParticleComputeNode {
         let cache = world.resource::<PipelineCache>();
         let params = world.get_resource::<SimParams>();
         // Each fractal has its own pipeline with its perturbation step
-        // compiled in; an out-of-range id falls back to Mandelbrot, matching
-        // the `_ =>` arms of the CPU orbit code so both halves of the
-        // perturbation pipeline iterate the same map.
-        let ftype = params.map_or(0, |p| p.0.fractal_type) as usize;
-        let wanted = if ftype < FRACTAL_DEFS.len() { ftype } else { 0 };
-        use std::sync::atomic::Ordering;
+        // compiled in. from_id maps a bad id to Mandelbrot, the same fallback
+        // the CPU orbit code uses, so both halves of the perturbation
+        // pipeline always iterate the same map.
+        let wanted = Fractal::from_id(params.map_or(0, |p| p.0.fractal_type)).id() as usize;
         let id = pipelines.compute_pipelines[wanted];
         let pipeline = match cache.get_compute_pipeline(id) {
             Some(pipeline) => {
@@ -871,7 +685,7 @@ impl render_graph::Node for ParticleComputeNode {
             .begin_compute_pass(&ComputePassDescriptor::default());
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bind_groups.compute, &[]);
-        pass.dispatch_workgroups((count + 255) / 256, 1, 1);
+        pass.dispatch_workgroups(count.div_ceil(256), 1, 1);
         Ok(())
     }
 }
@@ -906,7 +720,7 @@ impl ViewNode for ParticleDrawNode {
         let params = world.get_resource::<SimParams>();
         let count = params.map_or(0, |p| p.0.count).min(buffers.count);
         let decay = params.map_or(0.0, |p| p.0.trail_decay);
-        let composite = params.map_or(false, |p| p.0.needs_composite());
+        let composite = params.is_some_and(|p| p.0.needs_composite());
 
         // Composite path needs the texture and both extra pipelines ready;
         // otherwise draw straight to the view target.
@@ -982,6 +796,7 @@ pub struct ParticlePlugin;
 
 impl Plugin for ParticlePlugin {
     fn build(&self, app: &mut App) {
+        bevy::asset::embedded_asset!(app, "shaders/common.wgsl");
         bevy::asset::embedded_asset!(app, "shaders/particle_compute.wgsl");
         bevy::asset::embedded_asset!(app, "shaders/particle_render.wgsl");
         bevy::asset::embedded_asset!(app, "shaders/trail.wgsl");
@@ -989,7 +804,10 @@ impl Plugin for ParticlePlugin {
         app.add_plugins(ExtractResourcePlugin::<SimParams>::default());
         app.add_plugins(ExtractResourcePlugin::<RefOrbit>::default());
         app.add_plugins(ExtractComponentPlugin::<ParticleCamera>::default());
-        app.add_systems(Update, drop_particle_seed);
+        app.add_systems(
+            Update,
+            drop_particle_seed.run_if(resource_exists::<ParticleSeed>),
+        );
 
         let render_app = app.sub_app_mut(RenderApp);
         render_app
@@ -1025,18 +843,34 @@ impl Plugin for ParticlePlugin {
 /// step fails the test run instead of the show.
 #[cfg(test)]
 mod shader_validation {
-    use super::{FRACTAL_DEFS, JULIA_TYPE};
-    use naga_oil::compose::{Composer, NagaModuleDescriptor, ShaderDefValue, ShaderType};
+    use super::{Fractal, ParamsUniform, Particle};
+    use bevy::render::render_resource::ShaderType as _;
+    use naga_oil::compose::{
+        ComposableModuleDescriptor, Composer, NagaModuleDescriptor, ShaderDefValue, ShaderType,
+    };
     use std::collections::HashMap;
 
+    const COMMON: &str = include_str!("shaders/common.wgsl");
+    const COMPUTE: &str = include_str!("shaders/particle_compute.wgsl");
+
     /// One preprocessor+validate pass, shared by the positive and negative
-    /// tests so both always exercise the exact descriptor the pipelines use.
+    /// tests so both always exercise the exact descriptor the pipelines use,
+    /// with the shared struct module registered the way the pipeline cache
+    /// registers it.
     fn try_compile(source: &str, file_path: &str, defs: &[&str]) -> Result<(), String> {
         let shader_defs = defs
             .iter()
             .map(|d| (d.to_string(), ShaderDefValue::Bool(true)))
             .collect::<HashMap<_, _>>();
         let mut composer = Composer::default();
+        composer
+            .add_composable_module(ComposableModuleDescriptor {
+                source: COMMON,
+                file_path: "common.wgsl",
+                ..Default::default()
+            })
+            .map(|_| ())
+            .map_err(|e| e.emit_to_string(&composer))?;
         composer
             .make_naga_module(NagaModuleDescriptor {
                 source,
@@ -1057,9 +891,8 @@ mod shader_validation {
 
     #[test]
     fn compute_shader_compiles_for_every_fractal() {
-        let src = include_str!("shaders/particle_compute.wgsl");
-        for def in FRACTAL_DEFS {
-            compile(src, "particle_compute.wgsl", &[def]);
+        for fractal in Fractal::ALL {
+            compile(COMPUTE, "particle_compute.wgsl", &[fractal.shader_def()]);
         }
     }
 
@@ -1068,9 +901,8 @@ mod shader_validation {
     /// a pipeline that never queued one.
     #[test]
     fn compute_shader_needs_a_fractal_def() {
-        let src = include_str!("shaders/particle_compute.wgsl");
         assert!(
-            try_compile(src, "particle_compute.wgsl", &[]).is_err(),
+            try_compile(COMPUTE, "particle_compute.wgsl", &[]).is_err(),
             "compute shader compiled with no fractal selected"
         );
     }
@@ -1085,22 +917,40 @@ mod shader_validation {
         compile(include_str!("shaders/trail.wgsl"), "trail.wgsl", &[]);
     }
 
-    /// FRACTAL_DEFS is order-coupled to FRACTAL_MODES (lengths are tied by a
-    /// const assert next to the array); pin the one id other code keys on.
+    /// The WGSL structs must be exactly the size of their Rust mirrors: a
+    /// field added on one side only shifts every later uniform, which no
+    /// validator catches and which renders as garbage, not as an error.
     #[test]
-    fn julia_def_matches_julia_type() {
-        assert_eq!(FRACTAL_DEFS[JULIA_TYPE as usize], "FRACTAL_JULIA");
+    fn shared_structs_match_rust_layouts() {
+        // Composed as a top-level module, which has no import path to declare.
+        let source = COMMON.replace("#define_import_path fractality::common", "");
+        let module = Composer::default()
+            .make_naga_module(NagaModuleDescriptor {
+                source: &source,
+                file_path: "common.wgsl",
+                ..Default::default()
+            })
+            .expect("common.wgsl failed to compile");
+        let size = |name: &str| {
+            let (_, ty) = module
+                .types
+                .iter()
+                .find(|(_, ty)| ty.name.as_deref() == Some(name))
+                .unwrap_or_else(|| panic!("no struct {name} in common.wgsl"));
+            ty.inner.size(module.to_ctx()) as u64
+        };
+        assert_eq!(size("Particle"), std::mem::size_of::<Particle>() as u64);
+        assert_eq!(size("Params"), ParamsUniform::min_size().get());
     }
 
     /// The compute shader hardcodes 1/log2(3) for Multibrot-3 smooth
-    /// iteration (WGSL has no f64 math); a drift from the CPU value in
-    /// inv_log2_power() silently skews GPU bands against CPU smooth_iter.
+    /// iteration (WGSL has no f64 math); a drift from the CPU value
+    /// silently skews GPU bands against CPU smooth_iter.
     #[test]
     fn multibrot_inv_log2_power_matches_cpu() {
-        let src = include_str!("shaders/particle_compute.wgsl");
-        let expected = format!("return {};", 1.0 / 3.0f64.log2());
+        let expected = format!("return {};", Fractal::Multibrot3.inv_log2_power());
         assert!(
-            src.contains(&expected),
+            COMPUTE.contains(&expected),
             "particle_compute.wgsl inv_log2_power() drifted from the CPU value: expected `{expected}`"
         );
     }

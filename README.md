@@ -57,6 +57,6 @@ Or use `./build-web-singlefile.sh` for a single self-contained HTML file. The ho
 
 ## How it works
 
-The CPU computes one high-precision reference orbit (`f64`) per view. The compute shader then iterates only the *delta* from that orbit for every particle in `f32`, which keeps deep zooms stable far past where naive single-precision math falls apart. Particle color, motion, and escape behavior all derive from a smooth escape-time field with an analytic gradient (no finite differences), and the audio pipeline feeds beat, bass, and treble energy into the simulation parameters every frame.
+The CPU computes one high-precision reference orbit per view in double-double arithmetic (~31 digits, good to a view height of 1e-28). The compute shader then iterates only the *delta* from that orbit for every particle in `f32`, which keeps deep zooms stable far past where naive single-precision math falls apart. Particle color, motion, and escape behavior all derive from a smooth escape-time field with an analytic gradient (no finite differences), and the audio pipeline feeds beat, bass, and treble energy into the simulation parameters every frame.
 
 Rendering is instanced quads with additive blending, HDR bloom, an optional trail-accumulation pass with beat-driven RGB splitting, and a kaleidoscope fold in the trail composite.

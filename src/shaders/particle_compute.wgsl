@@ -1,60 +1,6 @@
 // Fractality particle compute shader.
-// Struct layouts must match the Rust side (particles.rs) exactly.
 
-struct Particle {
-    pos: vec2<f32>,
-    vel: vec2<f32>,
-    home: vec2<f32>,
-    band: f32,
-    hue: f32,
-};
-
-struct Params {
-    world_to_clip: vec4<f32>,
-    mouse: vec4<f32>,
-    particle_size: vec2<f32>,
-    center_delta: vec2<f32>,
-    time: f32,
-    dt: f32,
-    count: u32,
-    max_iter: u32,
-    flow_speed: f32,
-    band_k: f32,
-    damping: f32,
-    brightness: f32,
-    ref_len: u32,
-    frame: u32,
-    reseed_rate: f32,
-    detail: f32,
-    dissolve: f32,
-    color_mode: u32,
-    // Unused in this shader (the formula is a compile-time FRACTAL_* def,
-    // one pipeline per type); present for layout parity with ParamsUniform.
-    fractal_type: u32,
-    // Flow style: 0 contour, 1 layers, 2 gravity, 3 erupt, 4 pulse,
-    // 5 dynamics.
-    flow_mode: u32,
-    // Unused in this shader; present for layout parity with ParamsUniform.
-    trail_decay: f32,
-    // Audio levels: x bass, y mid, z treble, w beat pulse. All zero while
-    // audio reactivity is off, so every use is a natural no-op.
-    audio: vec4<f32>,
-    // Music-driven hue/phase accumulator; the dynamics flow mode spins its
-    // direction field by it.
-    audio_hue: f32,
-    // x seconds since last beat, y seconds since last drop (saturate high),
-    // z unused, w overall level.
-    audio2: vec4<f32>,
-    // Effect gains: x ring pulse, y flash/glitter (render), z spectrum glow
-    // (render), w unused.
-    audio_fx: vec4<f32>,
-    // 16 log-spaced spectrum bins (unused here; layout parity).
-    spectrum: array<vec4<f32>, 4>,
-    // Shape/dynamics tuning: x condensation (boundary freeze strength and
-    // reach; 1 = classic), y previous flow mode, z flow crossfade blend
-    // (0 = all previous mode, 1 = all current), w spare.
-    shape: vec4<f32>,
-};
+#import fractality::common::{Particle, Params}
 
 @group(0) @binding(0) var<storage, read_write> particles: array<Particle>;
 @group(0) @binding(1) var<uniform> params: Params;
@@ -99,11 +45,10 @@ fn diffabs(x: f32, d: f32) -> f32 {
 // value Z_n, the delta dz_n, and the point's offset dc from the view center.
 //
 // The formula is a compile-time choice, not a runtime switch: the Rust side
-// queues one compute pipeline per fractal type, each with exactly one
-// FRACTAL_* def set (see FRACTAL_DEFS in particles.rs, whose order must match
-// FRACTAL_MODES). This function and step_der run twice per iteration of the
-// hottest loop in the app, so folding the 5-way branch into the pipeline
-// keeps the loop body straight-line.
+// queues one compute pipeline per fractal, each with exactly one FRACTAL_*
+// def set (Fractal::shader_def in fractal.rs). This function and step_der run
+// twice per iteration of the hottest loop in the app, so folding the 5-way
+// branch into the pipeline keeps the loop body straight-line.
 fn step_dz(z_ref: vec2<f32>, dz: vec2<f32>, dc: vec2<f32>) -> vec2<f32> {
 #ifdef FRACTAL_SHIP
     // Burning Ship: z' = (|x| + i|y|)^2 + c. With w = |Z+dz| and
@@ -325,7 +270,7 @@ const DROP_AGE_MAX: f32 = 2.0;
 const WAVE_SPEED: f32 = 1.4;
 
 fn wave_live() -> bool {
-    return params.audio2.x < BEAT_AGE_MAX || params.audio2.y < DROP_AGE_MAX;
+    return params.audio_aux.x < BEAT_AGE_MAX || params.audio_aux.y < DROP_AGE_MAX;
 }
 
 // A gaussian shell at the radius an `age`-old wavefront has reached, fading
@@ -343,8 +288,8 @@ fn ring(rn: f32, age: f32) -> f32 {
 // displace, not eject: much higher and the cloud blows off screen and the
 // view goes dark until the recycle repopulates it.
 fn beat_impulse(pos: vec2<f32>, view_height: f32) -> vec2<f32> {
-    let beat_age = params.audio2.x;
-    let drop_age = params.audio2.y;
+    let beat_age = params.audio_aux.x;
+    let drop_age = params.audio_aux.y;
     // View-height units: length() of a raw center-relative position squares
     // it internally, which underflows f32 below height ~1e-19 and collapses
     // the radius (and the direction division) to garbage at deep zoom.

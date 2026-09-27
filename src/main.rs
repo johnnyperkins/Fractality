@@ -1,5 +1,11 @@
+// Bevy systems take their resources as parameters and filter with nested
+// query types; both lints fire on idiomatic system signatures.
+#![allow(clippy::too_many_arguments, clippy::type_complexity)]
+
 mod audio;
+mod choreographer;
 mod dd;
+mod fractal;
 mod menu;
 mod particles;
 mod recorder;
@@ -13,6 +19,7 @@ use bevy::core_pipeline::bloom::Bloom;
 use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
+use bevy::math::DVec2;
 use bevy::prelude::*;
 use bevy::render::camera::ClearColorConfig;
 #[cfg(not(target_arch = "wasm32"))]
@@ -24,18 +31,14 @@ use bevy::render::view::Msaa;
 use bevy::ui::IsDefaultUiCamera;
 use bevy::window::PresentMode;
 
-use bevy::math::DVec2;
-#[cfg(not(target_arch = "wasm32"))]
-use rayon::prelude::*;
-
-use dd::DdVec2;
-
 use audio::{AudioCapture, AudioLevels};
-use menu::{MenuOpen, MenuPlugin, PointerOverMenu, Settings};
+use choreographer::{update_choreographer, Choreographer};
+use dd::DdVec2;
+use fractal::{julia_morph_c, reference_orbit, Fractal, JULIA_C, REF_ORBIT_CAP};
+use menu::{MenuPlugin, PointerOverMenu, Settings};
 use particles::{
-    generate_particles, julia_morph_c, reference_orbit, smooth_iter, ParticleCamera,
-    ParticlePlugin, ParticleSeed, RefOrbit, SimParams, JULIA_C, JULIA_TYPE, MAX_PARTICLES,
-    REF_ORBIT_CAP,
+    generate_particles, ParticleCamera, ParticlePlugin, ParticleSeed, RefOrbit, SimParams,
+    MAX_PARTICLES,
 };
 use recorder::{Recorder, RecorderPlugin};
 
@@ -48,10 +51,18 @@ use recorder::{Recorder, RecorderPlugin};
 pub struct SceneTarget(pub Handle<Image>);
 
 const BASE_ITER: u32 = 240;
-const DEFAULT_CENTER: DVec2 = DVec2::new(-0.55, 0.0);
-const DEFAULT_HEIGHT: f64 = 2.7;
+const DEFAULT_CENTER: DVec2 = Fractal::Mandelbrot.home_view().0;
+const DEFAULT_HEIGHT: f64 = Fractal::Mandelbrot.home_view().1;
 
-#[derive(Resource)]
+/// Deepest view height: the double-double center carries ~31 digits, and a
+/// couple of digits of margin keep sub-pixel accuracy at the floor.
+const MIN_HEIGHT: f64 = 1e-28;
+/// Widest view height the wheel can reach.
+const MAX_HEIGHT: f64 = 40.0;
+
+/// Dissolve mode (Space): the flow field goes inert and particles melt off
+/// their contours.
+#[derive(Resource, Default)]
 struct Dissolve(bool);
 
 /// Palette selector, cycled with C (or by clicking the menu row). Names
@@ -62,18 +73,8 @@ pub struct ColorMode(pub u32);
 pub const COLOR_MODES: [&str; 5] = ["classic", "rings", "electric", "inferno", "audio aurora"];
 
 /// Fractal formula selector, cycled with F (or by clicking the menu row).
-/// Ids must match the switch in the compute shader and fractal_step() on the
-/// CPU side.
 #[derive(Resource, Default)]
-pub struct FractalType(pub u32);
-
-pub const FRACTAL_MODES: [&str; 5] = [
-    "mandelbrot",
-    "burning ship",
-    "tricorn",
-    "multibrot-3",
-    "julia",
-];
+pub struct FractalType(pub Fractal);
 
 /// Particle flow style, cycled with G (or picked from the menu dropdown).
 /// Ids must match the flow_mode switch in the compute shader.
@@ -81,17 +82,6 @@ pub const FRACTAL_MODES: [&str; 5] = [
 pub struct FlowMode(pub u32);
 
 pub const FLOW_MODES: [&str; 6] = ["contour", "layers", "gravity", "erupt", "pulse", "dynamics"];
-
-/// Home view (center, height) per fractal, used on R reset and when switching.
-fn fractal_default_view(ftype: u32) -> (DVec2, f64) {
-    match ftype {
-        1 => (DVec2::new(-0.4, -0.5), 3.0),
-        2 => (DVec2::new(-0.3, 0.0), 3.4),
-        3 => (DVec2::ZERO, 3.0),
-        4 => (DVec2::ZERO, 3.0),
-        _ => (DEFAULT_CENTER, DEFAULT_HEIGHT),
-    }
-}
 
 /// Kaleidoscope state. Toggled with K (or by clicking the menu row); the fold
 /// count and spin gain live in Settings sliders, shown only while on. Pure
@@ -122,186 +112,6 @@ struct Bookmarks([Option<Bookmark>; 9]);
 #[derive(Resource, Default)]
 struct FlyTo(Option<Bookmark>);
 
-/// Idle seconds before the attract-mode autopilot engages.
-const ATTRACT_IDLE_SECS: f32 = 30.0;
-
-/// Attract-mode dive floor: boundary targeting samples the escape field in
-/// plain f64, which loses the boundary below ~1e-13, so scenes cut to the
-/// next one here instead of diving blind toward the 1e-28 precision floor.
-const ATTRACT_FLOOR: f64 = 1e-12;
-
-/// Auto-choreographer (classic arcade "attract mode"): toggled with X or
-/// the menu row, or engaging on its own after 30 s without input. The autopilot dives into
-/// the busiest boundary in sight (retargeting as new structure resolves),
-/// phases the kaleidoscope in and out with fresh fold/spin styling, cycles
-/// flow modes through the crossfade, swaps the palette on song drops (or a
-/// timer when silent), varies the trail length, and fires blast bursts.
-/// Idle engagement hands control back on any input; explicit engagement
-/// (manual) ignores input and only the toggle exits. On exit the
-/// kaleidoscope and the touched sliders (folds, spin, trails) return to
-/// their pre-attract values; the view stays wherever the dive got to (R
-/// resets).
-#[derive(Resource)]
-pub struct Attract {
-    /// Seconds since the last user input.
-    idle: f32,
-    pub on: bool,
-    /// Set by the X key or the menu row; consumed by update_attract.
-    pub want_toggle: bool,
-    /// Engaged explicitly: input no longer exits, only the toggle does.
-    manual: bool,
-    target: DdVec2,
-    /// Eased aim point chasing `target`, so a retarget bends the dive
-    /// instead of yanking it sideways.
-    aim: DdVec2,
-    /// Countdown to the next boundary-target rescan.
-    retarget: f32,
-    /// Some = a scene cut is armed (the dive reached the floor) and this is
-    /// the remaining hang time at the deepest point: with music playing the
-    /// cut waits up to 1.2 s to land on a beat.
-    cut_wait: Option<f32>,
-    /// Post-cut reseed boost countdown: refill the new fractal's boundary
-    /// within a few frames so the cut never shows a half-empty cloud.
-    reseed_boost: f32,
-    /// Countdown to the next blast, and remaining seconds of the current one
-    /// (the synthetic "click" holds a few frames so it moves real mass).
-    next_burst: f32,
-    burst: f32,
-    /// Center-relative world position of the current blast.
-    burst_pos: Vec2,
-    /// Countdown to the next kaleidoscope phase flip.
-    kaleido_t: f32,
-    /// Countdown to the next styling tweak (folds / spin / trails).
-    style_t: f32,
-    /// Countdown to the next flow-mode cycle.
-    flow_t: f32,
-    /// Minimum spacing between drop-driven palette swaps, and the fallback
-    /// countdown that swaps anyway when the music never drops.
-    palette_hold: f32,
-    palette_t: f32,
-    prev_drop_age: f32,
-    saved_kaleido: bool,
-    saved_folds: f32,
-    saved_spin: f32,
-    saved_trail: f32,
-    last_cursor: Option<Vec2>,
-    /// Choreography dice; reseeded from the wall clock on every engage.
-    rng: fastrand::Rng,
-}
-
-impl Default for Attract {
-    fn default() -> Self {
-        Self {
-            idle: 0.0,
-            on: false,
-            want_toggle: false,
-            manual: false,
-            target: DdVec2::from_dvec2(DEFAULT_CENTER),
-            aim: DdVec2::from_dvec2(DEFAULT_CENTER),
-            retarget: 0.0,
-            cut_wait: None,
-            reseed_boost: 0.0,
-            next_burst: 0.0,
-            burst: 0.0,
-            burst_pos: Vec2::ZERO,
-            kaleido_t: 0.0,
-            style_t: 0.0,
-            flow_t: 0.0,
-            palette_hold: 0.0,
-            palette_t: 0.0,
-            prev_drop_age: 1e3,
-            saved_kaleido: false,
-            saved_folds: 6.0,
-            saved_spin: 1.0,
-            saved_trail: 0.3,
-            last_cursor: None,
-            rng: fastrand::Rng::with_seed(1),
-        }
-    }
-}
-
-/// Random pick of a mode id different from `cur`, uniform over the rest.
-fn rand_cycle(cur: u32, n: u32, rng: &mut fastrand::Rng) -> u32 {
-    (cur + 1 + rng.u32(0..n - 1)) % n
-}
-
-/// Fresh mandala styling: random fold count and spin gain.
-fn roll_kaleido_style(settings: &mut Settings, rng: &mut fastrand::Rng) {
-    settings.kaleido_folds = (3.0 + rng.f32() * 11.0).round();
-    settings.kaleido_spin = 0.2 + rng.f32() * 1.6;
-}
-
-/// Scan a coarse smooth-escape grid over the middle of the view and return
-/// the fractal point with the highest local escape-time variance - the
-/// busiest boundary in sight, which is where a dive keeps finding structure.
-/// Picks randomly among the top cells so repeated dives take different turns.
-/// Returns None over a flat field (deep interior, far exterior): nothing to
-/// steer toward, keep the current heading.
-fn pick_boundary_target(
-    center: DVec2,
-    height: f64,
-    aspect: f64,
-    max_iter: u32,
-    ftype: u32,
-    rng: &mut fastrand::Rng,
-) -> Option<DdVec2> {
-    const G: usize = 24;
-    // Middle 84% of the view: targets picked at the very edge get anchored
-    // there by the dive math and drag the interesting part half off screen.
-    let cell = |ix: usize, iy: usize| {
-        DVec2::new(
-            center.x + ((ix as f64 + 0.5) / G as f64 - 0.5) * height * aspect * 0.84,
-            center.y + ((iy as f64 + 0.5) / G as f64 - 0.5) * height * 0.84,
-        )
-    };
-    let mut f = [[0.0f32; G]; G];
-    // Row-parallel: at the 3000-iteration cap a serial scan costs a few ms,
-    // a visible frame hitch mid-dive; across cores it stays sub-ms. (Wasm
-    // has no rayon; single-threaded there, same as particle generation.)
-    let fill_row = |iy: usize, row: &mut [f32; G]| {
-        for (ix, v) in row.iter_mut().enumerate() {
-            let p = cell(ix, iy);
-            // Log-compressed so one deep escape spike cannot drown the
-            // variance of everything around it.
-            *v = (1.0 + smooth_iter(p.x, p.y, max_iter, ftype)).ln();
-        }
-    };
-    #[cfg(not(target_arch = "wasm32"))]
-    f.as_mut_slice()
-        .par_iter_mut()
-        .enumerate()
-        .for_each(|(iy, row)| fill_row(iy, row));
-    #[cfg(target_arch = "wasm32")]
-    f.iter_mut()
-        .enumerate()
-        .for_each(|(iy, row)| fill_row(iy, row));
-    let mut scored = Vec::with_capacity((G - 2) * (G - 2));
-    for iy in 1..G - 1 {
-        for ix in 1..G - 1 {
-            let mut lo = f32::MAX;
-            let mut hi = f32::MIN;
-            for row in &f[iy - 1..=iy + 1] {
-                for &v in &row[ix - 1..=ix + 1] {
-                    lo = lo.min(v);
-                    hi = hi.max(v);
-                }
-            }
-            scored.push((hi - lo, ix, iy));
-        }
-    }
-    scored.sort_by(|a, b| b.0.total_cmp(&a.0));
-    if scored[0].0 < 0.05 {
-        return None;
-    }
-    let top = scored
-        .iter()
-        .take_while(|s| s.0 > scored[0].0 * 0.6)
-        .count()
-        .min(6);
-    let (_, ix, iy) = scored[rng.usize(0..top)];
-    Some(DdVec2::from_dvec2(cell(ix, iy)))
-}
-
 /// View transform. The center is double-double (~31 digits) so the
 /// perturbation reference point stays exact down to the height floor of
 /// ~1e-28; plain f64 (~16 digits) capped useful zoom at ~1e-15. Height stays
@@ -325,6 +135,20 @@ impl Default for ViewState {
             prev_height: DEFAULT_HEIGHT,
         }
     }
+}
+
+impl ViewState {
+    /// Jump to the fractal's home view (R, and fractal switches).
+    fn go_home(&mut self, fractal: Fractal) {
+        let (center, height) = fractal.home_view();
+        self.center = DdVec2::from_dvec2(center);
+        self.height = height;
+    }
+}
+
+/// Advance a mode id to the next of `n`, wrapping.
+fn cycle(id: &mut u32, n: usize) {
+    *id = (*id + 1) % n as u32;
 }
 
 /// Iteration count at base zoom. Deeper views ramp above this, and
@@ -439,25 +263,10 @@ fn main() {
         .min(MAX_PARTICLES);
 
     println!("Fractality controls:");
-    println!("  hover      ripple particles");
-    println!("  left-click blast");
-    println!("  right-click vortex");
-    println!("  wheel      zoom toward cursor");
-    println!("  WASD       pan");
-    println!("  Space      dissolve");
-    println!("  Z          auto-zoom dive at cursor");
-    println!("  C          cycle color mode");
-    println!("  F          cycle fractal type");
-    println!("  G          cycle flow mode");
-    println!("  K          kaleidoscope (folds / spin sliders in menu)");
-    println!("  V          audio reactivity (system output drives the fractal)");
-    println!("  P          screenshot (PNG in working dir)");
-    println!("  O          record video (mp4 in working dir; webm download on web)");
-    println!("  Shift+1..9 save view, 1..9 fly back to it");
-    println!("  R          reset view");
-    println!("  M / Esc    settings menu");
-    println!("  X          auto-choreographer: dives, restyles, bursts on its own (X exits;");
-    println!("             also self-starts after 30s idle, then any input exits)");
+    for (key, action) in menu::CONTROLS {
+        println!("  {key:<10} {action}");
+    }
+    println!("  (the choreographer also self-starts after 30 s idle; then any input exits)");
 
     let mut app = App::new();
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -480,20 +289,20 @@ fn main() {
         particle_count: count,
         ..default()
     })
-    .insert_resource(ViewState::default())
-    .insert_resource(Dissolve(false))
-    .insert_resource(ColorMode::default())
-    .insert_resource(FractalType::default())
-    .insert_resource(FlowMode::default())
-    .insert_resource(Kaleido::default())
-    .insert_resource(AutoZoom::default())
-    .insert_resource(Bookmarks::default())
-    .insert_resource(FlyTo::default())
-    .insert_resource(Attract::default())
-    .insert_resource(SimParams::default())
-    .insert_resource(RefOrbit::default())
-    .insert_resource(AudioCapture::default())
-    .insert_resource(AudioLevels::default())
+    .init_resource::<ViewState>()
+    .init_resource::<Dissolve>()
+    .init_resource::<ColorMode>()
+    .init_resource::<FractalType>()
+    .init_resource::<FlowMode>()
+    .init_resource::<Kaleido>()
+    .init_resource::<AutoZoom>()
+    .init_resource::<Bookmarks>()
+    .init_resource::<FlyTo>()
+    .init_resource::<Choreographer>()
+    .init_resource::<SimParams>()
+    .init_resource::<RefOrbit>()
+    .init_resource::<AudioCapture>()
+    .init_resource::<AudioLevels>()
     .add_systems(Startup, setup)
     .add_systems(
         Update,
@@ -503,7 +312,7 @@ fn main() {
                 apply_fractal_switch,
                 audio::manage_capture,
                 audio::update_audio,
-                update_attract,
+                update_choreographer,
                 update_params,
             )
                 .chain(),
@@ -655,7 +464,7 @@ fn setup(
         settings.particle_count as usize,
         BASE_ITER,
         DEFAULT_CENTER,
-        0,
+        Fractal::Mandelbrot,
     );
     info!(
         "generated {} particles in {:.2?}",
@@ -742,9 +551,7 @@ fn handle_input(
     }
 
     if keys.just_pressed(KeyCode::KeyR) {
-        let (center, height) = fractal_default_view(fractal.0);
-        view.center = DdVec2::from_dvec2(center);
-        view.height = height;
+        view.go_home(fractal.0);
         auto_zoom.0 = false;
         fly.0 = None;
     }
@@ -756,15 +563,15 @@ fn handle_input(
         fly.0 = None;
     }
     if keys.just_pressed(KeyCode::KeyC) {
-        color_mode.0 = (color_mode.0 + 1) % COLOR_MODES.len() as u32;
+        cycle(&mut color_mode.0, COLOR_MODES.len());
         info!("color mode: {}", COLOR_MODES[color_mode.0 as usize]);
     }
     if keys.just_pressed(KeyCode::KeyF) {
-        fractal.0 = (fractal.0 + 1) % FRACTAL_MODES.len() as u32;
-        info!("fractal: {}", FRACTAL_MODES[fractal.0 as usize]);
+        fractal.0 = fractal.0.next();
+        info!("fractal: {}", fractal.0.name());
     }
     if keys.just_pressed(KeyCode::KeyG) {
-        flow_mode.0 = (flow_mode.0 + 1) % FLOW_MODES.len() as u32;
+        cycle(&mut flow_mode.0, FLOW_MODES.len());
         info!("flow mode: {}", FLOW_MODES[flow_mode.0 as usize]);
     }
     if keys.just_pressed(KeyCode::KeyK) {
@@ -830,9 +637,7 @@ fn handle_input(
         return;
     };
     if scroll != 0.0 {
-        // Lower clamp near the double-double precision floor for the center
-        // (~31 digits; a couple of digits of margin keeps sub-pixel accuracy).
-        let new_h = (view.height * 0.9f64.powf(scroll)).clamp(1e-28, 40.0);
+        let new_h = (view.height * 0.9f64.powf(scroll)).clamp(MIN_HEIGHT, MAX_HEIGHT);
         zoom_anchored(&mut view, window, new_h);
         auto_zoom.0 = false;
         fly.0 = None;
@@ -841,9 +646,9 @@ fn handle_input(
     // Auto-zoom dive: constant exponential rate toward the cursor, so the
     // apparent speed is the same at every depth. Stops at the precision floor.
     if auto_zoom.0 {
-        let new_h = (view.height * (-0.9 * dt).exp()).max(1e-28);
+        let new_h = (view.height * (-0.9 * dt).exp()).max(MIN_HEIGHT);
         zoom_anchored(&mut view, window, new_h);
-        if new_h <= 1e-28 {
+        if new_h <= MIN_HEIGHT {
             auto_zoom.0 = false;
         }
     }
@@ -874,7 +679,7 @@ fn handle_input(
 /// resamples the particle cloud onto the new set within a couple of seconds.
 fn apply_fractal_switch(
     fractal: Res<FractalType>,
-    attract: Res<Attract>,
+    choreo: Res<Choreographer>,
     mut view: ResMut<ViewState>,
     mut auto_zoom: ResMut<AutoZoom>,
     mut fly: ResMut<FlyTo>,
@@ -886,271 +691,12 @@ fn apply_fractal_switch(
     // lands on a boundary spot itself, so the home snap here would fight it
     // (and a manual F mid-show becomes a live morph, retargeted within a
     // few seconds).
-    if attract.on {
+    if choreo.on {
         return;
     }
-    let (center, height) = fractal_default_view(fractal.0);
-    view.center = DdVec2::from_dvec2(center);
-    view.height = height;
+    view.go_home(fractal.0);
     auto_zoom.0 = false;
     fly.0 = None;
-}
-
-/// The attract-mode choreographer. Runs after `handle_input` (so a frame
-/// with input is seen before it acts) and before `update_params` (so the
-/// view it writes is the one rendered). Everything here is glue over
-/// existing features: the dive shares the fly-to approach step aimed at a
-/// picked boundary point, scene cuts land on pre-scanned boundary spots,
-/// palette and kaleidoscope changes go through the same resources the keys
-/// use.
-fn update_attract(
-    time: Res<Time>,
-    keys: Res<ButtonInput<KeyCode>>,
-    mouse: Res<ButtonInput<MouseButton>>,
-    mut wheel: EventReader<MouseWheel>,
-    windows: Query<&Window>,
-    menu_open: Res<MenuOpen>,
-    mut settings: ResMut<Settings>,
-    mut fractal: ResMut<FractalType>,
-    audio: Res<AudioLevels>,
-    mut attract: ResMut<Attract>,
-    mut view: ResMut<ViewState>,
-    mut kaleido: ResMut<Kaleido>,
-    mut color_mode: ResMut<ColorMode>,
-    mut flow_mode: ResMut<FlowMode>,
-    mut auto_zoom: ResMut<AutoZoom>,
-    mut fly: ResMut<FlyTo>,
-) {
-    let dt = time.delta_secs();
-    let Ok(window) = windows.single() else {
-        return;
-    };
-    let aspect = (window.width().max(1.0) / window.height().max(1.0)) as f64;
-
-    // Explicit toggle: X key or the menu row. Manual engagement ignores
-    // input, so a VJ can nudge the swarm while the autopilot drives.
-    let toggled = attract.want_toggle || keys.just_pressed(KeyCode::KeyX);
-    attract.want_toggle = false;
-
-    // Any input: keys held (X excluded - it IS the toggle), buttons, wheel,
-    // or the cursor moving (including entering/leaving the window).
-    let cursor = window.cursor_position();
-    let moved = match (cursor, attract.last_cursor) {
-        (Some(c), Some(p)) => c.distance(p) > 2.0,
-        (a, b) => a.is_some() != b.is_some(),
-    };
-    attract.last_cursor = cursor;
-    let any_input = moved
-        || keys.get_pressed().any(|k| *k != KeyCode::KeyX)
-        || mouse.any_pressed([MouseButton::Left, MouseButton::Right, MouseButton::Middle])
-        || wheel.read().next().is_some();
-    if any_input {
-        attract.idle = 0.0;
-    } else {
-        attract.idle += dt;
-    }
-
-    // Exits: the toggle always; any input only for idle engagement.
-    if attract.on && (toggled || (any_input && !attract.manual)) {
-        attract.on = false;
-        attract.burst = 0.0;
-        attract.cut_wait = None;
-        attract.reseed_boost = 0.0;
-        // Restore the kaleidoscope unless the waking input IS the user
-        // toggling it - restoring would eat that press.
-        if !keys.just_pressed(KeyCode::KeyK) {
-            kaleido.on = attract.saved_kaleido;
-        }
-        settings.kaleido_folds = attract.saved_folds;
-        settings.kaleido_spin = attract.saved_spin;
-        settings.trail = attract.saved_trail;
-        info!("auto-choreographer: off");
-        return;
-    }
-
-    if !attract.on {
-        if !toggled && (attract.idle < ATTRACT_IDLE_SECS || menu_open.0) {
-            return;
-        }
-        attract.on = true;
-        attract.manual = toggled;
-        attract.saved_kaleido = kaleido.on;
-        attract.saved_folds = settings.kaleido_folds;
-        attract.saved_spin = settings.kaleido_spin;
-        attract.saved_trail = settings.trail;
-        attract.target = view.center;
-        attract.aim = view.center;
-        attract.retarget = 0.0;
-        attract.prev_drop_age = audio.drop_age;
-        auto_zoom.0 = false;
-        fly.0 = None;
-        attract.rng = fastrand::Rng::with_seed((time.elapsed_secs_f64() * 1e6) as u64 | 1);
-        attract.next_burst = 6.0 + attract.rng.f32() * 8.0;
-        attract.kaleido_t = 10.0 + attract.rng.f32() * 15.0;
-        attract.style_t = 8.0 + attract.rng.f32() * 12.0;
-        attract.flow_t = 20.0 + attract.rng.f32() * 20.0;
-        attract.palette_hold = 8.0;
-        attract.palette_t = 18.0 + attract.rng.f32() * 17.0;
-        info!(
-            "auto-choreographer: on ({})",
-            if toggled {
-                "X / menu exits"
-            } else {
-                "any input exits"
-            }
-        );
-    }
-
-    // Blast bursts: a synthetic left-click somewhere in the middle of the
-    // view, held ~0.25 s so the impulse moves real mass. Applied to the
-    // mouse uniform in update_params.
-    attract.next_burst -= dt;
-    attract.burst = (attract.burst - dt).max(0.0);
-    attract.reseed_boost = (attract.reseed_boost - dt).max(0.0);
-    if attract.next_burst <= 0.0 {
-        attract.burst = 0.25;
-        let rx = (attract.rng.f32() - 0.5) * 0.7;
-        let ry = (attract.rng.f32() - 0.5) * 0.7;
-        attract.burst_pos = Vec2::new(
-            (rx as f64 * view.height * aspect) as f32,
-            (ry as f64 * view.height) as f32,
-        );
-        attract.next_burst = 6.0 + attract.rng.f32() * 8.0;
-    }
-
-    // Kaleidoscope phases: on for a stretch (its rotation already rides the
-    // beat via the spin accumulator in update_params), then off again. Each
-    // on-phase gets a fresh fold count and spin gain, so no two mandala
-    // stretches look alike.
-    attract.kaleido_t -= dt;
-    if attract.kaleido_t <= 0.0 {
-        kaleido.on = !kaleido.on;
-        if kaleido.on {
-            roll_kaleido_style(&mut settings, &mut attract.rng);
-            attract.kaleido_t = 12.0 + attract.rng.f32() * 18.0;
-        } else {
-            attract.kaleido_t = 8.0 + attract.rng.f32() * 14.0;
-        }
-    }
-
-    // Styling tick: re-roll the look every so often - fold count and spin
-    // mid-phase (a live mandala re-facets), and the trail length. Trails
-    // mostly sit at the user's baseline or tighter; only sometimes stretch
-    // into the long dreamy smear, so the smear stays a highlight instead of
-    // the norm.
-    attract.style_t -= dt;
-    if attract.style_t <= 0.0 {
-        if kaleido.on {
-            roll_kaleido_style(&mut settings, &mut attract.rng);
-        }
-        let base = attract.saved_trail;
-        let r = attract.rng.f32();
-        settings.trail = if r < 0.4 {
-            base
-        } else if r < 0.75 {
-            base * (0.4 + 0.6 * attract.rng.f32())
-        } else {
-            (base.max(0.55) + attract.rng.f32() * 0.35).min(0.92)
-        };
-        attract.style_t = 8.0 + attract.rng.f32() * 12.0;
-    }
-
-    // Flow-mode cycle on its own clock; the 2 s crossfade melts each change.
-    attract.flow_t -= dt;
-    if attract.flow_t <= 0.0 {
-        flow_mode.0 = rand_cycle(flow_mode.0, FLOW_MODES.len() as u32, &mut attract.rng);
-        attract.flow_t = 20.0 + attract.rng.f32() * 20.0;
-    }
-
-    // Palette swaps on song sections, approximated by detected drops (with a
-    // minimum spacing so a bass barrage does not strobe the palette), or on
-    // a timer when the music never drops / audio is off.
-    let section = audio.drop_age < attract.prev_drop_age;
-    attract.prev_drop_age = audio.drop_age;
-    attract.palette_hold -= dt;
-    attract.palette_t -= dt;
-    if (section && attract.palette_hold <= 0.0) || attract.palette_t <= 0.0 {
-        // Audio aurora sits dim silver in silence: skip it when idle.
-        let n = if audio.is_idle() {
-            4
-        } else {
-            COLOR_MODES.len() as u32
-        };
-        color_mode.0 = rand_cycle(color_mode.0, n, &mut attract.rng);
-        attract.palette_hold = 8.0;
-        attract.palette_t = 18.0 + attract.rng.f32() * 17.0;
-    }
-
-    if view.height <= ATTRACT_FLOOR * 1.05 {
-        // Scene end (also catches engaging while parked deeper than the
-        // targeting floor). Every scene ends in a hard cut to the next one -
-        // there is no full zoom-out reset: half the time a different
-        // fractal, half a fresh region of the current one.
-        // Arm on floor arrival; with music playing, hang at the deepest
-        // point a moment and land the cut ON the next beat.
-        let wait = attract
-            .cut_wait
-            .get_or_insert(if audio.is_idle() { 0.0 } else { 1.2 });
-        *wait -= dt;
-        if *wait <= 0.0 || audio.beat_age < 0.08 {
-            attract.cut_wait = None;
-            // The cut: jump straight to a boundary spot partway zoomed in -
-            // never the mostly-empty full view. Masked hard: the
-            // kaleidoscope slams on with a fresh style (fold symmetry makes
-            // the cut read as an intentional edit), long trails smear the
-            // old shape out, a center blast pops, and a reseed boost
-            // (update_params) refills the boundary within a few frames.
-            if attract.rng.f32() < 0.5 {
-                fractal.0 = rand_cycle(fractal.0, FRACTAL_MODES.len() as u32, &mut attract.rng);
-            }
-            let (hc, hh) = fractal_default_view(fractal.0);
-            let scan_iter = depth_iter(hh, settings.detail).min(3000);
-            let spot = pick_boundary_target(hc, hh, aspect, scan_iter, fractal.0, &mut attract.rng)
-                .unwrap_or_else(|| DdVec2::from_dvec2(hc));
-            view.center = spot;
-            view.height = hh * (0.2 + attract.rng.f32() * 0.25) as f64;
-            attract.target = spot;
-            attract.aim = spot;
-            attract.retarget = 0.0;
-            kaleido.on = true;
-            roll_kaleido_style(&mut settings, &mut attract.rng);
-            attract.kaleido_t = 12.0 + attract.rng.f32() * 18.0;
-            settings.trail = settings.trail.max(0.85);
-            attract.burst = 0.3;
-            attract.burst_pos = Vec2::ZERO;
-            attract.reseed_boost = 1.5;
-        }
-    } else {
-        attract.retarget -= dt;
-        if attract.retarget <= 0.0 {
-            // Iteration cap: enough contrast to find the boundary at any
-            // depth in this range, bounded so a scan stays a few ms.
-            let max_iter = depth_iter(view.height, settings.detail).min(3000);
-            if let Some(t) = pick_boundary_target(
-                view.center.to_dvec2(),
-                view.height,
-                aspect,
-                max_iter,
-                fractal.0,
-                &mut attract.rng,
-            ) {
-                attract.target = t;
-            }
-            attract.retarget = 3.0;
-        }
-        // The aim eases toward the picked target (~1 s time constant),
-        // so a retarget bends the dive path instead of yanking it.
-        let chase = (attract.target - attract.aim).to_dvec2();
-        attract.aim += chase * (1.0 - (-1.2 * dt as f64).exp());
-        let new_h = (view.height * (-0.45 * dt as f64).exp()).max(ATTRACT_FLOOR);
-        // The extra decay recentres the aim over ~2 s on top of the anchor.
-        approach_step(
-            &mut view,
-            attract.aim,
-            new_h,
-            1.0 - (-0.6 * dt as f64).exp(),
-        );
-    }
 }
 
 /// State `update_params` carries between frames. Bundled into a single `Local`
@@ -1161,7 +707,7 @@ struct ParamState {
     /// Eased particle count, so the depth-vs-count trade ramps instead of
     /// snapping. Zero means "not yet initialized".
     smooth_count: f32,
-    last_orbit_key: Option<(DdVec2, u32, u32, (f64, f64))>,
+    last_orbit_key: Option<(DdVec2, u32, Fractal, (f64, f64))>,
     /// Flow-mode crossfade: the last mode seen (change detector), the mode
     /// being faded out, and when the switch happened. Defaults (all zero)
     /// mean "prev == current, ramp long done", which the shader treats as
@@ -1184,7 +730,7 @@ fn update_params(
     over_menu: Res<PointerOverMenu>,
     settings: Res<Settings>,
     audio: Res<AudioLevels>,
-    attract: Res<Attract>,
+    choreo: Res<Choreographer>,
     mut params: ResMut<SimParams>,
     mut ref_orbit: ResMut<RefOrbit>,
     mut state: Local<ParamState>,
@@ -1263,7 +809,7 @@ fn update_params(
     // the fractal shape itself dances. The GPU never sees c directly - the
     // reference orbit encodes it - so a changed c just means a fresh orbit
     // (cheap: <= REF_ORBIT_CAP f64 iterations, ~16 KB upload).
-    let jc = if fractal.0 == JULIA_TYPE && settings.audio_morph > 0.0 {
+    let jc = if fractal.0 == Fractal::Julia && settings.audio_morph > 0.0 {
         let amp = 0.04 * settings.audio_morph as f64 * (0.25 + audio.level as f64);
         julia_morph_c(audio.morph_phase as f64, amp)
     } else {
@@ -1273,11 +819,11 @@ fn update_params(
     // Only recompute (and re-upload, via the generation bump) when the view
     // center, iteration count, or Julia c actually changed; a static view
     // with no morph pays nothing.
-    if state.last_orbit_key != Some((view.center, max_iter, fractal.0, jc)) {
-        ref_orbit.points =
-            std::sync::Arc::new(reference_orbit(view.center, max_iter, fractal.0, jc));
+    let orbit_key = (view.center, max_iter, fractal.0, jc);
+    if state.last_orbit_key != Some(orbit_key) {
+        ref_orbit.points = Arc::new(reference_orbit(view.center, max_iter, fractal.0, jc));
         ref_orbit.generation = ref_orbit.generation.wrapping_add(1);
-        state.last_orbit_key = Some((view.center, max_iter, fractal.0, jc));
+        state.last_orbit_key = Some(orbit_key);
     }
 
     state.frame = state.frame.wrapping_add(1);
@@ -1289,10 +835,8 @@ fn update_params(
         Some(p) => Vec4::new(p.x, p.y, button, radius),
         None => Vec4::new(1e9, 1e9, 0.0, radius),
     };
-    // Choreographer blast: a synthetic left-click overrides the real cursor
-    // for the burst's few frames.
-    if attract.on && attract.burst > 0.0 {
-        u.mouse = Vec4::new(attract.burst_pos.x, attract.burst_pos.y, 1.0, radius);
+    if let Some(blast) = choreo.blast() {
+        u.mouse = Vec4::new(blast.x, blast.y, 1.0, radius);
     }
     u.particle_size = Vec2::new(2.0 * px / w, 2.0 * px / h);
     u.center_delta = center_delta;
@@ -1337,15 +881,14 @@ fn update_params(
     }
     u.ref_len = ref_orbit.points.len() as u32;
     u.frame = state.frame;
-    u.reseed_rate = reseed_rate;
-    // Post-cut refill: recycle particles onto the new fractal's boundary
-    // fast, so a choreographer scene cut never shows a half-empty cloud.
-    if attract.on && attract.reseed_boost > 0.0 {
-        u.reseed_rate = u.reseed_rate.max(0.2);
-    }
+    u.reseed_rate = if choreo.refilling() {
+        reseed_rate.max(0.2)
+    } else {
+        reseed_rate
+    };
     u.detail = settings.detail;
     u.color_mode = color_mode.0;
-    u.fractal_type = fractal.0;
+    u.fractal_type = fractal.0.id();
     u.flow_mode = flow_mode.0;
 
     // Audio reactivity (V): mids push the streams faster, bass swells the
@@ -1370,7 +913,7 @@ fn update_params(
             * settings.kaleido_spin
             * (0.05 + audio.level * 0.8 + audio.beat * 1.2);
     }
-    u.audio2 = Vec4::new(audio.beat_age, audio.drop_age, kaleido.rot, audio.level);
+    u.audio_aux = Vec4::new(audio.beat_age, audio.drop_age, kaleido.rot, audio.level);
     u.audio_fx = Vec4::new(
         settings.audio_pulse,
         settings.audio_flash,

@@ -32,6 +32,7 @@ impl Plugin for RecorderPlugin {
 /// recorder is the browser's MediaRecorder and takes what it gets).
 pub const REC_RES_MODES: [&str; 2] = ["Native", "Half"];
 pub const REC_FPS_MODES: [&str; 4] = ["24", "30", "60", "120"];
+#[cfg(not(target_arch = "wasm32"))]
 const REC_FPS_VALUES: [f64; 4] = [24.0, 30.0, 60.0, 120.0];
 
 /// Capture options for the next take, set from the menu's Recording card.
@@ -906,7 +907,7 @@ mod web {
         /// The live MediaRecorder. JS objects are !Send, so it lives here
         /// instead of in the Recorder resource; wasm is single-threaded so
         /// this is always the right thread.
-        static ACTIVE: RefCell<Option<web_sys::MediaRecorder>> = RefCell::new(None);
+        static ACTIVE: RefCell<Option<web_sys::MediaRecorder>> = const { RefCell::new(None) };
     }
 
     /// Send token for the Recorder resource; the real state is in ACTIVE.

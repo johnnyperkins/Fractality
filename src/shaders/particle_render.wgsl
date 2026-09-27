@@ -1,54 +1,6 @@
 // Fractality particle render shader.
-// Struct layouts must match the Rust side (particles.rs) exactly.
 
-struct Particle {
-    pos: vec2<f32>,
-    vel: vec2<f32>,
-    home: vec2<f32>,
-    band: f32,
-    hue: f32,
-};
-
-struct Params {
-    world_to_clip: vec4<f32>,
-    mouse: vec4<f32>,
-    particle_size: vec2<f32>,
-    center_delta: vec2<f32>,
-    time: f32,
-    dt: f32,
-    count: u32,
-    max_iter: u32,
-    flow_speed: f32,
-    band_k: f32,
-    damping: f32,
-    brightness: f32,
-    ref_len: u32,
-    frame: u32,
-    reseed_rate: f32,
-    detail: f32,
-    dissolve: f32,
-    color_mode: u32,
-    fractal_type: u32,
-    // Flow style (unused in this shader; layout parity).
-    flow_mode: u32,
-    // Unused in this shader; present for layout parity with ParamsUniform.
-    trail_decay: f32,
-    // Audio levels: x bass, y mid, z treble, w beat pulse. All zero while
-    // audio reactivity is off, so every use is a natural no-op.
-    audio: vec4<f32>,
-    // Music-driven palette hue offset.
-    audio_hue: f32,
-    // x seconds since last beat, y seconds since last drop, z unused,
-    // w overall level.
-    audio2: vec4<f32>,
-    // Effect gains: x ring pulse (compute), y flash/glitter, z spectrum glow,
-    // w unused.
-    audio_fx: vec4<f32>,
-    // 16 log-spaced spectrum bins (bin 0 = lowest), packed 4 per vec4.
-    spectrum: array<vec4<f32>, 4>,
-    // Shape/dynamics tuning (compute); layout parity here.
-    shape: vec4<f32>,
-};
+#import fractality::common::{Particle, Params}
 
 @group(0) @binding(0) var<storage, read> particles: array<Particle>;
 @group(0) @binding(1) var<uniform> params: Params;
@@ -148,7 +100,7 @@ fn vs(
     // glow); the gate is the union of theirs, so other modes with audio off
     // still skip the bin math entirely.
     var spec = 0.0;
-    if (params.color_mode == 4u || params.audio2.w > 0.01) {
+    if (params.color_mode == 4u || params.audio_aux.w > 0.01) {
         spec = spectrum_for_band(p_band, iter_f);
     }
 
@@ -240,7 +192,7 @@ fn vs(
             // Silence stays dim near-mono silver; sound saturates and the
             // particle's own spectrum bin drives most of its glow, so quiet
             // passages go dark ember and busy ones blaze ring by ring.
-            let level = params.audio2.w;
+            let level = params.audio_aux.w;
             let sat = clamp(level * 2.0, 0.0, 1.0);
             let tone = mix(vec3<f32>(0.4, 0.45, 0.6), sinebow(fract(hue)), sat);
             color = tone
@@ -272,7 +224,7 @@ fn vs(
     // Spectrum glow: each particle's iteration depth maps to a frequency
     // band - bass lights the deep shell filaments, treble the outer haze -
     // so the fractal becomes an equalizer shaped like itself.
-    if (params.audio2.w > 0.01) {
+    if (params.audio_aux.w > 0.01) {
         color *= 1.0 + spec * spec * 1.6 * params.audio_fx.z;
     }
 

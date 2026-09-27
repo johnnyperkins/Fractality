@@ -11,42 +11,7 @@
 // R and B sample radially offset positions scaled by beat energy, so a beat
 // hit fans the image into color fringes that snap back as the pulse decays.
 
-// Layout parity with ParamsUniform (particles.rs). Only audio/audio_fx are
-// read here.
-struct Params {
-    world_to_clip: vec4<f32>,
-    mouse: vec4<f32>,
-    particle_size: vec2<f32>,
-    center_delta: vec2<f32>,
-    time: f32,
-    dt: f32,
-    count: u32,
-    max_iter: u32,
-    flow_speed: f32,
-    band_k: f32,
-    damping: f32,
-    brightness: f32,
-    ref_len: u32,
-    frame: u32,
-    reseed_rate: f32,
-    detail: f32,
-    dissolve: f32,
-    color_mode: u32,
-    fractal_type: u32,
-    flow_mode: u32,
-    trail_decay: f32,
-    // x bass, y mid, z treble, w beat pulse.
-    audio: vec4<f32>,
-    audio_hue: f32,
-    // z kaleidoscope rotation angle (radians, music-driven).
-    audio2: vec4<f32>,
-    // Effect gains: y flash/glitter also gates the chromatic bloom.
-    // w kaleidoscope segment count (0 = off).
-    audio_fx: vec4<f32>,
-    spectrum: array<vec4<f32>, 4>,
-    // Shape/dynamics tuning (compute); layout parity here.
-    shape: vec4<f32>,
-};
+#import fractality::common::Params
 
 @group(0) @binding(0) var trail_tex: texture_2d<f32>;
 @group(0) @binding(1) var<uniform> params: Params;
@@ -70,7 +35,7 @@ fn fs_composite(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         let center = dims * 0.5;
         let d = pos.xy - center;
         let seg = 6.2831853 / n;
-        var a = atan2(d.y, d.x) - params.audio2.z;
+        var a = atan2(d.y, d.x) - params.audio_aux.z;
         a = a - seg * floor(a / seg);
         a = min(a, seg - a);
         sp = center + length(d) * vec2<f32>(cos(a), sin(a));

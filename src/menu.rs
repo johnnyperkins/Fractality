@@ -10,13 +10,13 @@ use bevy::prelude::*;
 use bevy::ui::{ComputedNode, RelativeCursorPosition};
 
 use crate::audio::{AudioCapture, AudioLevels};
+use crate::choreographer::Choreographer;
+use crate::fractal::Fractal;
 use crate::particles::{ParticleCamera, MAX_PARTICLES};
 use crate::recorder::{
     RecordSettings, REC_FPS_DEFAULT, REC_FPS_MODES, REC_RES_DEFAULT, REC_RES_MODES,
 };
-use crate::{
-    Attract, ColorMode, FlowMode, FractalType, Kaleido, COLOR_MODES, FLOW_MODES, FRACTAL_MODES,
-};
+use crate::{ColorMode, FlowMode, FractalType, Kaleido, COLOR_MODES, FLOW_MODES};
 
 /// Live-tunable knobs. Source of truth for the whole app.
 #[derive(Resource)]
@@ -269,7 +269,10 @@ enum Select {
     Fractal,
     Flow,
     Palette,
+    // The Recording card is native-only (see REC_SELECTS).
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     RecRes,
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     RecFps,
 }
 
@@ -303,7 +306,7 @@ impl Select {
 
     fn options(self) -> &'static [&'static str] {
         match self {
-            Select::Fractal => &FRACTAL_MODES,
+            Select::Fractal => &Fractal::NAMES,
             Select::Flow => &FLOW_MODES,
             Select::Palette => &COLOR_MODES,
             Select::RecRes => &REC_RES_MODES,
@@ -329,7 +332,7 @@ impl Select {
         rec: &RecordSettings,
     ) -> u32 {
         match self {
-            Select::Fractal => fractal.0,
+            Select::Fractal => fractal.0.id(),
             Select::Flow => flow.0,
             Select::Palette => palette.0,
             Select::RecRes => rec.res,
@@ -349,7 +352,7 @@ impl Select {
         rec: &mut ResMut<RecordSettings>,
     ) {
         match self {
-            Select::Fractal if fractal.0 != index => fractal.0 = index,
+            Select::Fractal if fractal.0.id() != index => fractal.0 = Fractal::from_id(index),
             Select::Flow if flow.0 != index => flow.0 = index,
             Select::Palette if palette.0 != index => palette.0 = index,
             Select::RecRes if rec.res != index => rec.res = index,
@@ -384,10 +387,10 @@ impl Toggle {
         }
     }
 
-    fn state(self, kaleido: &Kaleido, attract: &Attract, audio: &AudioCapture) -> bool {
+    fn state(self, kaleido: &Kaleido, choreo: &Choreographer, audio: &AudioCapture) -> bool {
         match self {
             Toggle::Kaleido => kaleido.on,
-            Toggle::Choreographer => attract.on,
+            Toggle::Choreographer => choreo.on,
             Toggle::Audio => audio.enabled,
         }
     }
@@ -452,6 +455,7 @@ struct ToggleSection(Toggle);
 /// The collapsible cards; each pairs a clickable header with a foldable body.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CollapseSection {
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     Recording,
     Controls,
 }
@@ -787,8 +791,9 @@ fn toggle_control(toggle: Toggle) -> impl Bundle {
     )
 }
 
-/// Key list, split into two columns of (chip, description).
-const CONTROLS: [(&str, &str); 18] = [
+/// Key list, split into two columns of (chip, description) in the panel and
+/// printed to the console at startup.
+pub const CONTROLS: [(&str, &str); 18] = [
     ("W A S D", "pan"),
     ("Scroll", "zoom at cursor"),
     ("LMB", "blast (hold)"),
@@ -1398,11 +1403,11 @@ fn update_select_ui(
 }
 
 /// Clicking a toggle row flips its feature, same as the K / X / V keys. The
-/// choreographer click only files a request; update_attract does the
+/// choreographer click only files a request; update_choreographer does the
 /// engage/disengage (it owns the save/restore of the settings it touches).
 fn click_toggle(
     mut kaleido: ResMut<Kaleido>,
-    mut attract: ResMut<Attract>,
+    mut choreo: ResMut<Choreographer>,
     mut audio: ResMut<AudioCapture>,
     mut rows: Query<(&Interaction, &ToggleRow, &mut BackgroundColor), Changed<Interaction>>,
 ) {
@@ -1411,7 +1416,7 @@ fn click_toggle(
             Interaction::Pressed => {
                 match row.0 {
                     Toggle::Kaleido => kaleido.on = !kaleido.on,
-                    Toggle::Choreographer => attract.want_toggle = true,
+                    Toggle::Choreographer => choreo.want_toggle = true,
                     Toggle::Audio => audio.enabled = !audio.enabled,
                 }
                 ROW_HOVER
@@ -1427,12 +1432,12 @@ fn click_toggle(
 
 /// Pills and their slider sections follow the real state, however it changed
 /// (click, key, idle engagement, input exit). Kaleido's rotation accumulator
-/// and Attract's timers tick every frame, so is_changed is useless here; diff
+/// and Choreographer's timers tick every frame, so is_changed is useless here; diff
 /// the three flags instead. Display::None collapses a section entirely (no
 /// reserved space), accordion-style.
 fn sync_toggles(
     kaleido: Res<Kaleido>,
-    attract: Res<Attract>,
+    choreo: Res<Choreographer>,
     audio: Res<AudioCapture>,
     // Explicit Without: naming a marker in the query data does not narrow the
     // Node access, so the two &mut Node queries are otherwise a conflict.
@@ -1441,16 +1446,16 @@ fn sync_toggles(
     mut last: Local<Option<[bool; 3]>>,
 ) {
     let now = [
-        Toggle::Kaleido.state(&kaleido, &attract, &audio),
-        Toggle::Choreographer.state(&kaleido, &attract, &audio),
-        Toggle::Audio.state(&kaleido, &attract, &audio),
+        Toggle::Kaleido.state(&kaleido, &choreo, &audio),
+        Toggle::Choreographer.state(&kaleido, &choreo, &audio),
+        Toggle::Audio.state(&kaleido, &choreo, &audio),
     ];
     if *last == Some(now) {
         return;
     }
     *last = Some(now);
     for (mut bg, mut node, pill) in &mut pills {
-        let on = pill.0.state(&kaleido, &attract, &audio);
+        let on = pill.0.state(&kaleido, &choreo, &audio);
         bg.0 = if on { ACCENT } else { PILL_OFF };
         node.justify_content = if on {
             JustifyContent::End
@@ -1459,7 +1464,7 @@ fn sync_toggles(
         };
     }
     for (mut node, section) in &mut sections {
-        let on = section.0.state(&kaleido, &attract, &audio);
+        let on = section.0.state(&kaleido, &choreo, &audio);
         node.display = if on { Display::Flex } else { Display::None };
     }
 }
