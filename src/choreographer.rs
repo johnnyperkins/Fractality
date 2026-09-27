@@ -260,10 +260,13 @@ pub fn update_choreographer(
         (a, b) => a.is_some() != b.is_some(),
     };
     choreo.last_cursor = cursor;
+    // Drain the wheel every frame: left inside the || chain it would be
+    // skipped whenever earlier input matched and count again next frame.
+    let scrolled = wheel.read().count() > 0;
     let any_input = moved
+        || scrolled
         || keys.get_pressed().any(|k| *k != KeyCode::KeyX)
-        || mouse.any_pressed([MouseButton::Left, MouseButton::Right, MouseButton::Middle])
-        || wheel.read().next().is_some();
+        || mouse.any_pressed([MouseButton::Left, MouseButton::Right, MouseButton::Middle]);
     // The toggle resets the idle clock too: X is excluded from any_input, so
     // an X exit after 30 s hands-off would otherwise re-engage (idle mode)
     // on the very next frame.
