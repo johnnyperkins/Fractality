@@ -22,7 +22,7 @@ use bevy::render::{
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 
-use crate::fractal::{smooth_iter, Fractal, REF_ORBIT_CAP};
+use crate::fractal::{smooth_iter, Fractal, JULIA_C, REF_ORBIT_CAP};
 
 /// Marker for the camera the particle pipeline draws on. The draw node and
 /// trail sizing only run for this view: the native present camera (which
@@ -198,7 +198,7 @@ pub fn generate_particles(
             loop {
                 let x = x0 + rng.f64() * (x1 - x0);
                 let y = y0 + rng.f64() * (y1 - y0);
-                let f = smooth_iter(x, y, max_iter, fractal);
+                let f = smooth_iter(x, y, max_iter, fractal, JULIA_C);
                 // Inside the set: reject.
                 if f >= max_iter as f32 - 1.0 {
                     continue;

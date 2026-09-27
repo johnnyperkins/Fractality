@@ -702,6 +702,19 @@ struct ParamState {
     morph_t0: f32,
 }
 
+/// Julia parameter for this frame: JULIA_C, orbited by the music when the
+/// audio morph is on so the fractal shape itself dances. Shared by the
+/// reference orbit and the choreographer's boundary scans so both see the
+/// same set.
+pub fn current_julia_c(fractal: Fractal, settings: &Settings, audio: &AudioLevels) -> (f64, f64) {
+    if fractal == Fractal::Julia && settings.audio_morph > 0.0 {
+        let amp = 0.04 * settings.audio_morph as f64 * (0.25 + audio.level as f64);
+        julia_morph_c(audio.morph_phase as f64, amp)
+    } else {
+        JULIA_C
+    }
+}
+
 fn update_params(
     time: Res<Time>,
     windows: Query<&Window>,
@@ -790,16 +803,10 @@ fn update_params(
     }
     state.smooth_count += (target_count - state.smooth_count) * (1.0 - (-3.0 * dt).exp());
     let count = (state.smooth_count as u32).clamp(1, user_count);
-    // Julia morph: music orbits the Julia parameter around its home value, so
-    // the fractal shape itself dances. The GPU never sees c directly - the
-    // reference orbit encodes it - so a changed c just means a fresh orbit
-    // (cheap: at most max_iter double-double steps, 16 bytes of upload each).
-    let jc = if fractal.0 == Fractal::Julia && settings.audio_morph > 0.0 {
-        let amp = 0.04 * settings.audio_morph as f64 * (0.25 + audio.level as f64);
-        julia_morph_c(audio.morph_phase as f64, amp)
-    } else {
-        JULIA_C
-    };
+    // The GPU never sees the Julia c directly - the reference orbit encodes
+    // it - so a morphing c just means a fresh orbit (cheap: at most max_iter
+    // double-double steps, 16 bytes of upload each).
+    let jc = current_julia_c(fractal.0, &settings, &audio);
     // High-precision reference orbit at the view center for perturbation.
     // Only recompute (and re-upload, via the generation bump) when the view
     // center, iteration count, or Julia c actually changed; a static view

@@ -187,12 +187,13 @@ fn in_main_bulbs(x: f64, y: f64) -> bool {
 
 /// Smooth escape-time field on the CPU (f64). The formula and the escape
 /// radius (256) must be identical to field() in the compute shader so that
-/// CPU band values match GPU field values.
-pub fn smooth_iter(x: f64, y: f64, max_iter: u32, fractal: Fractal) -> f32 {
+/// CPU band values match GPU field values. `jc` is the Julia parameter
+/// (ignored by the other fractals); pass the one the reference orbit used.
+pub fn smooth_iter(x: f64, y: f64, max_iter: u32, fractal: Fractal, jc: (f64, f64)) -> f32 {
     if fractal == Fractal::Mandelbrot && in_main_bulbs(x, y) {
         return max_iter as f32;
     }
-    let ((mut zx, mut zy), (cx, cy)) = fractal.start(x, y, JULIA_C);
+    let ((mut zx, mut zy), (cx, cy)) = fractal.start(x, y, jc);
     for i in 0..max_iter {
         (zx, zy) = fractal.step(zx, zy, cx, cy);
         let m = zx * zx + zy * zy;

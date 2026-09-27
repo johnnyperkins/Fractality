@@ -17,8 +17,8 @@ use crate::dd::DdVec2;
 use crate::fractal::{smooth_iter, Fractal};
 use crate::menu::{MenuOpen, Settings};
 use crate::{
-    approach_step, depth_iter, AutoZoom, ColorMode, FlowMode, FlyTo, FractalType, Kaleido,
-    ViewState, COLOR_MODES, DEFAULT_CENTER, FLOW_MODES,
+    approach_step, current_julia_c, depth_iter, AutoZoom, ColorMode, FlowMode, FlyTo, FractalType,
+    Kaleido, ViewState, COLOR_MODES, DEFAULT_CENTER, FLOW_MODES,
 };
 
 /// Idle seconds before the autopilot engages on its own.
@@ -160,6 +160,7 @@ fn pick_boundary_target(
     aspect: f64,
     max_iter: u32,
     fractal: Fractal,
+    jc: (f64, f64),
     rng: &mut fastrand::Rng,
 ) -> Option<DdVec2> {
     const G: usize = 24;
@@ -180,7 +181,7 @@ fn pick_boundary_target(
             let p = cell(ix, iy);
             // Log-compressed so one deep escape spike cannot drown the
             // variance of everything around it.
-            *v = (1.0 + smooth_iter(p.x, p.y, max_iter, fractal)).ln();
+            *v = (1.0 + smooth_iter(p.x, p.y, max_iter, fractal, jc)).ln();
         }
     };
     #[cfg(not(target_arch = "wasm32"))]
@@ -425,8 +426,10 @@ pub fn update_choreographer(
             }
             let (hc, hh) = fractal.0.home_view();
             let scan_iter = depth_iter(hh, settings.detail).min(SCAN_ITER_CAP);
-            let spot = pick_boundary_target(hc, hh, aspect, scan_iter, fractal.0, &mut choreo.rng)
-                .unwrap_or_else(|| DdVec2::from_dvec2(hc));
+            let jc = current_julia_c(fractal.0, &settings, &audio);
+            let spot =
+                pick_boundary_target(hc, hh, aspect, scan_iter, fractal.0, jc, &mut choreo.rng)
+                    .unwrap_or_else(|| DdVec2::from_dvec2(hc));
             view.center = spot;
             view.height = hh * (0.2 + choreo.rng.f32() * 0.25) as f64;
             choreo.target = spot;
@@ -444,12 +447,14 @@ pub fn update_choreographer(
         choreo.retarget -= dt;
         if choreo.retarget <= 0.0 {
             let max_iter = depth_iter(view.height, settings.detail).min(SCAN_ITER_CAP);
+            let jc = current_julia_c(fractal.0, &settings, &audio);
             if let Some(t) = pick_boundary_target(
                 view.center.to_dvec2(),
                 view.height,
                 aspect,
                 max_iter,
                 fractal.0,
+                jc,
                 &mut choreo.rng,
             ) {
                 choreo.target = t;
