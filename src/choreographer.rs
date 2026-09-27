@@ -259,7 +259,10 @@ pub fn update_choreographer(
         || keys.get_pressed().any(|k| *k != KeyCode::KeyX)
         || mouse.any_pressed([MouseButton::Left, MouseButton::Right, MouseButton::Middle])
         || wheel.read().next().is_some();
-    if any_input {
+    // The toggle resets the idle clock too: X is excluded from any_input, so
+    // an X exit after 30 s hands-off would otherwise re-engage (idle mode)
+    // on the very next frame.
+    if any_input || toggled {
         choreo.idle = 0.0;
     } else {
         choreo.idle += dt;
