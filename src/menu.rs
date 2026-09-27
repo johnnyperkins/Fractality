@@ -851,7 +851,7 @@ pub const CONTROLS: [(&str, &str); 18] = [
     ("X", "choreographer"),
     ("Shift+1-9", "save view"),
     ("1-9", "fly to view"),
-    ("Esc / M", "hide menu"),
+    ("Esc / M", "menu"),
 ];
 
 /// Select row plus its floating dropdown, the shape shared by the scene and
