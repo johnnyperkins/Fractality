@@ -841,12 +841,12 @@ mod native {
             std::fs::read(&path).unwrap()
         }
 
-        /// Full pipeline on synthetic frames, then reparse the mp4 and check
-        /// the track holds the expected samples.
+        /// Full pipeline on synthetic frames in the scene target's format,
+        /// then reparse the mp4 and check the track holds the expected samples.
         #[test]
         fn encodes_valid_mp4() {
             let (w, h) = (320u32, 240u32);
-            let bytes = encode_gradient("out.mp4", w, h, 30, 1, |_| TextureFormat::Bgra8UnormSrgb);
+            let bytes = encode_gradient("out.mp4", w, h, 30, 1, |_| TextureFormat::Rgba8UnormSrgb);
             assert_eq!(&bytes[4..8], b"ftyp");
             let size = bytes.len() as u64;
             let mp4 = mp4::Mp4Reader::read_header(std::io::Cursor::new(bytes), size).unwrap();
@@ -877,6 +877,22 @@ mod native {
             let mut dst = Vec::new();
             downsample2(&src, 2, 1, 1, &mut dst);
             assert_eq!(&dst[..3], &[25, 35, 45]);
+        }
+
+        /// Pure red converts identically from RGBA (the scene target) and
+        /// BGRA bytes, and lands where red belongs: V high, U low.
+        #[test]
+        fn channel_order_matches_format() {
+            let convert = |px: [u8; 4], format| {
+                let (r, b) = rb_offsets(format).unwrap();
+                let mut yuv = I420::new(2, 2);
+                yuv.fill(&px.repeat(4), 2, r, b);
+                (yuv.y()[0], yuv.u()[0], yuv.v()[0])
+            };
+            let rgba = convert([255, 0, 0, 255], TextureFormat::Rgba8UnormSrgb);
+            let bgra = convert([0, 0, 255, 255], TextureFormat::Bgra8UnormSrgb);
+            assert_eq!(rgba, bgra);
+            assert!(rgba.2 > 200 && rgba.1 < 128, "red decoded as {rgba:?}");
         }
 
         /// A fatal error midway (here an unsupported format on frame 12)
