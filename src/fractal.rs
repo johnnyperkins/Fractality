@@ -227,7 +227,8 @@ fn split_f32(v: f64) -> (f32, f32) {
 /// particles.rs) - perturbation needs the c behind the orbit at full
 /// precision, the stored samples only well enough to survive the
 /// close-approach cancellation in the shader. Stops at max_iter,
-/// REF_ORBIT_CAP, or when the orbit diverges hard.
+/// REF_ORBIT_CAP, or when the orbit diverges hard, but never before Z_1:
+/// the shader's first iteration reads entry 1 and computes ref_len - 1.
 pub fn reference_orbit(
     c: DdVec2,
     max_iter: u32,
@@ -236,13 +237,14 @@ pub fn reference_orbit(
 ) -> Vec<[f32; 4]> {
     let jc = (Dd::from_f64(jc.0), Dd::from_f64(jc.1));
     let ((mut zx, mut zy), (cx, cy)) = fractal.start(c.x, c.y, jc);
-    let len = (max_iter as usize + 1).min(REF_ORBIT_CAP);
+    let len = (max_iter as usize + 1).clamp(2, REF_ORBIT_CAP);
     let mut orbit = Vec::with_capacity(len);
     loop {
         let (hx, lx) = split_f32(zx.hi);
         let (hy, ly) = split_f32(zy.hi);
         orbit.push([hx, hy, lx, ly]);
-        if orbit.len() >= len || zx.hi * zx.hi + zy.hi * zy.hi > 1e10 {
+        let diverged = zx.hi * zx.hi + zy.hi * zy.hi > 1e10;
+        if orbit.len() >= len || (orbit.len() >= 2 && diverged) {
             return orbit;
         }
         (zx, zy) = fractal.step(zx, zy, cx, cy);
@@ -271,6 +273,19 @@ mod tests {
                 let err = (zx - dzx.hi).abs().max((zy - dzy.hi).abs());
                 assert!(err < 1e-9, "{fractal:?} iter {i}: err {err:e}");
             }
+        }
+    }
+
+    /// The shader reads entry 1 on its first iteration, so even an orbit
+    /// that starts diverged (a Julia view far from the origin) or a zero
+    /// iteration budget must hold Z_0 and Z_1.
+    #[test]
+    fn reference_orbit_holds_at_least_two_entries() {
+        let far = DdVec2::from_dvec2(DVec2::new(1e6, 0.0));
+        assert_eq!(reference_orbit(far, 500, Fractal::Julia, JULIA_C).len(), 2);
+        let home = DdVec2::from_dvec2(DVec2::ZERO);
+        for fractal in Fractal::ALL {
+            assert_eq!(reference_orbit(home, 0, fractal, JULIA_C).len(), 2);
         }
     }
 
