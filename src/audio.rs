@@ -256,12 +256,19 @@ impl WindowProcessor {
         for i in 1..edges.len() {
             edges[i] = edges[i].max(edges[i - 1] + 1);
         }
+        // Same for the three bands: at very high sample rates (~128 kHz+)
+        // 30 Hz and 250 Hz land on one bin, and an empty bass band would
+        // divide 0/0 in process().
+        let b0 = bin(30.0);
+        let b1 = bin(250.0).max(b0 + 1);
+        let m1 = bin(2000.0).max(b1 + 1);
+        let t1 = bin(8000.0).max(m1 + 1);
         Self {
             window,
-            b0: bin(30.0),
-            b1: bin(250.0),
-            m1: bin(2000.0),
-            t1: bin(8000.0),
+            b0,
+            b1,
+            m1,
+            t1,
             edges,
             peaks: [1e-5; 4],
             spec_peaks: [1e-5; SPECTRUM_BINS],
@@ -708,4 +715,26 @@ pub fn update_audio(time: Res<Time>, capture: Res<AudioCapture>, mut levels: Res
     l.drop = snap((-l.drop_age * 1.2).exp());
     // Music energy spins the palette; silence leaves it still.
     l.hue_phase = (l.hue_phase + (0.05 * l.mid + 0.1 * l.beat) * dt).fract();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every band stays non-empty at any plausible sample rate, so the band
+    /// powers never divide by zero.
+    #[test]
+    fn bands_non_empty_at_any_rate() {
+        for rate in [8_000.0, 44_100.0, 48_000.0, 96_000.0, 192_000.0, 384_000.0] {
+            let p = WindowProcessor::new(rate);
+            assert!(
+                p.b0 < p.b1 && p.b1 < p.m1 && p.m1 < p.t1 && p.t1 <= N / 2,
+                "{rate} Hz: {} {} {} {}",
+                p.b0,
+                p.b1,
+                p.m1,
+                p.t1
+            );
+        }
+    }
 }
