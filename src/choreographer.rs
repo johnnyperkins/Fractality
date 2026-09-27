@@ -18,7 +18,7 @@ use crate::fractal::{smooth_iter, Fractal};
 use crate::menu::{MenuOpen, Settings};
 use crate::{
     approach_step, current_julia_c, depth_iter, AutoZoom, ColorMode, FlowMode, FlyTo, FractalType,
-    Kaleido, ViewState, COLOR_MODES, DEFAULT_CENTER, FLOW_MODES,
+    Kaleido, ViewState, AURORA_MODE, COLOR_MODES, DEFAULT_CENTER, FLOW_MODES,
 };
 
 /// Idle seconds before the autopilot engages on its own.
@@ -137,8 +137,12 @@ impl Choreographer {
     }
 }
 
-/// Random pick of a mode id different from `cur`, uniform over the rest.
+/// Random pick of a mode id in 0..n different from `cur`, uniform over the
+/// rest. A `cur` outside 0..n (aurora while it is excluded) picks from all n.
 fn rand_cycle(cur: u32, n: u32, rng: &mut fastrand::Rng) -> u32 {
+    if cur >= n {
+        return rng.u32(0..n);
+    }
     (cur + 1 + rng.u32(0..n - 1)) % n
 }
 
@@ -389,10 +393,9 @@ pub fn update_choreographer(
     choreo.palette_hold -= dt;
     choreo.palette_t -= dt;
     if (section && choreo.palette_hold <= 0.0) || choreo.palette_t <= 0.0 {
-        // Audio aurora (the last mode) sits dim silver in silence: skip it
-        // when idle.
+        // Audio aurora sits dim silver in silence: skip it when idle.
         let n = if audio.is_idle() {
-            COLOR_MODES.len() as u32 - 1
+            AURORA_MODE
         } else {
             COLOR_MODES.len() as u32
         };
@@ -468,5 +471,23 @@ pub fn update_choreographer(
         let new_h = (view.height * (-0.45 * dt as f64).exp()).max(DIVE_FLOOR);
         // The extra decay recenters the aim over ~2 s on top of the anchor.
         approach_step(&mut view, choreo.aim, new_h, 1.0 - (-0.6 * dt as f64).exp());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rand_cycle_reaches_every_other_mode() {
+        let mut rng = fastrand::Rng::with_seed(7);
+        let mut seen = [false; 4];
+        // From aurora (4) with aurora excluded (n = 4): all of 0..4 reachable.
+        for _ in 0..200 {
+            seen[rand_cycle(4, 4, &mut rng) as usize] = true;
+        }
+        assert_eq!(seen, [true; 4]);
+        // In range: never the current mode.
+        assert!((0..200).all(|_| rand_cycle(2, 4, &mut rng) != 2));
     }
 }

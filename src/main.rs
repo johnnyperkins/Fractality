@@ -75,6 +75,11 @@ pub struct ColorMode(pub u32);
 
 pub const COLOR_MODES: [&str; 5] = ["classic", "rings", "electric", "inferno", "audio aurora"];
 
+/// Id of the audio aurora palette (particle_render.wgsl tests it as 4u). Kept
+/// last so skipping it means cycling over the first `AURORA_MODE` modes.
+pub const AURORA_MODE: u32 = 4;
+const _: () = assert!(AURORA_MODE as usize == COLOR_MODES.len() - 1);
+
 /// Fractal formula selector, cycled with F (or by clicking the menu row).
 #[derive(Resource, Default)]
 pub struct FractalType(pub Fractal);
