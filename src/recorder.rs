@@ -492,7 +492,9 @@ mod native {
     }
 
     /// Runs the encode until the channel closes or a fatal error; returns
-    /// the number of timeline frames written into the mp4.
+    /// the number of timeline frames written into the mp4. Errors after the
+    /// encoder is up break out to the finalize below rather than returning,
+    /// so a take that fails midway still gets its moov index and plays.
     fn encode_frames(rx: Receiver<Frame>, file: File, path: &str, fps: f64, scale: usize) -> u64 {
         let mut file = Some(file);
         let mut state: Option<EncState> = None;
@@ -542,7 +544,7 @@ mod native {
             }
             let Some((r, b)) = rb_offsets(frame.format) else {
                 error!("recording: unsupported surface format {:?}", frame.format);
-                return written;
+                break;
             };
             if scale == 2 {
                 downsample2(&frame.data, frame.w as usize, w, h, &mut half);
@@ -554,7 +556,7 @@ mod native {
                 Ok(bs) => bs,
                 Err(e) => {
                     error!("recording: encode failed: {e}");
-                    return written;
+                    break;
                 }
             };
             let is_sync = matches!(bs.frame_type(), FrameType::IDR);
@@ -607,7 +609,7 @@ mod native {
                 };
                 if let Err(e) = st.writer.add_track(&track) {
                     error!("recording: mp4 track setup failed: {e}");
-                    return written;
+                    break;
                 }
                 st.track_added = true;
             }
@@ -620,7 +622,7 @@ mod native {
             };
             if let Err(e) = st.writer.write_sample(1, &mp4_sample) {
                 error!("recording: mp4 sample write failed: {e}");
-                return written;
+                break;
             }
             written += n as u64;
             samples += 1;
@@ -799,7 +801,14 @@ mod native {
         /// Sends `frames` moving-gradient frames through the full pipeline
         /// (convert, optional downscale, encode, mux) at `scale` and returns
         /// the finished mp4's bytes.
-        fn encode_gradient(name: &str, w: u32, h: u32, frames: u32, scale: usize) -> Vec<u8> {
+        fn encode_gradient(
+            name: &str,
+            w: u32,
+            h: u32,
+            frames: u32,
+            scale: usize,
+            format: fn(u32) -> TextureFormat,
+        ) -> Vec<u8> {
             let dir = std::env::temp_dir().join("fractality_rec_test");
             std::fs::create_dir_all(&dir).unwrap();
             let path = dir.join(name);
@@ -822,7 +831,7 @@ mod native {
                     t: i as f64 / FPS,
                     w,
                     h,
-                    format: TextureFormat::Bgra8UnormSrgb,
+                    format: format(i),
                     data,
                 })
                 .unwrap();
@@ -837,7 +846,7 @@ mod native {
         #[test]
         fn encodes_valid_mp4() {
             let (w, h) = (320u32, 240u32);
-            let bytes = encode_gradient("out.mp4", w, h, 30, 1);
+            let bytes = encode_gradient("out.mp4", w, h, 30, 1, |_| TextureFormat::Bgra8UnormSrgb);
             assert_eq!(&bytes[4..8], b"ftyp");
             let size = bytes.len() as u64;
             let mp4 = mp4::Mp4Reader::read_header(std::io::Cursor::new(bytes), size).unwrap();
@@ -852,7 +861,7 @@ mod native {
         #[test]
         fn encodes_half_res() {
             let (w, h) = (320u32, 240u32);
-            let bytes = encode_gradient("half.mp4", w, h, 10, 2);
+            let bytes = encode_gradient("half.mp4", w, h, 10, 2, |_| TextureFormat::Bgra8UnormSrgb);
             let size = bytes.len() as u64;
             let mp4 = mp4::Mp4Reader::read_header(std::io::Cursor::new(bytes), size).unwrap();
             let track = mp4.tracks().values().next().unwrap();
@@ -868,6 +877,24 @@ mod native {
             let mut dst = Vec::new();
             downsample2(&src, 2, 1, 1, &mut dst);
             assert_eq!(&dst[..3], &[25, 35, 45]);
+        }
+
+        /// A fatal error midway (here an unsupported format on frame 12)
+        /// still finalizes the take: the mp4 parses and keeps the frames
+        /// encoded before the failure.
+        #[test]
+        fn failed_take_still_finalizes() {
+            let bytes = encode_gradient("failed.mp4", 320, 240, 20, 1, |i| {
+                if i < 12 {
+                    TextureFormat::Bgra8UnormSrgb
+                } else {
+                    TextureFormat::Rgba16Float
+                }
+            });
+            let size = bytes.len() as u64;
+            let mp4 = mp4::Mp4Reader::read_header(std::io::Cursor::new(bytes), size).unwrap();
+            let track = mp4.tracks().values().next().unwrap();
+            assert_eq!(track.sample_count(), 12);
         }
     }
 }
