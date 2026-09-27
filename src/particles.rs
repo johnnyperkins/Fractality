@@ -31,7 +31,7 @@ use crate::fractal::{smooth_iter, Fractal, REF_ORBIT_CAP};
 #[derive(Component, Clone, ExtractComponent)]
 pub struct ParticleCamera;
 
-/// GPU particle, 32 bytes. Layout must match the WGSL Particle struct exactly.
+/// GPU particle, 32 bytes. Layout must match Particle in common.wgsl exactly.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Particle {
@@ -117,7 +117,9 @@ mod uniform {
         pub spectrum: [Vec4; 4],
         /// Shape/dynamics tuning: x condensation (how hard particles freeze onto
         /// the boundary shell; 1 = classic, higher = wider and deader freeze,
-        /// 0 = everything streams), yzw spare.
+        /// 0 = everything streams), y previous flow mode and z crossfade
+        /// progress (0 = all previous mode, 1 = all current) for the flow-mode
+        /// morph, w spare.
         pub shape: Vec4,
     }
 
@@ -229,7 +231,6 @@ struct ParticleDrawLabel;
 #[derive(Resource)]
 struct ParticleBuffers {
     buffer: Buffer,
-    count: u32,
 }
 
 #[derive(Resource, Default)]
@@ -478,10 +479,7 @@ fn extract_particle_buffers(
     if n > 0 {
         queue.write_buffer(&buffer, 0, bytemuck::cast_slice(&seed.0[..n]));
     }
-    commands.insert_resource(ParticleBuffers {
-        buffer,
-        count: MAX_PARTICLES,
-    });
+    commands.insert_resource(ParticleBuffers { buffer });
 }
 
 /// Free the CPU-side seed once the render world has copied it into the GPU
@@ -645,9 +643,8 @@ impl render_graph::Node for ParticleComputeNode {
         render_context: &mut RenderContext,
         world: &World,
     ) -> Result<(), render_graph::NodeRunError> {
-        let (Some(bind_groups), Some(buffers), Some(pipelines)) = (
+        let (Some(bind_groups), Some(pipelines)) = (
             world.get_resource::<ParticleBindGroups>(),
-            world.get_resource::<ParticleBuffers>(),
             world.get_resource::<ParticlePipelines>(),
         ) else {
             return Ok(());
@@ -676,7 +673,7 @@ impl render_graph::Node for ParticleComputeNode {
             }
         };
         // Simulate only the active count (buffer holds up to MAX_PARTICLES).
-        let count = params.map_or(0, |p| p.0.count).min(buffers.count);
+        let count = params.map_or(0, |p| p.0.count).min(MAX_PARTICLES);
         if count == 0 {
             return Ok(());
         }
@@ -705,9 +702,8 @@ impl ViewNode for ParticleDrawNode {
         (view_target, _): bevy::ecs::query::QueryItem<'w, Self::ViewQuery>,
         world: &'w World,
     ) -> Result<(), render_graph::NodeRunError> {
-        let (Some(bind_groups), Some(buffers), Some(pipelines)) = (
+        let (Some(bind_groups), Some(pipelines)) = (
             world.get_resource::<ParticleBindGroups>(),
-            world.get_resource::<ParticleBuffers>(),
             world.get_resource::<ParticlePipelines>(),
         ) else {
             return Ok(());
@@ -718,7 +714,7 @@ impl ViewNode for ParticleDrawNode {
         };
         // Draw only the active count (buffer holds up to MAX_PARTICLES).
         let params = world.get_resource::<SimParams>();
-        let count = params.map_or(0, |p| p.0.count).min(buffers.count);
+        let count = params.map_or(0, |p| p.0.count).min(MAX_PARTICLES);
         let decay = params.map_or(0.0, |p| p.0.trail_decay);
         let composite = params.is_some_and(|p| p.0.needs_composite());
 

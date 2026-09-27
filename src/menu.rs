@@ -14,7 +14,7 @@ use crate::choreographer::Choreographer;
 use crate::fractal::Fractal;
 use crate::particles::{ParticleCamera, MAX_PARTICLES};
 use crate::recorder::{
-    RecordSettings, REC_FPS_DEFAULT, REC_FPS_MODES, REC_RES_DEFAULT, REC_RES_MODES,
+    RecordSettings, Recorder, REC_FPS_DEFAULT, REC_FPS_MODES, REC_RES_DEFAULT, REC_RES_MODES,
 };
 use crate::{ColorMode, FlowMode, FractalType, Kaleido, COLOR_MODES, FLOW_MODES};
 
@@ -94,7 +94,7 @@ impl Default for Settings {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Setting {
+enum Setting {
     ParticleCount,
     Detail,
     FlowSpeed,
@@ -609,6 +609,19 @@ fn card_node() -> impl Bundle {
     )
 }
 
+/// The accent tick that leads every card title.
+fn title_tick() -> impl Bundle {
+    (
+        Node {
+            width: Val::Px(3.0),
+            height: Val::Px(11.0),
+            ..default()
+        },
+        BackgroundColor(ACCENT),
+        BorderRadius::all(Val::Px(2.0)),
+    )
+}
+
 /// Accent tick + small caps title, used at the top of every card.
 fn card_title(title: &str) -> impl Bundle {
     (
@@ -619,17 +632,44 @@ fn card_title(title: &str) -> impl Bundle {
             margin: UiRect::bottom(Val::Px(1.0)),
             ..default()
         },
+        children![title_tick(), text_bundle(title, FONT_SMALL, TEXT_MUTED)],
+    )
+}
+
+/// Caret glyphs: down for an open section (and a select's dropdown hint),
+/// right for a folded one.
+const CARET_DOWN: &str = "\u{25be}";
+const CARET_RIGHT: &str = "\u{25b8}";
+
+fn caret_glyph(open: bool) -> &'static str {
+    if open {
+        CARET_DOWN
+    } else {
+        CARET_RIGHT
+    }
+}
+
+/// Clickable title of a collapsible card: card_title's tick and text plus a
+/// caret showing the fold state. Carries the section's open state.
+fn collapse_header(section: CollapseSection, title: &str, open: bool) -> impl Bundle {
+    (
+        Button,
+        Node {
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Center,
+            column_gap: Val::Px(6.0),
+            ..default()
+        },
+        BackgroundColor(Color::NONE),
+        MenuInteractive,
+        CollapseHeader { section, open },
         children![
-            (
-                Node {
-                    width: Val::Px(3.0),
-                    height: Val::Px(11.0),
-                    ..default()
-                },
-                BackgroundColor(ACCENT),
-                BorderRadius::all(Val::Px(2.0)),
-            ),
+            title_tick(),
             text_bundle(title, FONT_SMALL, TEXT_MUTED),
+            (
+                text_bundle(caret_glyph(open), 10.0, TEXT_MUTED),
+                CollapseCaret(section),
+            ),
         ],
     )
 }
@@ -758,7 +798,7 @@ fn select_control(select: Select, initial: &'static str) -> impl Bundle {
                 text_bundle(initial, FONT_ROW, TEXT_VALUE),
                 SelectValue(select),
             ),
-            text_bundle("\u{25be}", 10.0, TEXT_MUTED),
+            text_bundle(CARET_DOWN, 10.0, TEXT_MUTED),
         ],
     )
 }
@@ -882,10 +922,39 @@ fn spawn_select_row(card: &mut ChildSpawnerCommands, select: Select) {
     });
 }
 
+/// Slider group inside a card, collapsed to nothing until its effect is on.
+fn section_node() -> Node {
+    Node {
+        display: Display::None,
+        flex_direction: FlexDirection::Column,
+        row_gap: Val::Px(6.0),
+        padding: UiRect::left(Val::Px(6.0)),
+        margin: UiRect::bottom(Val::Px(2.0)),
+        ..default()
+    }
+}
+
+/// Toggle row, followed by its slider group when it has one.
+fn spawn_toggle_row(card: &mut ChildSpawnerCommands, toggle: Toggle, sliders: &[Setting]) {
+    card.spawn((
+        interactive_row(toggle.label(), toggle.key(), toggle_control(toggle)),
+        ToggleRow(toggle),
+    ));
+    if !sliders.is_empty() {
+        card.spawn((section_node(), ToggleSection(toggle)))
+            .with_children(|col| {
+                for &setting in sliders {
+                    col.spawn(slider_row(setting));
+                }
+            });
+    }
+}
+
 fn build_menu(mut commands: Commands) {
     // Floating REC indicator, top-right, outside the panel so it shows with
-    // the menu closed too. Never in captures: on native the UI only exists
-    // on the present camera while captures read the offscreen scene target.
+    // the menu closed too. Kept out of native captures: the UI only exists
+    // on the present camera while captures read the offscreen scene target
+    // (the web recorder takes the whole canvas, UI included).
     commands.spawn((
         Node {
             position_type: PositionType::Absolute,
@@ -900,7 +969,7 @@ fn build_menu(mut commands: Commands) {
             ..default()
         },
         BackgroundColor(PANEL_BG),
-        BorderColor(Color::srgba(0.96, 0.30, 0.30, 0.35)),
+        BorderColor(REC_RED.with_alpha(0.35)),
         BorderRadius::all(Val::Px(8.0)),
         RecChip,
         children![
@@ -1006,46 +1075,13 @@ fn build_menu(mut commands: Commands) {
                 }
             });
 
-            // Effects: toggles, each with its own slider group folded away
-            // until the effect is on.
+            // Effects: toggles, kaleidoscope and audio each with a slider
+            // group folded away until the effect is on.
             parent.spawn(card_node()).with_children(|card| {
                 card.spawn(card_title("EFFECTS"));
-                card.spawn((
-                    interactive_row(
-                        Toggle::Kaleido.label(),
-                        Toggle::Kaleido.key(),
-                        toggle_control(Toggle::Kaleido),
-                    ),
-                    ToggleRow(Toggle::Kaleido),
-                ));
-                card.spawn((section_node(), ToggleSection(Toggle::Kaleido)))
-                    .with_children(|col| {
-                        for setting in KALEIDO_SETTINGS {
-                            col.spawn(slider_row(setting));
-                        }
-                    });
-                card.spawn((
-                    interactive_row(
-                        Toggle::Choreographer.label(),
-                        Toggle::Choreographer.key(),
-                        toggle_control(Toggle::Choreographer),
-                    ),
-                    ToggleRow(Toggle::Choreographer),
-                ));
-                card.spawn((
-                    interactive_row(
-                        Toggle::Audio.label(),
-                        Toggle::Audio.key(),
-                        toggle_control(Toggle::Audio),
-                    ),
-                    ToggleRow(Toggle::Audio),
-                ));
-                card.spawn((section_node(), ToggleSection(Toggle::Audio)))
-                    .with_children(|col| {
-                        for setting in AUDIO_SETTINGS {
-                            col.spawn(slider_row(setting));
-                        }
-                    });
+                spawn_toggle_row(card, Toggle::Kaleido, &KALEIDO_SETTINGS);
+                spawn_toggle_row(card, Toggle::Choreographer, &[]);
+                spawn_toggle_row(card, Toggle::Audio, &AUDIO_SETTINGS);
             });
 
             // Recording: capture options applied to the next O take,
@@ -1053,43 +1089,19 @@ fn build_menu(mut commands: Commands) {
             // path records via MediaRecorder with no knobs.
             #[cfg(not(target_arch = "wasm32"))]
             parent.spawn(card_node()).with_children(|card| {
-                // card_title plus a caret, with the O chip on the right edge.
-                card.spawn((
-                    Button,
-                    Node {
-                        flex_direction: FlexDirection::Row,
-                        align_items: AlignItems::Center,
-                        column_gap: Val::Px(6.0),
+                // The O chip pushed to the header's right edge.
+                card.spawn(collapse_header(
+                    CollapseSection::Recording,
+                    "RECORDING",
+                    false,
+                ))
+                .with_children(|header| {
+                    header.spawn(Node {
+                        flex_grow: 1.0,
                         ..default()
-                    },
-                    BackgroundColor(Color::NONE),
-                    MenuInteractive,
-                    CollapseHeader {
-                        section: CollapseSection::Recording,
-                        open: false,
-                    },
-                    children![
-                        (
-                            Node {
-                                width: Val::Px(3.0),
-                                height: Val::Px(11.0),
-                                ..default()
-                            },
-                            BackgroundColor(ACCENT),
-                            BorderRadius::all(Val::Px(2.0)),
-                        ),
-                        text_bundle("RECORDING", FONT_SMALL, TEXT_MUTED),
-                        (
-                            text_bundle("\u{25b8}", 10.0, TEXT_MUTED),
-                            CollapseCaret(CollapseSection::Recording),
-                        ),
-                        Node {
-                            flex_grow: 1.0,
-                            ..default()
-                        },
-                        key_chip("O"),
-                    ],
-                ));
+                    });
+                    header.spawn(key_chip("O"));
+                });
                 card.spawn((
                     Node {
                         display: Display::None,
@@ -1109,37 +1121,7 @@ fn build_menu(mut commands: Commands) {
 
             // Controls: clickable title collapses the list.
             parent.spawn(card_node()).with_children(|card| {
-                card.spawn((
-                    Button,
-                    Node {
-                        flex_direction: FlexDirection::Row,
-                        align_items: AlignItems::Center,
-                        column_gap: Val::Px(6.0),
-                        ..default()
-                    },
-                    BackgroundColor(Color::NONE),
-                    MenuInteractive,
-                    CollapseHeader {
-                        section: CollapseSection::Controls,
-                        open: true,
-                    },
-                    children![
-                        (
-                            Node {
-                                width: Val::Px(3.0),
-                                height: Val::Px(11.0),
-                                ..default()
-                            },
-                            BackgroundColor(ACCENT),
-                            BorderRadius::all(Val::Px(2.0)),
-                        ),
-                        text_bundle("CONTROLS", FONT_SMALL, TEXT_MUTED),
-                        (
-                            text_bundle("\u{25be}", 10.0, TEXT_MUTED),
-                            CollapseCaret(CollapseSection::Controls),
-                        ),
-                    ],
-                ));
+                card.spawn(collapse_header(CollapseSection::Controls, "CONTROLS", true));
                 card.spawn((
                     Node {
                         flex_direction: FlexDirection::Row,
@@ -1174,18 +1156,6 @@ fn build_menu(mut commands: Commands) {
                 });
             });
         });
-}
-
-/// Slider group inside a card, collapsed to nothing until its effect is on.
-fn section_node() -> Node {
-    Node {
-        display: Display::None,
-        flex_direction: FlexDirection::Column,
-        row_gap: Val::Px(6.0),
-        padding: UiRect::left(Val::Px(6.0)),
-        margin: UiRect::bottom(Val::Px(2.0)),
-        ..default()
-    }
 }
 
 fn toggle_menu(
@@ -1431,10 +1401,10 @@ fn click_toggle(
 }
 
 /// Pills and their slider sections follow the real state, however it changed
-/// (click, key, idle engagement, input exit). Kaleido's rotation accumulator
-/// and Choreographer's timers tick every frame, so is_changed is useless here; diff
-/// the three flags instead. Display::None collapses a section entirely (no
-/// reserved space), accordion-style.
+/// (click, key, idle engagement, input exit). update_choreographer writes
+/// Choreographer (idle timer, want_toggle) every frame, so is_changed is
+/// useless here; diff the three flags instead. Display::None collapses a
+/// section entirely (no reserved space), accordion-style.
 fn sync_toggles(
     kaleido: Res<Kaleido>,
     choreo: Res<Choreographer>,
@@ -1494,7 +1464,7 @@ fn click_collapse_header(
                 }
                 for (mut text, caret) in &mut carets {
                     if caret.0 == header.section {
-                        *text = Text::new(if header.open { "\u{25be}" } else { "\u{25b8}" });
+                        *text = Text::new(caret_glyph(header.open));
                     }
                 }
                 ROW_HOVER
@@ -1511,7 +1481,7 @@ fn click_collapse_header(
 /// The floating REC indicator: shown while a take runs, dot pulsing,
 /// elapsed time ticking.
 fn update_rec_chip(
-    recorder: Res<crate::recorder::Recorder>,
+    recorder: Res<Recorder>,
     time: Res<Time>,
     mut chip: Query<&mut Node, With<RecChip>>,
     mut dot: Query<&mut BackgroundColor, With<RecDot>>,
@@ -1534,7 +1504,7 @@ fn update_rec_chip(
     // ~1 Hz breathe so the dot reads as live rather than static decoration.
     let pulse = 0.55 + 0.45 * (*elapsed * std::f32::consts::TAU).sin();
     for mut bg in &mut dot {
-        bg.0 = Color::srgba(0.96, 0.30, 0.30, pulse);
+        bg.0 = REC_RED.with_alpha(pulse);
     }
     let sec = *elapsed as u32;
     if *last_sec != sec {

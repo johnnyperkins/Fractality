@@ -1,9 +1,9 @@
 // Video recording, toggled with O. Two per-platform paths behind one
 // interface, same shape as the audio module: `platform::Handle` is the live
 // recording, dropping it stops the take.
-//  - native: per-frame GPU screenshot readback, encoded in-process to an
-//    H.264 mp4 by the bundled openh264 encoder (compiled in, ~1 MB of
-//    binary). No external tools, works on any machine.
+//  - native: per-frame GPU readback of the offscreen scene target, encoded
+//    in-process to an H.264 mp4 by the bundled openh264 encoder (compiled
+//    in, ~1 MB of binary). No external tools, works on any machine.
 //  - web: MediaRecorder on the canvas's captureStream. The browser encodes
 //    webm off-thread; stopping triggers a download, like the P screenshot.
 // No audio track: the visualizer reacts to system audio it does not own, and
@@ -182,8 +182,9 @@ mod native {
     }
 
     /// One captured frame, tightly packed (Bevy's screenshot readback strips
-    /// the 256-byte row padding). Format rides along because the swapchain
-    /// format (BGRA vs RGBA) is only known once the first readback lands.
+    /// the 256-byte row padding). Format rides along so the converter reads
+    /// the channel order the readback actually has instead of assuming the
+    /// scene target's (RGBA today) stays fixed.
     struct Frame {
         t: f64,
         w: u32,
@@ -230,10 +231,11 @@ mod native {
         })
     }
 
-    /// Per-frame capture while recording: spawn a screenshot of the window
-    /// and forward the readback into the encoder channel. The observer runs
-    /// a few frames later when the GPU copy lands; the timestamp taken there
-    /// is what the encoder's sample durations pace against.
+    /// Per-frame capture while recording: spawn a screenshot of the scene
+    /// target and forward the readback into the encoder channel. The
+    /// observer runs a few frames later when the GPU copy lands; the
+    /// timestamp taken there is what the encoder's sample durations pace
+    /// against.
     pub(super) fn capture_frames(
         mut rec: ResMut<Recorder>,
         windows: Query<&Window>,
@@ -291,8 +293,8 @@ mod native {
     }
 
     /// Byte offsets of (red, blue) within a 4-byte pixel; green is always at
-    /// offset 1. Swapchain formats seen in practice; anything else (a 10-bit
-    /// or float surface) aborts with a clear error instead of writing garbage.
+    /// offset 1. The 8-bit formats only; anything else (a 10-bit or float
+    /// target) aborts with a clear error instead of writing garbage.
     fn rb_offsets(format: TextureFormat) -> Option<(usize, usize)> {
         match format {
             TextureFormat::Bgra8Unorm | TextureFormat::Bgra8UnormSrgb => Some((2, 0)),
@@ -565,14 +567,17 @@ mod native {
                 for i in 0..layer.nal_count() {
                     let nal = strip_start_code(layer.nal_unit(i).unwrap());
                     match nal.first().map_or(0, |b| b & 0x1f) {
-                        7 => st.sps.get_or_insert_with(|| nal.to_vec()),
-                        8 => st.pps.get_or_insert_with(|| nal.to_vec()),
+                        7 => {
+                            st.sps.get_or_insert_with(|| nal.to_vec());
+                        }
+                        8 => {
+                            st.pps.get_or_insert_with(|| nal.to_vec());
+                        }
                         _ => {
                             sample.extend_from_slice(&(nal.len() as u32).to_be_bytes());
                             sample.extend_from_slice(nal);
-                            continue;
                         }
-                    };
+                    }
                 }
             }
             st.sample_hint = st.sample_hint.max(sample.len());
@@ -791,18 +796,17 @@ mod native {
             }
         }
 
-        /// Full pipeline on synthetic frames: convert, encode, mux, then
-        /// reparse the mp4 and check the track holds the expected samples.
-        #[test]
-        fn encodes_valid_mp4() {
+        /// Sends `frames` moving-gradient frames through the full pipeline
+        /// (convert, optional downscale, encode, mux) at `scale` and returns
+        /// the finished mp4's bytes.
+        fn encode_gradient(name: &str, w: u32, h: u32, frames: u32, scale: usize) -> Vec<u8> {
             let dir = std::env::temp_dir().join("fractality_rec_test");
             std::fs::create_dir_all(&dir).unwrap();
-            let path = dir.join("out.mp4");
+            let path = dir.join(name);
             let file = File::create(&path).unwrap();
 
-            let (w, h) = (320u32, 240u32);
             let (tx, rx) = std::sync::mpsc::sync_channel::<Frame>(64);
-            for i in 0..30u32 {
+            for i in 0..frames {
                 // Moving gradient so inter frames have real motion to code.
                 let mut data = vec![0u8; (w * h * 4) as usize];
                 for y in 0..h {
@@ -824,13 +828,19 @@ mod native {
                 .unwrap();
             }
             drop(tx);
-            encode_loop(rx, file, path.to_string_lossy().into_owned(), FPS, 1);
+            encode_loop(rx, file, path.to_string_lossy().into_owned(), FPS, scale);
+            std::fs::read(&path).unwrap()
+        }
 
-            let bytes = std::fs::read(&path).unwrap();
+        /// Full pipeline on synthetic frames, then reparse the mp4 and check
+        /// the track holds the expected samples.
+        #[test]
+        fn encodes_valid_mp4() {
+            let (w, h) = (320u32, 240u32);
+            let bytes = encode_gradient("out.mp4", w, h, 30, 1);
             assert_eq!(&bytes[4..8], b"ftyp");
             let size = bytes.len() as u64;
-            let reader = std::io::Cursor::new(bytes);
-            let mp4 = mp4::Mp4Reader::read_header(reader, size).unwrap();
+            let mp4 = mp4::Mp4Reader::read_header(std::io::Cursor::new(bytes), size).unwrap();
             let track = mp4.tracks().values().next().unwrap();
             assert_eq!(track.sample_count(), 30);
             assert_eq!(track.width(), w as u16);
@@ -841,37 +851,8 @@ mod native {
         /// source dimensions, and the box filter averages exact 2x2 blocks.
         #[test]
         fn encodes_half_res() {
-            let dir = std::env::temp_dir().join("fractality_rec_test");
-            std::fs::create_dir_all(&dir).unwrap();
-            let path = dir.join("half.mp4");
-            let file = File::create(&path).unwrap();
-
             let (w, h) = (320u32, 240u32);
-            let (tx, rx) = std::sync::mpsc::sync_channel::<Frame>(64);
-            for i in 0..10u32 {
-                let mut data = vec![0u8; (w * h * 4) as usize];
-                for y in 0..h {
-                    for x in 0..w {
-                        let p = ((y * w + x) * 4) as usize;
-                        data[p] = (x + i * 4) as u8;
-                        data[p + 1] = (y + i * 2) as u8;
-                        data[p + 2] = 128;
-                        data[p + 3] = 255;
-                    }
-                }
-                tx.send(Frame {
-                    t: i as f64 / FPS,
-                    w,
-                    h,
-                    format: TextureFormat::Bgra8UnormSrgb,
-                    data,
-                })
-                .unwrap();
-            }
-            drop(tx);
-            encode_loop(rx, file, path.to_string_lossy().into_owned(), FPS, 2);
-
-            let bytes = std::fs::read(&path).unwrap();
+            let bytes = encode_gradient("half.mp4", w, h, 10, 2);
             let size = bytes.len() as u64;
             let mp4 = mp4::Mp4Reader::read_header(std::io::Cursor::new(bytes), size).unwrap();
             let track = mp4.tracks().values().next().unwrap();

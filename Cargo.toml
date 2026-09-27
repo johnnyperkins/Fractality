@@ -4,8 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# Default features off: skips bevy_audio (audio.rs uses an external capture
-# process), gltf/scene/animation, and asset loaders this app never touches.
+# Default features off: skips bevy_audio (audio.rs captures via pw-record on
+# native, Web Audio on web), gltf/scene/animation, and asset loaders this app
+# never touches.
 bevy = { version = "0.16", default-features = false, features = [
     "bevy_winit",
     "bevy_ui",

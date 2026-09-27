@@ -60,10 +60,10 @@ fn vs(
     let center_clip = p_pos * params.world_to_clip.xy + params.world_to_clip.zw;
 
     // Off-screen instances leave before the palette math. Recycling only
-    // reclaims a particle once it has drifted 2.5 view-extents out, and a
-    // dive pushes the whole cloud outward, so a large slice of the draw is
-    // instances whose color is computed purely for the rasterizer to throw
-    // away. The test uses the quad CENTER plus its half-extent, so all four
+    // reclaims a particle once it has drifted 2.5 view half-extents from
+    // center, and a dive pushes the whole cloud outward, so a large slice of
+    // the draw is instances whose color is computed purely for the rasterizer
+    // to throw away. The test uses the quad CENTER plus its half-extent, so all four
     // vertices of an instance decide identically (a per-corner test would
     // fold only some vertices of a quad and tear the geometry), and it is
     // exact: a quad overlaps the viewport iff its center is within

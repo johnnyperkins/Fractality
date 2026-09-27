@@ -166,8 +166,7 @@ fn fft(re: &mut [f32; N], im: &mut [f32; N]) {
     // Bit-reversal permutation.
     let bits = N.trailing_zeros();
     for i in 0..N {
-        let j = (i as u32).reverse_bits() >> (32 - bits);
-        let j = j as usize;
+        let j = ((i as u32).reverse_bits() >> (32 - bits)) as usize;
         if j > i {
             re.swap(i, j);
             im.swap(i, j);
@@ -209,9 +208,9 @@ fn autogain(peak: &mut f32, amp: f32) -> f32 {
 /// One FFT window's worth of analysis state, shared by the native capture
 /// thread and the web audio callback. Timing is stream time in seconds,
 /// accumulated from windows processed (window duration = N / sample_rate),
-/// so it needs no clock - std::time::Instant panics on wasm. The old
-/// Instant-based code also only checked at window boundaries, so with a
-/// real-time source the decisions are identical.
+/// so it needs no clock - std::time::Instant panics on wasm. Decisions are
+/// only made at window boundaries anyway, and with a real-time source stream
+/// time tracks wall time.
 struct WindowProcessor {
     /// Hann window, precomputed.
     window: [f32; N],
@@ -273,8 +272,8 @@ impl WindowProcessor {
             ema_long: 0.0,
             t: 0.0,
             window_dt: N as f64 / rate as f64,
-            // t starts at 0, so beats hold off ~150 ms and drops 8 s after
-            // capture start, matching the old Instant::now() initialization.
+            // t starts at 0, so the cooldowns also hold beats off ~150 ms and
+            // drops 8 s after capture start.
             last_beat: 0.0,
             last_drop: 0.0,
         }
@@ -283,8 +282,7 @@ impl WindowProcessor {
     /// Analyze one N-sample mono window and publish the results.
     fn process(&mut self, samples: &[f32; N], shared: &AudioShared) {
         // Advance the stream clock first: after window k, t = k * window_dt,
-        // which is the wall time the old Instant-based code observed when it
-        // checked cooldowns at this same point (real-time source assumed).
+        // the stream time at the end of the window being analyzed.
         self.t += self.window_dt;
         let mut re = [0.0f32; N];
         let mut im = [0.0f32; N];
@@ -294,8 +292,8 @@ impl WindowProcessor {
         fft(&mut re, &mut im);
         // Per-bin power once; every band below is a range sum over this.
         let mut power = [0.0f32; N / 2];
-        for (p, (r, i_)) in power.iter_mut().zip(re.iter().zip(im.iter())) {
-            *p = r * r + i_ * i_;
+        for (p, (r, i)) in power.iter_mut().zip(re.iter().zip(&im)) {
+            *p = r * r + i * i;
         }
         let band_sum = |lo: usize, hi: usize| power[lo..hi].iter().sum::<f32>();
 
@@ -344,7 +342,8 @@ impl WindowProcessor {
         // then hit). Warm-up and a long cooldown keep it a rare event.
         self.ema_short += (level_p - self.ema_short) * 0.093;
         self.ema_long += (level_p - self.ema_long) * 0.0058;
-        // ~2 s warm-up (86 windows at 44.1 kHz, matching the original gate).
+        // ~2 s warm-up: ema_long starts at 0, so the surge test would pass
+        // trivially before it has seen a norm.
         if self.t > 2.0
             && self.ema_long > 1e-7
             && self.ema_short > self.ema_long * 3.0
@@ -435,7 +434,7 @@ mod platform {
 mod platform {
     use std::cell::{Cell, RefCell};
     use std::io;
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
 
     use bevy::prelude::warn;
@@ -463,7 +462,7 @@ mod platform {
         static GRAPH: RefCell<Option<Graph>> = const { RefCell::new(None) };
         static ACTIVE: Cell<u64> = const { Cell::new(0) };
     }
-    static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
     /// Send+Sync token for one capture attempt; dropping it tears down the
     /// audio graph if this attempt still owns it.

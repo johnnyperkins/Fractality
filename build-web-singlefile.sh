@@ -20,8 +20,9 @@ wasm-bindgen \
     --out-name fractality \
     target/wasm32-unknown-unknown/release/fractality.wasm
 
+# Optional size pass; --all-features for older wasm-opt, as in build-web.sh.
 if command -v wasm-opt >/dev/null; then
-    wasm-opt -O2 -o "$out/fractality_bg.wasm" "$out/fractality_bg.wasm"
+    wasm-opt -O2 --all-features -o "$out/fractality_bg.wasm" "$out/fractality_bg.wasm"
 fi
 
 html=web/fractality-standalone.html

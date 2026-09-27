@@ -1,9 +1,10 @@
 //! The auto-choreographer (classic arcade "attract mode"): an autopilot that
 //! dives into the busiest boundary in sight and restyles the show as it goes.
 //! Toggled with X or the menu row, or engaging on its own after 30 s without
-//! input. Everything here is glue over existing features - the dive shares
-//! the fly-to approach step, and palette, flow, kaleidoscope, and trail
-//! changes go through the same resources the keys and sliders use.
+//! input while the menu is hidden. Everything here is glue over existing
+//! features - the dive shares the fly-to approach step, and palette, flow,
+//! kaleidoscope, and trail changes go through the same resources the keys
+//! and sliders use.
 
 use bevy::input::mouse::MouseWheel;
 use bevy::math::DVec2;
@@ -23,6 +24,11 @@ use crate::{
 /// Idle seconds before the autopilot engages on its own.
 const IDLE_SECS: f32 = 30.0;
 
+/// Iteration cap for boundary scans: enough contrast to find the boundary at
+/// any depth above the dive floor, bounded so a scan stays cheap (see
+/// pick_boundary_target).
+const SCAN_ITER_CAP: u32 = 3000;
+
 /// Dive floor: boundary targeting samples the escape field in plain f64,
 /// which loses the boundary below ~1e-13, so scenes cut to the next one here
 /// instead of diving blind toward the 1e-28 precision floor.
@@ -31,12 +37,12 @@ const DIVE_FLOOR: f64 = 1e-12;
 /// Autopilot state. The dive heads into the busiest boundary in sight
 /// (retargeting as new structure resolves), phases the kaleidoscope in and
 /// out with fresh fold/spin styling, cycles flow modes through the
-/// crossfade, swaps the palette on song drops (or a timer when silent),
-/// varies the trail length, and fires blast bursts. Idle engagement hands
-/// control back on any input; explicit engagement (manual) ignores input and
-/// only the toggle exits. On exit the kaleidoscope and the touched sliders
-/// (folds, spin, trails) return to their pre-engage values; the view stays
-/// wherever the dive got to (R resets).
+/// crossfade, swaps the palette on song drops (or on a timer), varies the
+/// trail length, fires blast bursts, and hard-cuts to a new scene at the
+/// dive floor. Idle engagement hands control back on any input; explicit
+/// engagement (manual) ignores input and only the toggle exits. On exit the
+/// kaleidoscope and the touched sliders (folds, spin, trails) return to their
+/// pre-engage values; the view stays wherever the dive got to (R resets).
 #[derive(Resource)]
 pub struct Choreographer {
     /// Seconds since the last user input.
@@ -56,8 +62,7 @@ pub struct Choreographer {
     /// the remaining hang time at the deepest point: with music playing the
     /// cut waits up to 1.2 s to land on a beat.
     cut_wait: Option<f32>,
-    /// Post-cut reseed boost countdown: refill the new fractal's boundary
-    /// within a few frames so the cut never shows a half-empty cloud.
+    /// Post-cut reseed boost countdown (see `refilling`).
     reseed_boost: f32,
     /// Countdown to the next blast, and remaining seconds of the current one
     /// (the synthetic "click" holds a few frames so it moves real mass).
@@ -75,13 +80,15 @@ pub struct Choreographer {
     /// countdown that swaps anyway when the music never drops.
     palette_hold: f32,
     palette_t: f32,
+    /// Last frame's `AudioLevels::drop_age`; a drop shows up as it resetting.
     prev_drop_age: f32,
+    /// Pre-engage kaleidoscope state and slider values, restored on exit.
     saved_kaleido: bool,
     saved_folds: f32,
     saved_spin: f32,
     saved_trail: f32,
     last_cursor: Option<Vec2>,
-    /// Choreography dice; reseeded from the wall clock on every engage.
+    /// Choreography dice; reseeded from app uptime on every engage.
     rng: fastrand::Rng,
 }
 
@@ -165,9 +172,9 @@ fn pick_boundary_target(
         )
     };
     let mut f = [[0.0f32; G]; G];
-    // Row-parallel: at the 3000-iteration cap a serial scan costs a few ms,
-    // a visible frame hitch mid-dive; across cores it stays sub-ms. (Wasm
-    // has no rayon; single-threaded there, same as particle generation.)
+    // Row-parallel: at SCAN_ITER_CAP a serial scan costs a few ms, a visible
+    // frame hitch mid-dive; across cores it stays sub-ms. (Wasm has no rayon;
+    // single-threaded there, same as particle generation.)
     let fill_row = |iy: usize, row: &mut [f32; G]| {
         for (ix, v) in row.iter_mut().enumerate() {
             let p = cell(ix, iy);
@@ -177,14 +184,10 @@ fn pick_boundary_target(
         }
     };
     #[cfg(not(target_arch = "wasm32"))]
-    f.as_mut_slice()
-        .par_iter_mut()
-        .enumerate()
-        .for_each(|(iy, row)| fill_row(iy, row));
+    let rows = f.par_iter_mut();
     #[cfg(target_arch = "wasm32")]
-    f.iter_mut()
-        .enumerate()
-        .for_each(|(iy, row)| fill_row(iy, row));
+    let rows = f.iter_mut();
+    rows.enumerate().for_each(|(iy, row)| fill_row(iy, row));
     let mut scored = Vec::with_capacity((G - 2) * (G - 2));
     for iy in 1..G - 1 {
         for ix in 1..G - 1 {
@@ -214,11 +217,7 @@ fn pick_boundary_target(
 
 /// The choreographer's per-frame tick. Runs after `handle_input` (so a frame
 /// with input is seen before it acts) and before `update_params` (so the
-/// view it writes is the one rendered). Everything here is glue over
-/// existing features: the dive shares the fly-to approach step aimed at a
-/// picked boundary point, scene cuts land on pre-scanned boundary spots,
-/// palette and kaleidoscope changes go through the same resources the keys
-/// use.
+/// view it writes is the one rendered).
 pub fn update_choreographer(
     time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
@@ -386,9 +385,10 @@ pub fn update_choreographer(
     choreo.palette_hold -= dt;
     choreo.palette_t -= dt;
     if (section && choreo.palette_hold <= 0.0) || choreo.palette_t <= 0.0 {
-        // Audio aurora sits dim silver in silence: skip it when idle.
+        // Audio aurora (the last mode) sits dim silver in silence: skip it
+        // when idle.
         let n = if audio.is_idle() {
-            4
+            COLOR_MODES.len() as u32 - 1
         } else {
             COLOR_MODES.len() as u32
         };
@@ -421,7 +421,7 @@ pub fn update_choreographer(
                 fractal.0 = Fractal::from_id(rand_cycle(fractal.0.id(), n, &mut choreo.rng));
             }
             let (hc, hh) = fractal.0.home_view();
-            let scan_iter = depth_iter(hh, settings.detail).min(3000);
+            let scan_iter = depth_iter(hh, settings.detail).min(SCAN_ITER_CAP);
             let spot = pick_boundary_target(hc, hh, aspect, scan_iter, fractal.0, &mut choreo.rng)
                 .unwrap_or_else(|| DdVec2::from_dvec2(hc));
             view.center = spot;
@@ -440,9 +440,7 @@ pub fn update_choreographer(
     } else {
         choreo.retarget -= dt;
         if choreo.retarget <= 0.0 {
-            // Iteration cap: enough contrast to find the boundary at any
-            // depth in this range, bounded so a scan stays a few ms.
-            let max_iter = depth_iter(view.height, settings.detail).min(3000);
+            let max_iter = depth_iter(view.height, settings.detail).min(SCAN_ITER_CAP);
             if let Some(t) = pick_boundary_target(
                 view.center.to_dvec2(),
                 view.height,
@@ -460,7 +458,7 @@ pub fn update_choreographer(
         let chase = (choreo.target - choreo.aim).to_dvec2();
         choreo.aim += chase * (1.0 - (-1.2 * dt as f64).exp());
         let new_h = (view.height * (-0.45 * dt as f64).exp()).max(DIVE_FLOOR);
-        // The extra decay recentres the aim over ~2 s on top of the anchor.
+        // The extra decay recenters the aim over ~2 s on top of the anchor.
         approach_step(&mut view, choreo.aim, new_h, 1.0 - (-0.6 * dt as f64).exp());
     }
 }

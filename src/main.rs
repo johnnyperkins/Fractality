@@ -50,6 +50,9 @@ use recorder::{Recorder, RecorderPlugin};
 #[derive(Resource)]
 pub struct SceneTarget(pub Handle<Image>);
 
+/// Iteration count at base zoom: the startup seed's depth and the floor of
+/// `depth_iter`'s ramp (deeper views ramp above it, and `iter_budget_count`
+/// gives back particles in proportion).
 const BASE_ITER: u32 = 240;
 const DEFAULT_CENTER: DVec2 = Fractal::Mandelbrot.home_view().0;
 const DEFAULT_HEIGHT: f64 = Fractal::Mandelbrot.home_view().1;
@@ -151,15 +154,11 @@ fn cycle(id: &mut u32, n: usize) {
     *id = (*id + 1) % n as u32;
 }
 
-/// Iteration count at base zoom. Deeper views ramp above this, and
-/// `iter_budget_count` gives back particles in proportion.
-const BASE_DEPTH_ITER: f64 = 240.0;
-
 /// Iteration count grows with zoom depth so deep boundary detail resolves.
-/// Capped at REF_ORBIT_CAP, which the ramp now actually reaches: a dive past
-/// height ~2.4e-6 used to freeze here and the fractal stopped resolving new
-/// structure, going mushy instead of deep. Frame cost is held flat by
-/// `iter_budget_count`, not by pinning the iteration count.
+/// Capped at REF_ORBIT_CAP (the reference orbit length) and no lower:
+/// pinning it lower freezes the depth, and a dive past the pin stops
+/// resolving new structure, going mushy instead of deep. Frame cost is held
+/// flat by `iter_budget_count`, not by pinning the iteration count.
 fn depth_iter(height: f64, detail: f32) -> u32 {
     let zoom = (DEFAULT_HEIGHT / height).max(1.0);
     let l = zoom.log2();
@@ -171,7 +170,7 @@ fn depth_iter(height: f64, detail: f32) -> u32 {
     // while still ~4x smaller on screen and grow in over ~1.5 s of dive.
     // Tapered over the first 4 doublings so base-zoom cost is unchanged.
     let margin = 180.0 * (l * 0.25).min(1.0);
-    let raw = (BASE_DEPTH_ITER + 90.0 * l + margin) * detail as f64;
+    let raw = (BASE_ITER as f64 + 90.0 * l + margin) * detail as f64;
     // Cap at REF_ORBIT_CAP: the perturbation reference orbit is that long.
     raw.clamp(60.0, (REF_ORBIT_CAP - 1) as f64) as u32
 }
@@ -183,10 +182,9 @@ const AFFORDABLE_ITER: f32 = 2047.0;
 
 /// Trade particle count against iteration depth PAST the old cap, holding
 /// per-frame work (~count x max_iter) near its old worst-case value. Shallow
-/// and mid zoom are untouched; only dives beyond height ~2.4e-6 - where the
-/// old build froze and went mushy - thin the swarm (to ~23% at the height
-/// floor of 1e-28). Brightness normalization downstream compensates for the
-/// lower density, so the image does not dim.
+/// and mid zoom are untouched; only dives beyond height ~1e-5 thin the swarm
+/// (to ~23% at the height floor of 1e-28). Brightness normalization
+/// downstream compensates for the lower density, so the image does not dim.
 ///
 /// The budget scales with `detail`: max_iter is proportional to it, so
 /// without the scaling the slider would trade particles away 1:1 and
@@ -266,7 +264,9 @@ fn main() {
     for (key, action) in menu::CONTROLS {
         println!("  {key:<10} {action}");
     }
-    println!("  (the choreographer also self-starts after 30 s idle; then any input exits)");
+    println!(
+        "  (with the menu hidden, the choreographer self-starts after 30 s idle; any input exits)"
+    );
 
     let mut app = App::new();
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -379,37 +379,39 @@ fn setup(
     mut windows: Query<&mut Window>,
     #[cfg(not(target_arch = "wasm32"))] mut images: ResMut<Assets<Image>>,
 ) {
-    #[allow(unused_mut, unused_variables)]
-    let mut size = UVec2::new(1920, 1080);
     if let Ok(mut window) = windows.single_mut() {
         window.set_maximized(true);
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            size = UVec2::new(window.physical_width(), window.physical_height());
-        }
     }
     // Native: the scene camera renders offscreen and a present camera puts
     // that texture on the window underneath the UI, so captures read the
     // texture and never contain UI. set_maximized lands later, so the
     // initial size is provisional; sync_scene_target follows the window.
+    // Web: the scene camera renders straight to the canvas.
+    #[cfg(not(target_arch = "wasm32"))]
+    let target = {
+        let size = windows.single().map_or(UVec2::new(1920, 1080), |w| {
+            UVec2::new(w.physical_width(), w.physical_height())
+        });
+        images.add(scene_target_image(size))
+    };
+    commands.spawn((
+        Camera2d,
+        Camera {
+            hdr: true,
+            clear_color: ClearColorConfig::Custom(Color::BLACK),
+            #[cfg(not(target_arch = "wasm32"))]
+            target: target.clone().into(),
+            ..default()
+        },
+        Bloom {
+            intensity: settings.bloom,
+            ..Bloom::NATURAL
+        },
+        Msaa::Off,
+        ParticleCamera,
+    ));
     #[cfg(not(target_arch = "wasm32"))]
     {
-        let target = images.add(scene_target_image(size));
-        commands.spawn((
-            Camera2d,
-            Camera {
-                hdr: true,
-                clear_color: ClearColorConfig::Custom(Color::BLACK),
-                target: target.clone().into(),
-                ..default()
-            },
-            Bloom {
-                intensity: settings.bloom,
-                ..Bloom::NATURAL
-            },
-            Msaa::Off,
-            ParticleCamera,
-        ));
         commands.spawn((
             Camera2d,
             Camera {
@@ -439,21 +441,6 @@ fn setup(
         ));
         commands.insert_resource(SceneTarget(target));
     }
-    #[cfg(target_arch = "wasm32")]
-    commands.spawn((
-        Camera2d,
-        Camera {
-            hdr: true,
-            clear_color: ClearColorConfig::Custom(Color::BLACK),
-            ..default()
-        },
-        Bloom {
-            intensity: settings.bloom,
-            ..Bloom::NATURAL
-        },
-        Msaa::Off,
-        ParticleCamera,
-    ));
 
     // bevy_platform's Instant works on wasm; std's panics there.
     let start = bevy::platform::time::Instant::now();
@@ -655,10 +642,8 @@ fn handle_input(
 
     // Animated fly-to. Height moves in log space with a fixed time constant,
     // so the trip takes a couple of seconds regardless of depth. The center
-    // gets two pulls: an anchor term matching the height shrink (keeps the
-    // target's screen position stable while diving, same math as cursor zoom)
-    // plus the same exponential decay as the height, which closes the
-    // remaining error in sync instead of leaving the target off-screen.
+    // follows via `approach_step` with the height's own decay `k`, so the
+    // remaining error closes in sync instead of leaving the target off-screen.
     if let Some(target) = fly.0 {
         let k = 1.0 - (-2.5 * dt).exp();
         let old_h = view.height;
@@ -808,7 +793,7 @@ fn update_params(
     // Julia morph: music orbits the Julia parameter around its home value, so
     // the fractal shape itself dances. The GPU never sees c directly - the
     // reference orbit encodes it - so a changed c just means a fresh orbit
-    // (cheap: <= REF_ORBIT_CAP f64 iterations, ~16 KB upload).
+    // (cheap: at most max_iter double-double steps, 16 bytes of upload each).
     let jc = if fractal.0 == Fractal::Julia && settings.audio_morph > 0.0 {
         let amp = 0.04 * settings.audio_morph as f64 * (0.25 + audio.level as f64);
         julia_morph_c(audio.morph_phase as f64, amp)
@@ -894,8 +879,8 @@ fn update_params(
     // Audio reactivity (V): mids push the streams faster, bass swells the
     // dots, the overall level and beat lift brightness. Levels decay to zero
     // while disabled, so every term collapses to identity with no branch.
-    // Shader-side effects (ring waves, treble shimmer, spectrum glow, pan
-    // push, hue spin) read the raw levels the same way.
+    // Shader-side effects (ring waves, treble shimmer, spectrum glow, hue
+    // spin) read the raw levels the same way.
     u.flow_speed *= 1.0 + audio.mid * 2.5 * settings.audio_flow;
     u.brightness *= 1.0 + audio.level * 0.6 + audio.beat * 0.5;
     u.particle_size *= 1.0 + audio.bass * 0.7;
@@ -905,9 +890,8 @@ fn update_params(
     // static, plus music level and beats spinning it up, all scaled by the
     // Spin slider (0 = frozen wedges). Accumulated here (not derived from
     // time) so the speed reacts, not the absolute angle.
-    // Bypass change detection: the per-frame accumulation must not mark the
-    // resource changed, or the menu's label sync (gated on is_changed) would
-    // rewrite its text every frame. Only the toggle (K / menu click) flags.
+    // Bypass change detection so is_changed keeps meaning "toggled" (K / menu
+    // click), not "rotated this frame".
     if kaleido.on {
         kaleido.bypass_change_detection().rot += time.delta_secs()
             * settings.kaleido_spin

@@ -12,9 +12,11 @@ Built in Rust with [Bevy](https://bevyengine.org) and WGSL compute shaders. Runs
 - **5 fractals**: Mandelbrot, Burning Ship, Tricorn, Multibrot-3, and a morphing Julia set
 - **Deep zoom** using perturbation theory: a high-precision reference orbit on the CPU, per-particle deltas on the GPU, with rebasing (Zhuoran's method) when the delta outgrows the reference
 - **Audio reactivity**: captures system audio (native) or tab/mic audio (web) and drives particle motion, beat-synced chromatic bloom, drop detection, and an "audio aurora" color mode where bass and treble anchor the palette
-- **6 flow modes**: contour, layers, gravity, erupt, pulse, dynamics: different ways particles ride the fractal's field
+- **6 flow modes** (contour, layers, gravity, erupt, pulse, dynamics), each a different way for particles to ride the fractal's field, crossfaded on switch
+- **5 palettes**: classic, rings, electric, inferno, audio aurora
 - **Kaleidoscope mode** with adjustable folds and spin
-- **Trails, dissolve, auto-zoom dive**, and view bookmarks you can fly between
+- **Trails, dissolve, auto-zoom dive**, view bookmarks you can fly between, and mouse blast/vortex forces
+- **Auto-choreographer**: an attract-mode autopilot that dives into the busiest boundary in view, restyles palette, flow, kaleidoscope, and trails as it goes (palette swaps land on music drops), and cuts to a new scene at the dive floor
 - **Recording built in**: `P` for a screenshot, `O` to record video (H.264 MP4 on native via openh264, WebM via MediaRecorder on web)
 
 ## Controls
@@ -22,20 +24,24 @@ Built in Rust with [Bevy](https://bevyengine.org) and WGSL compute shaders. Runs
 | Key | Action |
 |-----|--------|
 | `W A S D` | Pan |
-| Scroll | Zoom |
+| Scroll | Zoom at cursor |
+| Left / right mouse (hold) | Blast / vortex |
 | `F` | Cycle fractal |
 | `G` | Cycle flow mode |
-| `C` | Cycle color mode |
+| `C` | Cycle palette |
 | `K` | Toggle kaleidoscope |
 | `V` | Toggle audio reactivity |
 | `Space` | Toggle dissolve |
 | `Z` | Auto-zoom dive |
+| `X` | Toggle auto-choreographer |
 | `R` | Reset view |
 | `Shift+1..9` | Save bookmark |
 | `1..9` | Fly to bookmark |
 | `P` | Screenshot |
 | `O` | Record video |
-| `M` / `Esc` | Menu (sliders for everything) |
+| `M` / `Esc` | Toggle menu (sliders for everything) |
+
+With the menu hidden, the choreographer also engages on its own after 30 s without input; any input then hands control back.
 
 ## Running
 
@@ -43,17 +49,23 @@ Built in Rust with [Bevy](https://bevyengine.org) and WGSL compute shaders. Runs
 
 ```sh
 cargo run --release
+cargo run --release -- 4_000_000   # optional starting particle count (default 2M)
 ```
 
-Audio reactivity captures system audio output, so play music anywhere and the fractal hears it.
+Audio reactivity records the default output's monitor via PipeWire's `pw-record`, so play music anywhere and the fractal hears it.
 
 ### Web
 
+Needs `rustup target add wasm32-unknown-unknown` and `wasm-bindgen-cli` (matching the `wasm-bindgen` version in `Cargo.lock`); `wasm-opt` is used if installed.
+
 ```sh
-./build-web.sh        # builds wasm + serves locally
+./build-web.sh                        # builds the bundle into web/
+python3 -m http.server -d web 8080    # then open http://localhost:8080
 ```
 
-Or use `./build-web-singlefile.sh` for a single self-contained HTML file. The hosted build deploys automatically to GitHub Pages from `pages.yml`.
+Or run `./build-web-singlefile.sh` for `web/fractality-standalone.html`, one self-contained file that runs from a double-click with no server. Pushes to `master` deploy to GitHub Pages via `.github/workflows/pages.yml`.
+
+In the browser, audio comes from a shared tab or screen (tick "share audio" in the picker), falling back to the microphone.
 
 ## How it works
 

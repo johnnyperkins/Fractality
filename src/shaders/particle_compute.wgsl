@@ -80,9 +80,9 @@ fn step_dz(z_ref: vec2<f32>, dz: vec2<f32>, dc: vec2<f32>) -> vec2<f32> {
 }
 
 // d(z_{n+1})/dc iteration for the selected fractal, using the full z_n.
-// Exact for the holomorphic maps (0, 3, 4); Burning Ship and Tricorn are not
-// holomorphic, so their rules are the standard distance-estimate
-// approximations - plenty for steering the flow field.
+// Exact for the holomorphic maps (Mandelbrot, Multibrot-3, Julia); Burning
+// Ship and Tricorn are not holomorphic, so their rules are the standard
+// distance-estimate approximations - plenty for steering the flow field.
 fn step_der(z_full: vec2<f32>, der: vec2<f32>) -> vec2<f32> {
 #ifdef FRACTAL_SHIP
     return 2.0 * cmul(abs(z_full), der) + vec2<f32>(1.0, 0.0);
@@ -210,9 +210,11 @@ const LN2_SQ: f32 = 0.4804530139182014;
 
 // field() plus its exact spatial gradient in one perturbation loop. The
 // derivative of the full orbit w.r.t. c is iterated alongside the delta
-// (der_{n+1} = 2*z_n*der_n + 1, using the full z, so rebasing does not affect
-// it). At escape the gradient of f = n + 1 - log2(0.5*log2(|z|^2)) follows by
-// chain rule: grad f = -z*conj(der) / (|z|^2 * 0.5*log2(|z|^2) * ln(2)^2).
+// (step_der; der_{n+1} = 2*z_n*der_n + 1 for Mandelbrot, using the full z, so
+// rebasing does not affect it). At escape the gradient of
+// f = n + 1 - log2(0.5*log2(|z|^2)) follows by chain rule:
+// grad f = -z*conj(der) / (|z|^2 * 0.5*log2(|z|^2) * ln(2)^2), both scaled
+// by inv_log2_power().
 // One analytic loop replaces three finite-difference field() calls and has no
 // step-size (eps) tuning, staying exact at any zoom depth.
 fn field_grad(dc: vec2<f32>) -> FieldGrad {
@@ -385,10 +387,9 @@ fn flow_desired(
             // across contours like wind, and the recycle trickle keeps
             // repainting the boundary behind them. Calm only softens
             // (not freezes) on the shell so the streams stay alive.
-            let ze = zesc;
-            let m = dot(ze, ze);
+            let m = dot(zesc, zesc);
             if (m > 1e-12) {
-                let a0 = atan2(ze.y, ze.x);
+                let a0 = atan2(zesc.y, zesc.x);
                 // u is the fractional-iteration coordinate (escape
                 // overshoot) - it varies ACROSS bands, so any monotonic
                 // use of it paints band-parallel stripes. Keep it only
@@ -503,10 +504,10 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
             // Boundary bias: like the CPU seed, prefer candidates near the set
             // (high f). Without this, recycle accepts the whole exterior evenly
             // and the boundary detail washes out to a uniform haze over a few
-            // seconds. t*t*t pushes the accept threshold up toward max_iter.
-            // Boundary tightness scales with the detail knob: exponent 4 at
-            // detail=1, higher pushes the accept threshold up toward max_iter so
-            // particles cluster into a thinner, finer boundary shell.
+            // seconds. The bias exponent scales with the detail knob: 4 at
+            // detail=1 (the CPU seed's t^4), higher pushes the accept threshold
+            // up toward max_iter so particles cluster into a thinner, finer
+            // boundary shell.
             let t = rand01(&seed);
             let bias = pow(t, bias_exp);
             let threshold = 3.0 + (iter_f - 12.0) * bias;
@@ -595,8 +596,7 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Flow-mode crossfade: on a switch, shape.y holds the outgoing mode and
     // shape.z ramps 0 to 1 over ~2s. Smoothstep eases both endpoints. All
     // mode-dependent behavior blends by this weight: the desired field, the
-    // pulse band wave, and the band-pull strength (pull_w, replacing the old
-    // free_flow bool - see pull_of).
+    // pulse band wave, and the band-pull strength (pull_w, see pull_of).
     let prev_mode = u32(params.shape.y + 0.5);
     let blend = smoothstep(0.0, 1.0, params.shape.z);
     let morphing = blend < 1.0 && prev_mode != params.flow_mode;
@@ -710,7 +710,8 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
     // jitter amplitude scales with the pull strength (via alpha), so align = 0
     // is the perfectly crisp static boundary, and turning it up buys stronger
     // streams while the matching pull keeps the fuzz bounded to ~jitter size.
-    // The branch's mistake was a large fixed jitter (0.008) with no such link.
+    // A fixed jitter with no such link would diffuse particles off the
+    // boundary even at align = 0, with no pull to bound it.
     if (on_contour && params.dissolve > 0.5) {
         // Dissolve: the pull is inert; diffusion alone along the gradient
         // normal gives the slow melt off the contours.

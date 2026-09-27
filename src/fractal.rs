@@ -206,7 +206,7 @@ pub fn smooth_iter(x: f64, y: f64, max_iter: u32, fractal: Fractal) -> f32 {
 
 /// Max reference-orbit length (also caps max_iter). One vec4<f32> per entry
 /// (hi/lo pairs), so the whole GPU buffer is 256 KB. Sized so the depth ramp
-/// (~8750 iterations at the height floor of 1e-28) fits with detail-slider
+/// (~8900 iterations at the height floor of 1e-28) fits with detail-slider
 /// headroom. The real cost of a long orbit is the per-particle iteration
 /// loop, which `iter_budget_count` in main.rs pays for by trading particle
 /// count against depth.

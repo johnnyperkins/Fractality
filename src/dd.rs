@@ -8,8 +8,8 @@
 //! Classic error-free transformations (Dekker/Knuth): two_sum captures the
 //! rounding error of an addition exactly, Dekker's split + two_prod do the
 //! same for multiplication without relying on FMA (portable to wasm at full
-//! speed). Values here stay within O(1e10), far from the split's overflow
-//! range near 1e300.
+//! speed). Values here stay below ~1e15 (the reference orbit stops once
+//! |z|^2 > 1e10), far from the split's overflow range near 1e300.
 
 use bevy::math::DVec2;
 
